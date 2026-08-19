@@ -1,0 +1,21 @@
+[package]
+name = "loomix-core"
+description = "Pure DSP and mixing engine. No I/O, no allocation in process()."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+bench = false
+
+[features]
+# Enables the panicking test allocator from the rt-assert harness (spec 3.3).
+rt-assert = []
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "rt_assert"
+harness = false

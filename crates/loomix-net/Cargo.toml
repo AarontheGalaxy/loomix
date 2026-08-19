@@ -1,0 +1,7 @@
+[package]
+name = "loomix-net"
+description = "Network audio: the VBAN-class wire protocol, and its text and MIDI sub-protocols."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true

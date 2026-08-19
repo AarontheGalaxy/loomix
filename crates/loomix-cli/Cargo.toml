@@ -1,0 +1,7 @@
+[package]
+name = "loomix-cli"
+description = "Command-line front end: scriptable control, and the thing CI drives."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true

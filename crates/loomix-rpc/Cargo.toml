@@ -1,0 +1,7 @@
+[package]
+name = "loomix-rpc"
+description = "Request-script parser and the unix-socket, network and C ABI control transports."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
