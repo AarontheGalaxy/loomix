@@ -1,3 +1,16 @@
 target/
 node_modules/
 .DS_Store
+
+# UI build/test output
+ui/dist/
+ui/coverage/
+
+# Xcode
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# coverage reports
+lcov.info

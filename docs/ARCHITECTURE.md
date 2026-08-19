@@ -1,0 +1,85 @@
+# Architecture decision log
+
+Decisions made during implementation that `docs/SPEC.md` leaves to
+engineering judgement, dated, so the reasoning survives past the PR that
+made them. `SPEC.md` remains the source of truth for anything it does
+specify; this file never contradicts it.
+
+## 2026-08-19 — M0
+
+**Licence: dual MIT / Apache-2.0, copyright held by "Loomix contributors".**
+Standard choice across the Rust ecosystem, compatible with the notarised,
+commercially distributed installer the project ships (spec 4.5), and with
+crediting BlackHole (MIT) as a design reference (spec 2.1). No personal
+legal name was available to attribute the copyright to.
+
+**Workspace edition 2021, shared package metadata via `[workspace.package]`.**
+Every crate carries `version.workspace = true` etc. so a version bump is a
+one-line change. Crate versions start at `0.0.0`; spec 3.4 calls out `0.1.0`
+as the tag for the first usable build, at the end of M4.
+
+**The rt-assert harness lives inside `loomix-core`, not a separate crate.**
+Implementing `GlobalAlloc` requires `unsafe impl`, which conflicts with
+`loomix-core` being one of the crates required to forbid unsafe code
+(spec 4.2). Rather than carve out a third unsafe-permitting crate beyond
+the two the spec names (`loomix-hal`, the driver bindings), `lib.rs` uses
+`#![cfg_attr(not(test), forbid(unsafe_code))]`: the shipped, non-test build
+still forbids unsafe code entirely, and the panicking allocator — test-only
+infrastructure, never linked into a release binary — is permitted only
+under `cfg(test)`. See `crates/loomix-core/src/rt_assert.rs`.
+
+**`loomix-cli` and `loomix-app` ship as library stubs with no `[[bin]]` yet.**
+An M0 `main()` with nothing to do but print a version string can't be
+exercised by `cargo test`, and dragged the workspace under the 80% line
+coverage gate for no real benefit. The executable entry point lands with
+the milestone that gives each crate actual behaviour: M10 for the CLI's
+subcommands, the first milestone that needs a UI surface for the Tauri
+backend.
+
+**The M0 driver target is a placeholder dynamic library, not yet the real
+`AudioServerPlugIn` bundle.** Its only job right now is to prove the
+`xcodebuild` + static-analysis + CI pipeline (spec 4.3) ahead of M1, which
+adds the real entry point, factory function and `Info.plist`.
+
+**`driver/tests/run-static-checks.sh` skips `clang-tidy` if it isn't on the
+runner's `PATH`, rather than failing.** It isn't guaranteed to ship with
+every Xcode command line tools install. The compiler's own
+`-Wall -Wextra -Werror` in the Xcode build (enforced in
+`project.pbxproj`) is the check that actually gates CI; `clang-tidy` and
+`clang --analyze` are additional coverage when available.
+
+**`ui/` is a bare TypeScript + Vitest + ESLint project, no React or Tauri
+yet.** Proves the `typecheck` / `lint` / `test` pipeline the `ui` CI job
+needs without pulling in a UI framework before there's a UI to build with
+it.
+
+**Bench regression gate uses checked-in JSON baselines under
+`testdata/bench-baseline/`, one file per benchmark, written by
+`scripts/save-bench-baseline.sh` and checked by
+`scripts/check-bench-regression.sh <max-percent>`.** Mirrors the golden-file
+rule in spec 4.1 layer 4 — regenerated deliberately, reviewed in the diff —
+applied to benches, since the spec's `ci.yml` calls the check script
+without specifying its comparison mechanism. A benchmark with no stored
+baseline yet is reported and skipped rather than failing the build, so the
+first bench for a new function doesn't need a baseline commit in the same
+PR.
+
+**`cargo-deny`'s license allow-list is broader than the current dependency
+graph.** It includes the permissive licences (BSD, ISC, Zlib, Unicode-3.0,
+CC0) that show up across most of the Rust ecosystem, to avoid a `deny.toml`
+edit every time a new dependency needs one already-vetted. Unused entries
+show up as informational "unmatched license allowance" warnings, not
+failures.
+
+**`nightly.yml`'s fuzz, soak and `release.yml`'s packaging jobs are
+guarded or documented as inert until the milestones that create their
+inputs land** (fuzz targets at M10/M11, the soak harness at M4/M9,
+`packaging/build-pkg.sh` and the Developer ID secrets at M4). The
+workflows ship now per the M0 requirement to have all of section 4.3 in
+place from the start; they activate themselves the moment those milestones
+add the files and secrets they check for, no workflow edit required.
+
+**`CODEOWNERS` is set to the repository's git user.** Branch protection
+requiring every `ci.yml` job (spec 4.3) is a GitHub repository setting, not
+a file, and needs a GitHub remote to configure — tracked as an open item
+for whoever pushes this repository to GitHub.
