@@ -46,6 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: xcodebuild -project driver/LoomixAudioDriver.xcodeproj -scheme LoomixAudioDriver -configuration Release build CODE_SIGNING_ALLOWED=NO
+      - run: brew install llvm
       - run: ./driver/tests/run-static-checks.sh
   ui:
     runs-on: macos-15

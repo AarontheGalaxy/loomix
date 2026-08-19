@@ -32,26 +32,49 @@ docs/             SPEC.md (source of truth), ARCHITECTURE.md (decision log)
 testdata/         Golden renders and fixtures
 ```
 
-## Building
+## Prerequisites
+
+* Xcode and the Xcode command line tools, for the driver.
+* [`just`](https://github.com/casey/just), to run the commands below.
+* `clang-tidy`, for the driver's static analysis pass. Not part of the
+  Xcode command line tools -- install it with `brew install llvm` and add
+  `$(brew --prefix llvm)/bin` to `PATH` (or leave it off `PATH`;
+  `driver/tests/run-static-checks.sh` finds it at the Homebrew prefix
+  either way).
+* Node.js 22, for the UI.
+
+## Developer commands
+
+```
+just build             # cargo build + a debug driver build
+just test              # cargo test, workspace + release golden tests
+just lint               # fmt, clippy, cargo deny, driver static checks, ui typecheck/lint
+just cover              # coverage gate, 80% line minimum workspace-wide
+just bench               # criterion bench + regression check against testdata/bench-baseline/
+just install-driver      # ad-hoc-signs and installs the driver, restarts coreaudiod
+just uninstall-driver    # removes the driver, restarts coreaudiod
+just restart-coreaudio   # sudo killall coreaudiod
+```
+
+`install-driver`, `uninstall-driver` and `restart-coreaudio` need `sudo`
+and restart `coreaudiod`, which briefly interrupts all audio on the
+machine -- each says so before it runs.
+
+Without `just`, the underlying commands:
 
 ```
 cargo build --workspace
 xcodebuild -project driver/LoomixAudioDriver.xcodeproj -scheme LoomixAudioDriver -configuration Release build CODE_SIGNING_ALLOWED=NO
 npm ci --prefix ui
-```
-
-## Testing
-
-```
 cargo test --workspace --all-features
 cargo test -p loomix-core --features rt-assert -- realtime   # real-time safety harness, spec 3.3
 cargo bench -p loomix-core
 npm run --prefix ui test -- --coverage
 ```
 
-CI (`.github/workflows/ci.yml`) runs all of the above, plus `clippy`,
-`rustfmt`, `cargo deny`, coverage (80% line minimum, 90% in `loomix-core`),
-and the driver's static analysis pass, on every push and pull request.
+CI (`.github/workflows/ci.yml`) runs the same checks, plus `clippy`,
+`rustfmt`, `cargo deny`, and coverage (80% line minimum, 90% in
+`loomix-core`), on every push and pull request.
 
 ## Non-goals
 

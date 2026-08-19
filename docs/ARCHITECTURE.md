@@ -41,12 +41,16 @@ backend.
 `xcodebuild` + static-analysis + CI pipeline (spec 4.3) ahead of M1, which
 adds the real entry point, factory function and `Info.plist`.
 
-**`driver/tests/run-static-checks.sh` skips `clang-tidy` if it isn't on the
-runner's `PATH`, rather than failing.** It isn't guaranteed to ship with
-every Xcode command line tools install. The compiler's own
-`-Wall -Wextra -Werror` in the Xcode build (enforced in
-`project.pbxproj`) is the check that actually gates CI; `clang-tidy` and
-`clang --analyze` are additional coverage when available.
+**`driver/tests/run-static-checks.sh` requires `clang-tidy` and fails if
+it's missing, rather than skipping it.** It doesn't ship with the Xcode
+command line tools; it comes from Homebrew's keg-only `llvm` formula, which
+isn't linked onto `PATH` by default. The script checks `PATH` first, then
+falls back to `$(brew --prefix llvm)/bin` directly, so installing it is
+enough without also editing `PATH`; only a genuinely missing install fails,
+with a message naming `brew install llvm`. `driver/.clang-tidy` configures
+the enabled checks (`clang-analyzer-*`, `bugprone-*`, `performance-*`,
+`portability-*`), since clang-tidy errors out with none enabled by default.
+README documents the prerequisite.
 
 **`ui/` is a bare TypeScript + Vitest + ESLint project, no React or Tauri
 yet.** Proves the `typecheck` / `lint` / `test` pipeline the `ui` CI job
@@ -83,3 +87,14 @@ add the files and secrets they check for, no workflow edit required.
 requiring every `ci.yml` job (spec 4.3) is a GitHub repository setting, not
 a file, and needs a GitHub remote to configure — tracked as an open item
 for whoever pushes this repository to GitHub.
+
+**A `justfile` wraps the build/test/lint/cover/bench/install-driver/
+uninstall-driver/restart-coreaudio commands.** `docs/SPEC.md` doesn't
+actually specify a justfile or these target names anywhere in section 3.4
+or elsewhere — added on direct request, not because the spec calls for it;
+noted here so this file doesn't misattribute it. Each recipe wraps the same
+commands documented in the README and run by CI, so there's exactly one
+place that knows how to run a check. `install-driver` and
+`uninstall-driver` operate on the current placeholder driver product
+(`libLoomixAudioDriver.dylib`); the copy/sign/restart mechanics carry over
+unchanged once M1 turns it into the real bundle target.
