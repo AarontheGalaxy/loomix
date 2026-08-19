@@ -8,6 +8,7 @@ ui/coverage/
 
 # Xcode
 DerivedData/
+driver/build/
 *.xcuserstate
 xcuserdata/
 *.xcworkspace/xcuserdata/
