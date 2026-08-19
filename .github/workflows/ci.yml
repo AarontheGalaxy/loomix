@@ -1,0 +1,66 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+jobs:
+  lint:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
+  test:
+    runs-on: macos-15
+    strategy:
+      matrix: { profile: [debug, release] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+      - run: cargo test --workspace --release -- --ignored golden
+  rt_safety:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p loomix-core --features rt-assert -- realtime
+  coverage:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 80
+      - uses: codecov/codecov-action@v4
+  driver:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: xcodebuild -project driver/LoomixAudioDriver.xcodeproj -scheme LoomixAudioDriver -configuration Release build CODE_SIGNING_ALLOWED=NO
+      - run: ./driver/tests/run-static-checks.sh
+  ui:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: ui/package-lock.json }
+      - run: npm ci --prefix ui
+      - run: npm run --prefix ui typecheck
+      - run: npm run --prefix ui lint
+      - run: npm run --prefix ui test -- --coverage
+  bench:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo bench -p loomix-core -- --save-baseline pr
+      - run: ./scripts/check-bench-regression.sh 10

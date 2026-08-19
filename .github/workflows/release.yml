@@ -1,0 +1,48 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  build:
+    # Needs packaging/build-pkg.sh (ships alongside the first release-ready
+    # milestone, spec section 3.4 targets 0.1.0 at M4) and the Developer ID
+    # signing secrets below configured in the repository before it can
+    # produce a real artifact; the shape is in place so tagging just works
+    # once those exist.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - run: cargo build --workspace --release --target aarch64-apple-darwin
+      - run: cargo build --workspace --release --target x86_64-apple-darwin
+      - run: xcodebuild -project driver/LoomixAudioDriver.xcodeproj -scheme LoomixAudioDriver -configuration Release build ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO
+      - name: Import Developer ID signing identity
+        env:
+          DEVELOPER_ID_CERTIFICATE_P12: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12 }}
+          DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: ./packaging/scripts/import-signing-identity.sh
+      - name: Build and sign the installer package
+        run: ./packaging/build-pkg.sh
+      - name: Notarise
+        env:
+          NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
+          NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}
+          NOTARYTOOL_PRIVATE_KEY: ${{ secrets.NOTARYTOOL_PRIVATE_KEY }}
+        run: |
+          xcrun notarytool submit packaging/build/Loomix.pkg \
+            --key <(echo "$NOTARYTOOL_PRIVATE_KEY") \
+            --key-id "$NOTARYTOOL_KEY_ID" \
+            --issuer "$NOTARYTOOL_ISSUER_ID" \
+            --wait
+          xcrun stapler staple packaging/build/Loomix.pkg
+      - name: Generate release notes from conventional commits
+        run: git log "$(git describe --tags --abbrev=0 HEAD^)"..HEAD --pretty=format:"- %s" > release-notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: packaging/build/Loomix.pkg
+          body_path: release-notes.md
+          generate_release_notes: true

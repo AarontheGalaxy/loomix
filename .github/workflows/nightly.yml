@@ -1,0 +1,48 @@
+name: nightly
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  fuzz:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      # Fuzz targets land with loomix-net's packet parser (M11) and
+      # loomix-rpc's request-script parser (M10); nothing to run before then.
+      - run: |
+          if [ -d loomix-net/fuzz ] || [ -d crates/loomix-net/fuzz ]; then
+            for target in $(cargo fuzz list --fuzz-dir crates/loomix-net/fuzz); do
+              cargo fuzz run --fuzz-dir crates/loomix-net/fuzz "$target" -- -max_total_time=1800
+            done
+          else
+            echo "no fuzz targets yet, skipping"
+          fi
+  soak:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The soak harness lands with the M4 engine and M9 recorder; nothing
+      # to run before then.
+      - run: |
+          if cargo metadata --no-deps --format-version=1 | grep -q '"name":"loomix-soak"'; then
+            cargo run -p loomix-soak --release -- --duration 2h
+          else
+            echo "no soak harness yet, skipping"
+          fi
+  dependency-freshness:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-outdated
+      - run: cargo outdated --workspace || true
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: ui/package-lock.json }
+      - run: npm ci --prefix ui
+      - run: npm outdated --prefix ui || true
