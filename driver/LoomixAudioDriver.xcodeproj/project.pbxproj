@@ -1,0 +1,190 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		C240C58F0A4AC38CF8245E94 /* LoomixAudioDriver.c in Sources */ = {isa = PBXBuildFile; fileRef = 91765756D3B2F77220E76DF4 /* LoomixAudioDriver.c */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		83F63DF6B35BE21BA827F7DF /* LoomixAudioDriver.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = LoomixAudioDriver.h; sourceTree = "<group>"; };
+		91765756D3B2F77220E76DF4 /* LoomixAudioDriver.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = LoomixAudioDriver.c; sourceTree = "<group>"; };
+		3350106A936A3BA0DEFC2872 /* libLoomixAudioDriver.dylib */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.dylib"; includeInIndex = 0; path = libLoomixAudioDriver.dylib; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		1EE88ACEF14DA96D8150B533 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		145B098CA495D4D48812B6ED = {
+			isa = PBXGroup;
+			children = (
+				1EA9641F6D374F602C8149AF /* LoomixAudioDriver */,
+				1DFD5CF7F6B936168382920D /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		1DFD5CF7F6B936168382920D /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				3350106A936A3BA0DEFC2872 /* libLoomixAudioDriver.dylib */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		1EA9641F6D374F602C8149AF /* LoomixAudioDriver */ = {
+			isa = PBXGroup;
+			children = (
+				91765756D3B2F77220E76DF4 /* LoomixAudioDriver.c */,
+				83F63DF6B35BE21BA827F7DF /* LoomixAudioDriver.h */,
+			);
+			path = LoomixAudioDriver;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		5B50C3F43D7188DB301132F2 /* LoomixAudioDriver */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7FB408340540611F2CFA6C67 /* Build configuration list for PBXNativeTarget "LoomixAudioDriver" */;
+			buildPhases = (
+				02CDF0D1FB0011A1EC185261 /* Sources */,
+				1EE88ACEF14DA96D8150B533 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = LoomixAudioDriver;
+			productName = LoomixAudioDriver;
+			productReference = 3350106A936A3BA0DEFC2872 /* libLoomixAudioDriver.dylib */;
+			productType = "com.apple.product-type.library.dynamic";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		1A4C4234C8BA3E5E82272A16 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1540;
+			};
+			buildConfigurationList = F08C7E83393AB690761C8969 /* Build configuration list for PBXProject "LoomixAudioDriver" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 145B098CA495D4D48812B6ED;
+			productRefGroup = 1DFD5CF7F6B936168382920D /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				5B50C3F43D7188DB301132F2 /* LoomixAudioDriver */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		02CDF0D1FB0011A1EC185261 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C240C58F0A4AC38CF8245E94 /* LoomixAudioDriver.c in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		BF8D27A411867FD7EF711B2B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_WARN_ABOUT_MISSING_PROTOTYPES = YES;
+				GCC_TREAT_WARNINGS_AS_ERRORS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				WARNING_CFLAGS = (
+					"-Wall",
+					"-Wextra",
+				);
+			};
+			name = Debug;
+		};
+		DB60DDAE27D9B66BC030D169 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_WARN_ABOUT_MISSING_PROTOTYPES = YES;
+				GCC_TREAT_WARNINGS_AS_ERRORS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				SDKROOT = macosx;
+				WARNING_CFLAGS = (
+					"-Wall",
+					"-Wextra",
+				);
+			};
+			name = Release;
+		};
+		4F1FF3A2394EA224BE5C55DB /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "-";
+				EXECUTABLE_PREFIX = lib;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		7253270ED6DD70D39D49DDE8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "-";
+				EXECUTABLE_PREFIX = lib;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		F08C7E83393AB690761C8969 /* Build configuration list for PBXProject "LoomixAudioDriver" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				BF8D27A411867FD7EF711B2B /* Debug */,
+				DB60DDAE27D9B66BC030D169 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		7FB408340540611F2CFA6C67 /* Build configuration list for PBXNativeTarget "LoomixAudioDriver" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4F1FF3A2394EA224BE5C55DB /* Debug */,
+				7253270ED6DD70D39D49DDE8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 1A4C4234C8BA3E5E82272A16 /* Project object */;
+}
