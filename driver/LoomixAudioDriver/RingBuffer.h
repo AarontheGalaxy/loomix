@@ -15,10 +15,15 @@
 #define kLoomixMinChannels 2
 #define kLoomixMaxChannels 8
 
-/* Sized for the largest supported format so it is allocated once, by the
- * caller, and never resized on the audio thread. */
-#define kLoomixRingBufferSeconds 2
-#define kLoomixRingBufferFrameCapacity ((uint32_t)(192000u * kLoomixRingBufferSeconds))
+/* Sized generously above spec section 1.19's "at least 3x the engine
+ * buffer size" (3 x 2048 = 6144 frames, the largest supported buffer) and
+ * well above the 512-frame safety offset proven sufficient in the M1
+ * loopback test, without being sized for the *seconds* a device might
+ * run -- with 16 devices, most idle at once (M2), a per-device multiplier
+ * that big is wasted memory on devices nothing is using. Allocated once,
+ * lazily, by the caller on first use (not for every device at driver
+ * load), and never resized on the audio thread. */
+#define kLoomixRingBufferFrameCapacity ((uint32_t)65536u)
 
 typedef struct
 {

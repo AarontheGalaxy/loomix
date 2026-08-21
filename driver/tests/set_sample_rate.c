@@ -4,6 +4,8 @@
  * PerformDeviceConfigurationChange path in LoomixAudioDriver.c (spec
  * section 1.11: 44.1 through 192 kHz). Usage: set_sample_rate <hz>
  */
+#include "timeout_guard.h"
+
 #include <CoreAudio/CoreAudio.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +17,7 @@ int main(int argc, const char *argv[])
         fprintf(stderr, "usage: %s <sample-rate-hz>\n", argv[0]);
         return 1;
     }
+    ArmTimeout();
     Float64 rate = atof(argv[1]);
 
     CFStringRef uid = CFSTR("com.loomix.audiodriver.in1");

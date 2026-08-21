@@ -21,3 +21,28 @@ sudo mkdir -p "$plugin_dir"
 sudo rm -rf "${plugin_dir:?}/$product_name"
 sudo cp -R "$product" "$plugin_dir/"
 sudo killall coreaudiod
+
+# Poll for coreaudiod to come back up and load the plug-in, rather than
+# guessing a fixed delay -- under load a restart can take longer than any
+# single guess, and a delay too short here means a healthy install gets
+# misreported as a crash. Give it up to 15 seconds before calling it
+# failed.
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+clang -Wall -Wextra -Werror -framework CoreAudio -framework CoreFoundation -o "$work/count_loomix_devices" \
+    "$root/driver/tests/count_loomix_devices.c"
+
+loomix_device_count=0
+deadline=$((SECONDS + 15))
+while [ "$SECONDS" -lt "$deadline" ]; do
+    if loomix_device_count="$("$work/count_loomix_devices")"; then
+        break
+    fi
+    sleep 1
+done
+
+if [ "$loomix_device_count" -eq 0 ]; then
+    echo "error: zero Loomix devices visible 15s after install -- coreaudiod likely crashed on load. Check with: system_profiler SPAudioDataType" >&2
+    exit 1
+fi
+echo "Loomix devices visible: $loomix_device_count"

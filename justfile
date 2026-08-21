@@ -11,6 +11,10 @@ test:
     mkdir -p driver/build
     clang -Wall -Wextra -Werror -std=gnu17 -o driver/build/test_ring_buffer driver/tests/test_ring_buffer.c driver/LoomixAudioDriver/RingBuffer.c
     driver/build/test_ring_buffer
+    clang -Wall -Wextra -Werror -std=gnu17 -framework CoreFoundation -framework CoreAudio -o driver/build/test_driver_host driver/tests/test_driver_host.c driver/LoomixAudioDriver/LoomixAudioDriver.c driver/LoomixAudioDriver/RingBuffer.c
+    driver/build/test_driver_host
+    clang -Wall -Wextra -Werror -std=gnu17 -DLOOMIX_CALLOC=FailingCalloc -DLOOMIX_MALLOC=FailingMalloc -framework CoreFoundation -framework CoreAudio -o driver/build/test_driver_host_fault_injection driver/tests/test_driver_host.c driver/LoomixAudioDriver/LoomixAudioDriver.c driver/LoomixAudioDriver/RingBuffer.c
+    driver/build/test_driver_host_fault_injection
 
 lint:
     cargo fmt --all --check

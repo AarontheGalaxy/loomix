@@ -66,10 +66,21 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
     exit 1
 fi
 
+clang -Wall -Wextra -Werror -framework CoreAudio -framework CoreFoundation -o "$work/count_loomix_devices" \
+    "$root/driver/tests/count_loomix_devices.c"
 clang -Wall -Wextra -Werror -framework CoreAudio -framework CoreFoundation -o "$work/query_device_stats" \
     "$root/driver/tests/query_device_stats.c"
 clang -Wall -Wextra -Werror -framework CoreAudio -framework CoreFoundation -o "$work/set_sample_rate" \
     "$root/driver/tests/set_sample_rate.c"
+
+# Fail immediately and unambiguously if the driver crashed coreaudiod or
+# never published a device, rather than have that show up 30+ seconds from
+# now as an ffmpeg device-index lookup coming up empty.
+loomix_device_count="$("$work/count_loomix_devices")" || {
+    echo "FAIL: zero Loomix devices visible to CoreAudio -- coreaudiod likely crashed on load or never published them. Check with: system_profiler SPAudioDataType" >&2
+    exit 1
+}
+echo "Loomix devices visible: $loomix_device_count"
 
 # Force a known starting rate rather than trusting whatever a previous run
 # (or a crash before its cleanup trap ran) left the device at.
