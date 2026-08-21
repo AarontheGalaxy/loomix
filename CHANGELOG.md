@@ -24,3 +24,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `cargo deny` license and advisory policy (`deny.toml`).
 - Dual MIT / Apache-2.0 licensing.
 - `docs/ARCHITECTURE.md` decision log.
+
+### Fixed
+
+- The real-time safety harness's panicking test allocator (spec 3.3) now
+  fails an offending test reliably in release builds, not just debug:
+  panicking from inside a `#[global_allocator]` method is not reliably
+  unwindable once LLVM optimises it, so the allocator now only records
+  that a violation happened and `RealtimeGuard::drop` panics from
+  ordinary, non-allocator code once the guarded scope ends.
+- `ci.yml`'s `test` job matrix legs (`debug`, `release`) now run distinct
+  commands gated on `matrix.profile`; previously both legs ran the same
+  debug-only `--all-features` suite, so the release leg never actually
+  exercised a release build.
