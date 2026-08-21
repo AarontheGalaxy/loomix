@@ -5,6 +5,70 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-21 — M3
+
+**Audio moves through the engine as `&[[f32; 8]]` — a slice of fixed-size,
+8-channel frames — not planar buffers or an interleaved `f32` stream.**
+Every strip and every bus carries all 8 of a bus's channels
+(`FL FR FC SW RL RR SL SR`, spec 1.1) even though nothing before M5's pan
+pot and M7's bus modes actually spreads a signal across more than channels
+0 and 1. The alternative was a `CHANNELS`-generic engine that only strips
+and buses actually needing more than 2 channels would opt into, but that
+would mean deciding the pan/bus-mode data model now, a milestone early,
+to serve a currently-empty need. A fixed `[f32; 8]` per frame costs
+nothing today (unused channels are just `0.0`) and is the same shape M5
+onward needs anyway, so there is no rework at the point it actually gets
+used — only the ladder's "does this need to exist yet" applied to
+*channel count*, not to a whole abstraction layer. `Frame = [f32; 8]`
+and `process_block`'s `&[&[Frame]]` / `&mut [&mut [Frame]]` arguments are
+in `crates/loomix-core/src/lib.rs` and `engine.rs`.
+
+**Solo is engine-global for M3: it silences every non-soloed strip on
+every bus, not just "the monitored bus."** Spec 1.3 describes solo as
+muting non-soloed strips "on the monitored bus," but a monitor-bus
+selection (spec 1.5's Monitor select) doesn't exist as an engine concept
+yet — nothing in M3's scope (8 strips, 8 buses, the matrix, gain layers,
+mute, solo, mono, fader law, meters) creates one. Scoping solo to a
+not-yet-modelled concept would mean inventing that concept now, un-asked,
+to serve a distinction M3 has no way to observe. The global interpretation
+is the one every routing-truth-table combination in
+`crates/loomix-core/tests/routing_truth_table.rs` can actually assert
+against; it degrades cleanly to per-bus monitor scoping later; the
+solo-then-monitor-select wiring is deferred to whichever milestone adds
+monitor selection (M10's control surface is the current best guess, spec
+1.5/1.10).
+
+**Bus mono (spec 1.5) only ever touches channels 0 and 1.** "First press
+sums to mono, second press swaps channels 1 and 2" is unambiguous about
+*which* channels; a bus's other 6 channels (`FC SW RL RR SL SR`) are
+reshuffled only by the 12 bus modes, which is explicitly M7 (spec 3.4).
+Implementing an 8-channel-aware mono here would mean guessing at M7's bus
+mode semantics now. `BusMono` (`Off` / `Mono` / `StereoReverse`) lives in
+`crates/loomix-core/src/bus.rs`.
+
+**The offline render harness's routing-truth-table test uses a Goertzel
+single-bin filter, not an FFT crate, to identify each strip's tone on
+each bus.** M3's signal path is linear and stateless per block (gain scale
+and sum, nothing spectral), so the test only ever needs the magnitude at
+8 known, bin-aligned frequencies — a ~15 line Goertzel loop
+(`crates/loomix-core/src/render.rs`) gets an exact answer for exactly that
+question without a new dependency `cargo deny` would need to vet. A real
+FFT earns its place once M6's parametric EQ needs a general frequency
+response sweep (spec 4.1 layer 1).
+
+**The truth-table test does not enumerate the full 2^64 strip×bus
+assignment space spec layer 5 could be read as literally asking for.**
+"Every combination... that matters" is read as: every one of the 8x8
+matrix's 64 cells tested for cross-talk in isolation
+(`matrix_every_cell_routes_only_its_own_strip_to_only_its_own_bus`), plus
+the full 2^8 = 256-combination space of each *other* per-strip dimension
+(mute, solo) applied uniformly across all 8 buses at once, plus a
+dedicated case for the one feature that's genuinely per-bus-per-strip
+(the 8 independent gain layers). This is the reduction real routing-matrix
+tests use: each dimension gets its combinatorics exhausted, but the
+dimensions aren't multiplied against each other, which is what would
+produce an uncomputable test rather than a stronger one.
+
 ## 2026-08-21 — rt-assert release-mode fix
 
 **The real-time safety harness (spec 3.3 — "the single most valuable test
@@ -64,6 +128,7 @@ once per guarded scope (per `process_block` call once the engine exists,
 not per sample) and buy back a trap that actually fires in a release
 build; not regenerating the baseline to hide that cost was never the
 alternative under consideration.
+
 `ci.yml`'s `test` job now gates its steps on `matrix.profile` so the two
 legs are no longer identical: the `debug` leg runs the plain
 `--all-features` suite, and the `release` leg runs that same suite with
