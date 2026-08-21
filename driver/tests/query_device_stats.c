@@ -21,11 +21,15 @@
  * driver/tests/test_ring_buffer.c, which reads them directly with no
  * CoreAudio involved at all. See docs/ARCHITECTURE.md.
  */
+#include "timeout_guard.h"
+
 #include <CoreAudio/CoreAudio.h>
 #include <stdio.h>
 
 int main(void)
 {
+    ArmTimeout();
+
     CFStringRef uid = CFSTR("com.loomix.audiodriver.in1");
     AudioObjectPropertyAddress translateAddress = {
         kAudioHardwarePropertyTranslateUIDToDevice,
