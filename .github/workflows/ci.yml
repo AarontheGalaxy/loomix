@@ -2,6 +2,7 @@ name: ci
 on:
   push: { branches: [main] }
   pull_request:
+  workflow_dispatch:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -65,3 +66,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo bench -p loomix-core -- --save-baseline pr
       - run: ./scripts/check-bench-regression.sh 10
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-pr-baseline
+          path: target/criterion/*/pr/estimates.json
+          retention-days: 5
