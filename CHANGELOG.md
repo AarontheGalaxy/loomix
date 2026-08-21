@@ -7,6 +7,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `loomix-core` engine core (spec 3.4 M3): 8 strips, 8 buses, the full
+  8x8 assignment matrix, per-bus independent gain layers, mute, solo,
+  strip and bus mono, the shared fader law (`gain_db_to_linear` /
+  `gain_linear_to_db`), and peak-hold metering. No effects processing yet
+  (denoiser, gate, comp, EQ, pan, FX sends, bus modes land M5 onward).
+- An offline deterministic render harness (`loomix-core::render`) and the
+  routing truth-table test (spec 4.1 layer 5) that is M3's acceptance
+  criterion: exhaustive per-cell assignment cross-talk checks, full
+  mute/solo combination sweeps, independent per-bus gain layer checks, and
+  strip/bus mono checks, all via a Goertzel tone-magnitude probe.
+- Fader law and engine-state property tests (spec 4.1 layers 1-2):
+  monotonicity, continuity and round-trip of the dB/linear conversion,
+  `-inf` as exact digital silence, and a finite/bounded-output check under
+  randomised parameter sequences.
+
 - Cargo workspace skeleton: `loomix-core`, `loomix-hal`, `loomix-net`,
   `loomix-rpc`, `loomix-recorder`, `loomix-config`, `loomix-cli`,
   `loomix-app`.
