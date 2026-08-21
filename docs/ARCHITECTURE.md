@@ -5,6 +5,100 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-21 — M2
+
+**Installing the M2 driver crashed `coreaudiod` (or wedged it badly enough
+to look crashed); this is not a pre-existing daemon problem.** The
+sequence, from the daemon's own log: `com.loomix.audiodriver.in1` was alive
+and enumerable at device ID 2051 before the M2 install; after it, no
+Loomix device appeared under any ID, the daemon never recovered on its
+own, and it was later found pegged at 100%+ CPU, unresponsive even to
+`system_profiler SPAudioDataType`, requiring a hard restart. `coreaudiod`
+was healthy immediately before the install and unhealthy immediately
+after, on the same machine, with nothing else changing in between — that
+is the M2 driver's fault, stated plainly, not something to hedge as
+"the daemon acting up."
+
+The leading (never independently instrumented inside a live `coreaudiod`,
+since that would have meant more install cycles) suspect: M1's driver
+initialized one device eagerly; M2's `Create` initialized sixteen, each
+`calloc`ing a ~1.7 MB ring buffer (`kLoomixRingBufferFrameCapacity *
+kLoomixMaxChannels` floats), unconditionally, synchronously, on the
+daemon's plug-in-load path, with the `calloc` return value unchecked. An
+audit turned up the same unchecked-allocation pattern in two more places
+that had never actually been exercised: two `malloc(sizeof
+(LoomixConfigurationChange))` calls in `SetPropertyData`'s sample-rate and
+stream-format change paths, and the buffer-statistics custom property's
+`CFNumberCreate`/`CFDictionaryCreate` calls. All of these now check their
+result and return `kAudioHardwareUnspecifiedError` on failure instead of
+dereferencing NULL. Independent of whether allocation failure was the
+actual trigger, eager per-device allocation at load time was itself the
+wrong shape: `EnsureDeviceRingAllocated` now allocates a device's ring
+lazily, on that device's first `StartIO`, not sixteen times unconditionally
+in `Create`. `kLoomixRingBufferFrameCapacity` also dropped from 384000 to
+65536 frames — still comfortably above spec 1.19's 3x-engine-buffer floor
+(6144 frames), but not sized for devices that mostly sit idle.
+
+**Debugging this went through the installed driver twice, each costing a
+system-wide audio interruption and twice leaving the machine in a bad
+state — that stopped, in favor of a host-side harness, before it became a
+third.** `LoomixAudioDriver_Create` is the plugin's one non-static exported
+symbol, and none of `LoomixAudioDriver.c`'s own code calls CoreAudio's
+client API (only CoreFoundation) — so `driver/tests/test_driver_host.c`
+links `LoomixAudioDriver.c` and `RingBuffer.c` directly into a small binary
+and drives the returned `AudioServerPlugInDriverInterface` vtable exactly
+as `coreaudiod` would, entirely in-process, with no installed driver and
+no daemon involved. It covers `Initialize`, the plug-in's device list
+(including a deliberately undersized caller buffer, checked against
+overflow with poisoned guard slots past what was asked for), object-ID
+lookups for in-range IDs (exhaustively, all 48 device/stream objects, not
+just the first and last), out-of-range IDs, and "misaligned" ones — a real
+object ID paired with a property selector that belongs to a different
+object type, proving property dispatch actually gates on both the ID *and*
+the selector rather than one alone. A second build of the same source,
+compiled with `-DLOOMIX_CALLOC=FailingCalloc -DLOOMIX_MALLOC=FailingMalloc`
+(`LoomixAudioDriver.c` routes every allocation through the `LOOMIX_CALLOC`/
+`LOOMIX_MALLOC` macros for exactly this reason), forces every allocation in
+the driver to fail for real and confirms `Create`, `Initialize`, `StartIO`
+and `SetPropertyData` all fail cleanly rather than crash — including
+proving, as a regression guard, that `Create`/`Initialize` still allocate
+nothing at all even under forced failure. Both builds run in `just test`
+and CI's `driver` job. The installed driver is now the final confirmation
+of a milestone already proven correct host-side, not the loop debugging
+happens in.
+
+**A background run of `count_loomix_devices` against a wedged `coreaudiod`
+hung for 17 minutes, drove the daemon to 105% CPU, and forced a machine
+restart — the second machine-down incident in the same day.** CoreAudio's
+client API has no built-in timeout; a call into a wedged daemon blocks
+forever, and running that in the background meant nothing was watching it
+or able to kill it. Two changes came out of this, not one: `driver/tests/
+timeout_guard.h` gives every tool that queries the installed driver
+(`count_loomix_devices`, `query_device_stats`, `set_sample_rate`) a hard
+wall-clock timeout (`alarm()`/`SIGALRM`, an async-signal-safe write to
+stderr, `_exit(1)`) so a wedged daemon fails the tool in seconds instead of
+hanging it forever; the default is 5 seconds, long enough that every one of
+these queries finishes in under half a second against a healthy daemon,
+short enough that CI (via the `LOOMIX_COREAUDIO_TIMEOUT_SECONDS`
+environment override) doesn't have to burn its whole time budget waiting
+on a wedged one. Separately: CoreAudio-touching commands run one at a
+time, in the foreground, for the rest of this project — a background run
+is what turned a single blocked call into an unwatched, unkillable one.
+
+**`driver/scripts/install.sh` and `driver/tests/loopback_test.sh` both
+fail loudly, not silently, when zero Loomix devices are visible.**
+Previously a crashed or wedged daemon showed up only as a confusing
+downstream failure — an `ffmpeg` device-index lookup coming up empty, a
+30-second capture timing out — far from the actual cause.
+`count_loomix_devices` (built fresh by both scripts, with the same timeout
+guard) prints the count and exits non-zero on zero; `install.sh` polls it
+for up to 15 seconds after restarting `coreaudiod` (a fixed `sleep 3` was
+tried first and rejected — a restart under load can legitimately take
+longer than any single guess, and guessing too short misreports a healthy
+install as a crash) and now exits non-zero itself if the count is still
+zero at the deadline, rather than printing a warning and reporting success
+anyway.
+
 ## 2026-08-21 — M1
 
 **The loopback test does not assert bit-exactness from sample zero, and that's deliberate — the full arc, so this isn't misread as a lowered bar later.**
