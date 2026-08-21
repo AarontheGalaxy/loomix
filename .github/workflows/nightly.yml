@@ -42,7 +42,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-outdated
       - run: cargo outdated --workspace || true
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: 22, cache: npm, cache-dependency-path: ui/package-lock.json }
       - run: npm ci --prefix ui
       - run: npm outdated --prefix ui || true
