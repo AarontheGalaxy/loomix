@@ -5,6 +5,30 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-21
+
+**Branch protection on `main` requires all 8 `ci.yml` jobs**
+(`lint`, `test (debug)`, `test (release)`, `rt_safety`, `coverage`, `driver`,
+`ui`, `bench`), with branches required to be up to date before merging.
+`enforce_admins` is off, so the repo owner can still push directly during
+this early bootstrap phase; no required review count was set since none was
+requested. Configured via the GitHub API once the repo had a remote — this
+is a repository setting, not a file, so it isn't visible in this checkout.
+
+**The bench-regression baseline is captured on GitHub's `macos-15` runner,
+not a developer machine.** The M0 baseline for `rt_assert_guard_overhead`
+was recorded on the machine that built it (~1.15ns) and failed the first
+real CI run at +60.89% against a 10% gate — the runner's numbers cluster
+around 1.7-1.9ns, a real, consistent hardware difference, not noise (two
+separate CI runs landed at 1.856ns and 1.775ns, agreeing within 5%).
+`ci.yml`'s `bench` job now uploads `target/criterion/*/pr/estimates.json`
+as a build artifact (`if: always()`, so it uploads even when the gate
+fails) precisely so this baseline can be regenerated from runner output
+instead of a laptop; `ci.yml` also gained a `workflow_dispatch` trigger to
+make that possible without a throwaway commit. The lesson generalises to
+every bench baseline this project checks in from here on: capture it from
+a CI run, never from a local machine.
+
 ## 2026-08-19 — M0
 
 **Licence: dual MIT / Apache-2.0, copyright held by "Loomix contributors".**
