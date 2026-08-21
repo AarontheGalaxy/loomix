@@ -8,6 +8,9 @@ build:
 test:
     cargo test --workspace --all-features
     cargo test --workspace --release -- --ignored golden
+    mkdir -p driver/build
+    clang -Wall -Wextra -Werror -std=gnu17 -o driver/build/test_ring_buffer driver/tests/test_ring_buffer.c driver/LoomixAudioDriver/RingBuffer.c
+    driver/build/test_ring_buffer
 
 lint:
     cargo fmt --all --check
