@@ -5,6 +5,71 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-21 — rt-assert release-mode fix
+
+**The real-time safety harness (spec 3.3 — "the single most valuable test
+in the project") did not work in release builds, and nothing caught it.**
+Discovered starting M3, not caused by it: `cargo test --workspace --release
+--all-features` on plain `main` failed
+`rt_assert::tests::realtime_guard_traps_allocation` — not by correctly
+detecting the trapped allocation, but by the panic escaping
+`catch_unwind` entirely and surfacing as an uncaught panic in that test's
+own thread.
+
+Root cause, confirmed with a standalone minimal reproduction outside this
+crate (a `#[global_allocator]` whose `alloc()` panics when a thread-local
+flag is set, wrapped in `std::panic::catch_unwind`): compiled with `rustc
+-O`, the panic escapes `catch_unwind` and the process exits 101
+uncaught; the identical program compiled without optimisation is caught
+cleanly. Panicking from inside a `GlobalAlloc` method is not reliably
+unwindable once LLVM optimises the allocator shim — a real, general Rust
+behaviour, not a defect specific to this file. It was invisible until now
+because `ci.yml`'s `test` job matrix (`profile: [debug, release]`, lifted
+from spec 4.3's `ci.yml` skeleton verbatim) never actually passed
+`--release` to the `--all-features` run on either matrix leg — both legs
+ran the identical `cargo test --workspace --all-features` command, so the
+"release" leg was decorative from M0 onward and every green run of it
+asserted nothing.
+
+The fix moves the panic out of the allocator entirely rather than trying
+to make an allocator-internal panic unwind reliably (fighting the
+underlying platform behaviour instead of avoiding it). `RtAssertAlloc`'s
+methods now only record a thread-local "violation happened" flag and let
+the real allocation proceed; `RealtimeGuard::drop` — ordinary code,
+outside any allocator boundary — checks that flag and panics there
+instead, once the guarded scope has already ended. This is caught
+reliably under `catch_unwind` in every profile (verified by rerunning
+`realtime_guard_traps_allocation` in both), and it's arguably a better
+shape independent of the bug it fixes: the guarded scope always completes
+normally rather than aborting mid-allocation partway through whatever it
+was doing. `drop` skips its own panic when `std::thread::panicking()` is
+already true, so a violation recorded during a callback that panics for
+its own unrelated reason doesn't turn one panic into an unwind-aborting
+double panic —
+`rt_assert::tests::the_callbacks_own_panic_is_not_swallowed_by_a_concurrent_violation`
+is the regression test for exactly that. The fix was verified negatively,
+too: temporarily disabling the new panic in `drop` was confirmed to make
+`realtime_guard_traps_allocation` itself fail in release mode, proving the
+passing state means the trap actually fires rather than the assertion
+having become vacuous.
+
+`RealtimeGuard::drop` now reads a second thread-local (the violation
+flag) on every exit instead of just clearing the first, and
+`rt_assert_guard_overhead`'s checked-in bench baseline moved with it —
+1.776ns to 2.675ns on the CI runner, +50.64%, tripping the 10% regression
+gate on this PR's own `bench` job. Regenerated from that same CI run's
+`criterion-pr-baseline` artifact, not a local machine, per the M0 lesson
+above about runner-vs-laptop hardware variance. The extra nanoseconds are
+once per guarded scope (per `process_block` call once the engine exists,
+not per sample) and buy back a trap that actually fires in a release
+build; not regenerating the baseline to hide that cost was never the
+alternative under consideration.
+`ci.yml`'s `test` job now gates its steps on `matrix.profile` so the two
+legs are no longer identical: the `debug` leg runs the plain
+`--all-features` suite, and the `release` leg runs that same suite with
+`--release` plus, separately, the release-only ignored `golden` tests
+(spec 4.1 layer 4) that were already release-gated before this fix.
+
 ## 2026-08-21 — M2
 
 **Installing the M2 driver crashed `coreaudiod` (or wedged it badly enough
