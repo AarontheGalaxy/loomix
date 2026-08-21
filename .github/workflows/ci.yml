@@ -74,7 +74,7 @@ jobs:
       - run: cargo bench -p loomix-core -- --save-baseline pr
       - run: ./scripts/check-bench-regression.sh 10
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: criterion-pr-baseline
           path: target/criterion/*/pr/estimates.json
