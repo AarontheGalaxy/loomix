@@ -5,7 +5,7 @@
 set -euo pipefail
 
 plugin_dir="/Library/Audio/Plug-Ins/HAL"
-product_name="libLoomixAudioDriver.dylib"
+product_name="LoomixAudioDriver.driver"
 installed="$plugin_dir/$product_name"
 
 if [ ! -e "$installed" ]; then

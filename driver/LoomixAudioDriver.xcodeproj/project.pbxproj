@@ -8,12 +8,20 @@
 
 /* Begin PBXBuildFile section */
 		C240C58F0A4AC38CF8245E94 /* LoomixAudioDriver.c in Sources */ = {isa = PBXBuildFile; fileRef = 91765756D3B2F77220E76DF4 /* LoomixAudioDriver.c */; };
+		0E18B5A9AA047B5703507564 /* RingBuffer.c in Sources */ = {isa = PBXBuildFile; fileRef = 2D24A7357BCF6D863AA1D257 /* RingBuffer.c */; };
+		F8BCF80417818874AA986306 /* CoreAudio.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5DE74E2643FAAC1758832880 /* CoreAudio.framework */; };
+		68DE1A1F7671EAA84F7A0E56 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 45F290E7B351A6DD5E8F40BF /* CoreFoundation.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		83F63DF6B35BE21BA827F7DF /* LoomixAudioDriver.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = LoomixAudioDriver.h; sourceTree = "<group>"; };
 		91765756D3B2F77220E76DF4 /* LoomixAudioDriver.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = LoomixAudioDriver.c; sourceTree = "<group>"; };
-		3350106A936A3BA0DEFC2872 /* libLoomixAudioDriver.dylib */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.dylib"; includeInIndex = 0; path = libLoomixAudioDriver.dylib; sourceTree = BUILT_PRODUCTS_DIR; };
+		2D24A7357BCF6D863AA1D257 /* RingBuffer.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = RingBuffer.c; sourceTree = "<group>"; };
+		16CD7D7F03A0086844ADAB24 /* RingBuffer.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RingBuffer.h; sourceTree = "<group>"; };
+		56BCB7DD2BC2B862EBACF23E /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		5DE74E2643FAAC1758832880 /* CoreAudio.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreAudio.framework; path = System/Library/Frameworks/CoreAudio.framework; sourceTree = SDKROOT; };
+		45F290E7B351A6DD5E8F40BF /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
+		3350106A936A3BA0DEFC2872 /* LoomixAudioDriver.driver */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LoomixAudioDriver.driver; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -21,6 +29,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F8BCF80417818874AA986306 /* CoreAudio.framework in Frameworks */,
+				68DE1A1F7671EAA84F7A0E56 /* CoreFoundation.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -31,6 +41,7 @@
 			isa = PBXGroup;
 			children = (
 				1EA9641F6D374F602C8149AF /* LoomixAudioDriver */,
+				2B1E4B6D6A6C4B6E9F5C1A2D /* Frameworks */,
 				1DFD5CF7F6B936168382920D /* Products */,
 			);
 			sourceTree = "<group>";
@@ -38,9 +49,18 @@
 		1DFD5CF7F6B936168382920D /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				3350106A936A3BA0DEFC2872 /* libLoomixAudioDriver.dylib */,
+				3350106A936A3BA0DEFC2872 /* LoomixAudioDriver.driver */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		2B1E4B6D6A6C4B6E9F5C1A2D /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				5DE74E2643FAAC1758832880 /* CoreAudio.framework */,
+				45F290E7B351A6DD5E8F40BF /* CoreFoundation.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 		1EA9641F6D374F602C8149AF /* LoomixAudioDriver */ = {
@@ -48,6 +68,9 @@
 			children = (
 				91765756D3B2F77220E76DF4 /* LoomixAudioDriver.c */,
 				83F63DF6B35BE21BA827F7DF /* LoomixAudioDriver.h */,
+				2D24A7357BCF6D863AA1D257 /* RingBuffer.c */,
+				16CD7D7F03A0086844ADAB24 /* RingBuffer.h */,
+				56BCB7DD2BC2B862EBACF23E /* Info.plist */,
 			);
 			path = LoomixAudioDriver;
 			sourceTree = "<group>";
@@ -68,8 +91,8 @@
 			);
 			name = LoomixAudioDriver;
 			productName = LoomixAudioDriver;
-			productReference = 3350106A936A3BA0DEFC2872 /* libLoomixAudioDriver.dylib */;
-			productType = "com.apple.product-type.library.dynamic";
+			productReference = 3350106A936A3BA0DEFC2872 /* LoomixAudioDriver.driver */;
+			productType = "com.apple.product-type.bundle";
 		};
 /* End PBXNativeTarget section */
 
@@ -104,6 +127,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				C240C58F0A4AC38CF8245E94 /* LoomixAudioDriver.c in Sources */,
+				0E18B5A9AA047B5703507564 /* RingBuffer.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -149,8 +173,11 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "-";
-				EXECUTABLE_PREFIX = lib;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = LoomixAudioDriver/Info.plist;
+				PRODUCT_BUNDLE_IDENTIFIER = com.loomix.audiodriver;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				WRAPPER_EXTENSION = driver;
 			};
 			name = Debug;
 		};
@@ -158,8 +185,11 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "-";
-				EXECUTABLE_PREFIX = lib;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = LoomixAudioDriver/Info.plist;
+				PRODUCT_BUNDLE_IDENTIFIER = com.loomix.audiodriver;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				WRAPPER_EXTENSION = driver;
 			};
 			name = Release;
 		};
