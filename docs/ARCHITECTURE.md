@@ -53,6 +53,17 @@ too: temporarily disabling the new panic in `drop` was confirmed to make
 passing state means the trap actually fires rather than the assertion
 having become vacuous.
 
+`RealtimeGuard::drop` now reads a second thread-local (the violation
+flag) on every exit instead of just clearing the first, and
+`rt_assert_guard_overhead`'s checked-in bench baseline moved with it —
+1.776ns to 2.675ns on the CI runner, +50.64%, tripping the 10% regression
+gate on this PR's own `bench` job. Regenerated from that same CI run's
+`criterion-pr-baseline` artifact, not a local machine, per the M0 lesson
+above about runner-vs-laptop hardware variance. The extra nanoseconds are
+once per guarded scope (per `process_block` call once the engine exists,
+not per sample) and buy back a trap that actually fires in a release
+build; not regenerating the baseline to hide that cost was never the
+alternative under consideration.
 `ci.yml`'s `test` job now gates its steps on `matrix.profile` so the two
 legs are no longer identical: the `debug` leg runs the plain
 `--all-features` suite, and the `release` leg runs that same suite with
