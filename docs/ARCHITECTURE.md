@@ -5,6 +5,53 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-23 — M4's real acceptance criterion is not yet met (outstanding)
+
+**The 30-minute soak has been run (macOS 26.6, build 25G72;
+`com.loomix.audiodriver.outA1` as master, `com.loomix.audiodriver.outA2`
+as the drift-corrected device; `timeout -k 60 35m ... --duration 30m`;
+zero dropouts, exit PASS) but this run does not satisfy spec 3.4 M4's
+acceptance criterion ("a 30 minute soak test on two devices with
+different clocks shows no dropouts and bounded drift"), and M4 is not
+being called accepted on the strength of it.** Recorded here plainly
+rather than filed as a passing checkbox, on direct instruction, because
+the gap is real and specific, not a formality:
+
+1. Both devices were idle Loomix virtual outputs (`outA1`/`outA2`), not
+   two physically independent interfaces. Both are software-clocked off
+   this process's own timer -- they do not have "different clocks" in the
+   sense spec 1.19 means (two devices whose *hardware* crystals drift
+   against each other). The drift ratio stayed at exactly `1.000000` for
+   the full 1800 seconds, not "close to 1.0 and bounded" the way a
+   corrector actively holding two real clocks together would show, but
+   completely flat -- direct evidence the PI controller and the resampler
+   were never actually engaged, because there was nothing to correct.
+   This run proves the IOProc/ring-buffer/engine path stays clean under
+   real CoreAudio scheduling for 30 minutes; it does not exercise drift
+   correction, which is the entire subject of spec 2.3 and most of this
+   milestone's code.
+2. Both buses carried silence throughout (`loomix-soak`'s own printed
+   caveat -- "both buses carry silence -- this measures timing and
+   dropouts, not audio content" -- by design, for the reasons in the
+   two-output-device entry above), but it means denormal handling and
+   real per-sample DSP cost were never exercised either over a sustained
+   run.
+3. Consequently: `dropouts: 0` and `PASS` in this run's output demonstrate
+   the wiring doesn't fall over on its own, not that "bounded drift" has
+   been observed at all -- there was no drift to bound.
+
+**What would actually satisfy spec 3.4 M4's acceptance criterion:** two
+genuinely independent physical audio interfaces (e.g. this machine's
+built-in output plus a real external USB/Thunderbolt/Bluetooth interface,
+not two Loomix virtual devices, not one physical device aggregated with
+itself), carrying real signal rather than silence, run for 30 minutes,
+with a *non-zero* drift ratio actually observed and staying bounded
+(not saturating `DriftCorrector`'s `max_correction` clamp) and zero
+dropouts throughout. Until that specific run exists and is recorded here,
+M4's hardware-clocking claim rests on the synthetic fake-device tests in
+`loomix-hal::ioproc` and `loomix-hal::drift`, not on hardware evidence,
+and should be described that way.
+
 ## 2026-08-23 — M4 (continued, the coverage gate)
 
 **CI's `coverage` job failed at 78.21% against the 80% gate after this
