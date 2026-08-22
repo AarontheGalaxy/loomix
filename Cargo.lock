@@ -351,6 +351,10 @@ dependencies = [
 [[package]]
 name = "loomix-hal"
 version = "0.0.0"
+dependencies = [
+ "loomix-core",
+ "proptest",
+]
 
 [[package]]
 name = "loomix-net"
