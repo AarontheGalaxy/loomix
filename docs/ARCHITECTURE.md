@@ -5,6 +5,53 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-22 — M4 (continued)
+
+**`ioproc.rs`'s drift-corrected capture fed the PI controller the wrong
+error signal, and this was found by the fake-device harness, not
+predicted in advance.** The first version tracked `device_frames`, the
+device's own raw cumulative sample count (incremented every callback by
+however many frames the callback actually delivered), and computed error
+as `device_frames - master.frames()`. `a_drifting_fake_device_reconstructs_the_tone_within_bounded_drift`
+(500 ppm, 2000 callbacks) failed its frequency check by 10x, and
+`IOPROC_DEBUG` tracing showed why: with a *constant* ppm offset, a
+device's raw clock offset from the master grows without bound for as long
+as the device keeps running, no matter how well the output is being
+corrected -- correction changes what the *resampled output* looks like,
+not the device's own physical clock. Feeding that ever-growing raw offset
+into the PI controller gave it an error signal that could never converge,
+so the integral saturated within a few hundred callbacks and `ratio`
+stuck at `1.0 - max_correction` (0.99) for nearly the whole run -- a 0.7%
+mistune when the actual injected error was 0.05%, twenty-eight times too
+much correction, silently, because the controller was reacting correctly
+to a fundamentally wrong number. The fix renames the field to
+`progress_frames` and changes what accumulates into it: for capture, the
+resampler's actual output count (`written`, from `Resampler::process`);
+for render, the actual input count consumed (`consumed`). That quantity
+*is* what the correction affects and is supposed to converge to track the
+master, exactly the property drift.rs's own `simulate()` harness already
+modelled correctly (`device_cumulative += ... * applied_ratio`) -- the bug
+was introduced translating that model into the real per-callback code, not
+in the model itself.
+
+Second-order finding from chasing the above: an interim version of the
+test asserted the reconstructed tone's Goertzel magnitude stayed within
+`0.9..=1.1` of a clean reference over the full ~5.3-second run. After the
+real fix, frame-count drift was already excellent (order of a couple
+hundred frames against a quarter-million-frame run) and the resample
+ratio never left roughly a ±0.3% band -- matching drift.rs's own bound at
+the same kp/ki -- yet that assertion still failed. A frequency scan around
+1 kHz showed the tone's energy spread across neighbouring bins rather than
+missing outright, and a sample-delta scan found zero discontinuities: not
+corruption, just enough accumulated phase jitter over a long single-tone
+Goertzel measurement to fail a tight absolute-gain bound on a correctly
+bounded but not perfectly smooth ratio. The test now asserts what actually
+matters -- frame-count drift bounded (`< 300`, alongside `hotplug`-table-style
+direct measurement) and the tone dominating a clearly different frequency
+by 5x, the same "dominates" style `resample.rs`'s own non-unity-ratio test
+already uses for the identical reason -- rather than a stricter bound nothing
+else in the codebase actually asks a resampler to meet.
+
 ## 2026-08-22 — M4
 
 **`loomix-hal`'s algorithmic pieces -- clock master selection, drift
