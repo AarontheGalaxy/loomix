@@ -465,6 +465,144 @@ impl Drop for RenderIoProcHandle {
     }
 }
 
+/// A CFString built from a dynamic, caller-supplied string. Not real-time
+/// code (device creation is a one-off control-plane call, never per
+/// block), so allocating here is fine.
+fn cfstring_from_str(s: &str) -> CFStringRef {
+    let c = std::ffi::CString::new(s).expect("CoreAudio strings must not contain a NUL byte");
+    unsafe { CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), kCFStringEncodingUTF8) }
+}
+
+/// A CFString built from one of `coreaudio-sys`'s dictionary-key
+/// constants (`&[u8; N]`, already NUL-terminated C strings, e.g.
+/// `kAudioAggregateDeviceUIDKey`) rather than a dynamic string -- no
+/// `CString` round trip needed, the bytes are already in the right shape.
+fn cfstring_from_key(key: &[u8]) -> CFStringRef {
+    unsafe {
+        CFStringCreateWithCString(
+            std::ptr::null(),
+            key.as_ptr() as *const std::os::raw::c_char,
+            kCFStringEncodingUTF8,
+        )
+    }
+}
+
+/// Creates a CoreAudio aggregate device spanning `sub_device_uids` under
+/// one clock (spec 2.3's alternative to `drift.rs`'s own correction --
+/// "let the user choose" -- and spec 2.2's ASIO-multichannel-routing
+/// mapping). `master_uid` picks which sub-device's clock the aggregate
+/// follows and must be one of `sub_device_uids`; that invariant is the
+/// caller's to uphold; CoreAudio's own error is what surfaces if it isn't.
+/// Private by default (spec's own aggregate devices are Loomix-internal
+/// plumbing, not something every app's device picker needs to show),
+/// unless `visible_in_ui` is set.
+pub fn create_aggregate_device(
+    name: &str,
+    uid: &str,
+    sub_device_uids: &[&str],
+    master_uid: &str,
+    visible_in_ui: bool,
+) -> Result<DeviceId, CoreAudioError> {
+    unsafe {
+        let name_key = cfstring_from_key(kAudioAggregateDeviceNameKey);
+        let name_value = cfstring_from_str(name);
+        let uid_key = cfstring_from_key(kAudioAggregateDeviceUIDKey);
+        let uid_value = cfstring_from_str(uid);
+        let private_key = cfstring_from_key(kAudioAggregateDeviceIsPrivateKey);
+        let private_value = if visible_in_ui {
+            kCFBooleanFalse
+        } else {
+            kCFBooleanTrue
+        };
+        let master_key = cfstring_from_key(kAudioAggregateDeviceMasterSubDeviceKey);
+        let master_value = cfstring_from_str(master_uid);
+        let sub_device_list_key = cfstring_from_key(kAudioAggregateDeviceSubDeviceListKey);
+        let sub_device_uid_key = cfstring_from_key(kAudioSubDeviceUIDKey);
+
+        let sub_device_dicts: Vec<CFDictionaryRef> = sub_device_uids
+            .iter()
+            .map(|sub_uid| {
+                let value = cfstring_from_str(sub_uid);
+                let mut keys: [*const std::os::raw::c_void; 1] = [sub_device_uid_key as *const _];
+                let mut values: [*const std::os::raw::c_void; 1] = [value as *const _];
+                let dict = CFDictionaryCreate(
+                    std::ptr::null(),
+                    keys.as_mut_ptr(),
+                    values.as_mut_ptr(),
+                    1,
+                    &kCFTypeDictionaryKeyCallBacks,
+                    &kCFTypeDictionaryValueCallBacks,
+                );
+                CFRelease(value as CFTypeRef);
+                dict
+            })
+            .collect();
+        let mut sub_device_dict_ptrs: Vec<*const std::os::raw::c_void> = sub_device_dicts
+            .iter()
+            .map(|&d| d as *const std::os::raw::c_void)
+            .collect();
+        let sub_device_array = CFArrayCreate(
+            std::ptr::null(),
+            sub_device_dict_ptrs.as_mut_ptr(),
+            sub_device_dict_ptrs.len() as CFIndex,
+            &kCFTypeArrayCallBacks,
+        );
+        for &d in &sub_device_dicts {
+            CFRelease(d as CFTypeRef);
+        }
+
+        let mut keys: [*const std::os::raw::c_void; 5] = [
+            name_key as *const _,
+            uid_key as *const _,
+            private_key as *const _,
+            master_key as *const _,
+            sub_device_list_key as *const _,
+        ];
+        let mut values: [*const std::os::raw::c_void; 5] = [
+            name_value as *const _,
+            uid_value as *const _,
+            private_value as *const _,
+            master_value as *const _,
+            sub_device_array as *const _,
+        ];
+        let description = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_mut_ptr(),
+            values.as_mut_ptr(),
+            5,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        );
+
+        let mut device_id: AudioObjectID = 0;
+        let status = AudioHardwareCreateAggregateDevice(description, &mut device_id);
+
+        for key in [
+            name_key,
+            uid_key,
+            private_key,
+            master_key,
+            sub_device_list_key,
+            sub_device_uid_key,
+        ] {
+            CFRelease(key as CFTypeRef);
+        }
+        for value in [name_value, uid_value, master_value] {
+            CFRelease(value as CFTypeRef);
+        }
+        CFRelease(sub_device_array as CFTypeRef);
+        CFRelease(description as CFTypeRef);
+
+        check(status)?;
+        Ok(device_id)
+    }
+}
+
+/// Destroys an aggregate device created by [`create_aggregate_device`].
+pub fn destroy_aggregate_device(id: DeviceId) -> Result<(), CoreAudioError> {
+    check(unsafe { AudioHardwareDestroyAggregateDevice(id) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +663,22 @@ mod tests {
         assert_eq!(hog_owner(id).unwrap(), Some(our_pid));
         set_hog_owner(id, -1).expect("releasing hog mode should succeed");
         assert_eq!(hog_owner(id).unwrap(), None);
+    }
+
+    #[test]
+    #[ignore = "creates a real system aggregate device; run manually, not in CI"]
+    fn create_and_destroy_an_aggregate_device_round_trip() {
+        let id = default_output_device().expect("a default output device should exist");
+        let uid = device_uid(id).expect("uid query should succeed");
+        let aggregate_id = create_aggregate_device(
+            "Loomix test aggregate",
+            "com.loomix.test-aggregate",
+            &[&uid],
+            &uid,
+            false,
+        )
+        .expect("aggregate device creation should succeed");
+        destroy_aggregate_device(aggregate_id).expect("aggregate device teardown should succeed");
     }
 
     #[test]
