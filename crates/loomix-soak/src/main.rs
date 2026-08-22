@@ -23,11 +23,18 @@
 //! runs it with `--duration 2h`; that leg is M9's (with the recorder
 //! folded in), not exercised by this binary's current two-device-only
 //! shape.
+//!
+//! Excluded from the `cargo llvm-cov` coverage gate via
+//! `--ignore-filename-regex` in `justfile`/`ci.yml` -- this doc comment is
+//! the explicit reason. `duration.rs`'s `parse_duration` is pure and has
+//! no such excuse, so it lives in its own file, tested, and not excluded.
 #![forbid(unsafe_code)]
 
-use loomix_app::engine_io::{
-    attach_master_device, attach_render_device, select_clock_master, EngineIoDriver,
-};
+mod duration;
+
+use duration::parse_duration;
+use loomix_app::device_wiring::{attach_master_device, attach_render_device};
+use loomix_app::engine_io::{select_clock_master, EngineIoDriver};
 use loomix_core::Engine;
 use loomix_hal::clock::{ClockSource, DeviceId};
 use loomix_hal::device::{
@@ -61,10 +68,14 @@ fn main() {
         match args[i].as_str() {
             "--duration" => {
                 i += 1;
-                duration = parse_duration(args.get(i).unwrap_or_else(|| {
+                let value = args.get(i).unwrap_or_else(|| {
                     eprintln!("--duration needs a value, e.g. 30m, 1800s, 2h");
                     std::process::exit(2);
-                }));
+                });
+                duration = parse_duration(value).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                });
             }
             "--device-a" => {
                 i += 1;
@@ -279,22 +290,4 @@ fn run(
         std::process::exit(1);
     }
     Ok(())
-}
-
-fn parse_duration(s: &str) -> Duration {
-    let (num, unit) = s.split_at(s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len()));
-    let value: f64 = num.parse().unwrap_or_else(|_| {
-        eprintln!("bad duration '{s}', expected e.g. 30m, 1800s, 2h, 0.5h");
-        std::process::exit(2);
-    });
-    let seconds = match unit {
-        "" | "s" => value,
-        "m" => value * 60.0,
-        "h" => value * 3600.0,
-        other => {
-            eprintln!("unknown duration unit '{other}', expected s, m or h");
-            std::process::exit(2);
-        }
-    };
-    Duration::from_secs_f64(seconds)
 }

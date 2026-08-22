@@ -2,4 +2,5 @@
 //! land with the first milestone that needs a UI surface.
 #![forbid(unsafe_code)]
 
+pub mod device_wiring;
 pub mod engine_io;

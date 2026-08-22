@@ -11,6 +11,7 @@
 
 pub mod clock;
 pub mod device;
+pub mod device_lifecycle;
 pub mod drift;
 pub mod hog;
 pub mod hotplug;

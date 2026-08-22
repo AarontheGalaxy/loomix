@@ -20,7 +20,7 @@ use std::sync::Arc;
 /// A CoreAudio `OSStatus` failure from any call in this module.
 pub type CoreAudioError = OSStatus;
 
-fn check(status: OSStatus) -> Result<(), CoreAudioError> {
+pub(crate) fn check(status: OSStatus) -> Result<(), CoreAudioError> {
     if status == 0 {
         Ok(())
     } else {
@@ -160,70 +160,6 @@ pub fn channel_count(id: DeviceId, direction: Direction) -> Result<usize, CoreAu
         total += unsafe { (*first.add(i)).mNumberChannels as usize };
     }
     Ok(total)
-}
-
-/// *Requests* a non-interleaved, 32-bit float stream format on
-/// `direction` -- best-effort, not load-bearing. `CaptureIoProcHandle`/
-/// `RenderIoProcHandle::start` call this and ignore whether it succeeds:
-/// confirmed against a real device on this machine that
-/// `AudioObjectSetPropertyData` can report success here and the format
-/// still comes back interleaved on readback, silently. Some devices
-/// genuinely don't support non-interleaved at all; asking anyway costs
-/// nothing on the ones that do honour it. The actual fix for a device
-/// that stays interleaved either way is `read_input_channels_planar` (and
-/// the equivalent inlined into `render_ioproc_trampoline`) adapting to
-/// whichever layout the callback actually receives, not this function --
-/// see that doc comment for the failure this was found chasing.
-///
-/// The device's own sample rate is preserved -- read from its current
-/// format and left alone -- since that's the hardware's to set, not a
-/// client's; only the interleaving and channel count are requested here.
-pub fn set_stream_format_non_interleaved(
-    id: DeviceId,
-    direction: Direction,
-    channel_count: usize,
-) -> Result<(), CoreAudioError> {
-    let scope = match direction {
-        Direction::Input => kAudioDevicePropertyScopeInput,
-        Direction::Output => kAudioDevicePropertyScopeOutput,
-    };
-    let addr = AudioObjectPropertyAddress {
-        mSelector: kAudioDevicePropertyStreamFormat,
-        mScope: scope,
-        mElement: kAudioObjectPropertyElementMain,
-    };
-    let mut format: AudioStreamBasicDescription = unsafe { std::mem::zeroed() };
-    let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
-    check(unsafe {
-        AudioObjectGetPropertyData(
-            id,
-            &addr,
-            0,
-            std::ptr::null(),
-            &mut size,
-            &mut format as *mut _ as *mut _,
-        )
-    })?;
-    format.mFormatID = kAudioFormatLinearPCM;
-    format.mFormatFlags =
-        kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved;
-    format.mChannelsPerFrame = channel_count as u32;
-    format.mBitsPerChannel = 32;
-    // Non-interleaved: each AudioBuffer carries exactly one channel, so a
-    // "frame" within any single buffer is one 4-byte float.
-    format.mBytesPerFrame = 4;
-    format.mFramesPerPacket = 1;
-    format.mBytesPerPacket = 4;
-    check(unsafe {
-        AudioObjectSetPropertyData(
-            id,
-            &addr,
-            0,
-            std::ptr::null(),
-            std::mem::size_of::<AudioStreamBasicDescription>() as u32,
-            &format as *const _ as *const _,
-        )
-    })
 }
 
 fn cfstring_property(
@@ -425,6 +361,10 @@ impl CaptureIoProcContext {
             deinterleave: vec![0.0; MAX_IO_CHANNELS * scratch_capacity],
         }
     }
+
+    pub(crate) fn channel_count(&self) -> usize {
+        self.outputs.len()
+    }
 }
 
 /// Reads up to [`MAX_IO_CHANNELS`] channels from an `AudioBufferList` as
@@ -551,7 +491,7 @@ unsafe fn write_output_channels<'a>(
 /// `outputs`/`scratch`/`deinterleave` were sized once at construction. No
 /// locks: `rtrb::Producer::push` is lock-free. No syscalls beyond what
 /// CoreAudio itself performs to invoke this callback.
-unsafe extern "C" fn capture_ioproc_trampoline(
+pub(crate) unsafe extern "C" fn capture_ioproc_trampoline(
     _device: AudioObjectID,
     _now: *const AudioTimeStamp,
     input_data: *const AudioBufferList,
@@ -571,48 +511,6 @@ unsafe extern "C" fn capture_ioproc_trampoline(
         &mut ctx.scratch,
     );
     0
-}
-
-/// A running capture IOProc registration. Stops and unregisters on drop.
-pub struct CaptureIoProcHandle {
-    device: AudioObjectID,
-    proc_id: AudioDeviceIOProcID,
-    _ctx: Box<CaptureIoProcContext>,
-}
-
-impl CaptureIoProcHandle {
-    pub fn start(device: DeviceId, ctx: CaptureIoProcContext) -> Result<Self, CoreAudioError> {
-        // Best-effort; ignored either way (see the function's doc comment).
-        let _ = set_stream_format_non_interleaved(device, Direction::Input, ctx.outputs.len());
-        let mut ctx = Box::new(ctx);
-        let mut proc_id: AudioDeviceIOProcID = None;
-        check(unsafe {
-            AudioDeviceCreateIOProcID(
-                device,
-                Some(capture_ioproc_trampoline),
-                ctx.as_mut() as *mut CaptureIoProcContext as *mut _,
-                &mut proc_id,
-            )
-        })?;
-        if let Err(e) = check(unsafe { AudioDeviceStart(device, proc_id) }) {
-            unsafe { AudioDeviceDestroyIOProcID(device, proc_id) };
-            return Err(e);
-        }
-        Ok(Self {
-            device,
-            proc_id,
-            _ctx: ctx,
-        })
-    }
-}
-
-impl Drop for CaptureIoProcHandle {
-    fn drop(&mut self) {
-        unsafe {
-            AudioDeviceStop(self.device, self.proc_id);
-            AudioDeviceDestroyIOProcID(self.device, self.proc_id);
-        }
-    }
 }
 
 /// Per-device state for a registered render IOProc, symmetric to
@@ -646,13 +544,17 @@ impl RenderIoProcContext {
             interleave: vec![0.0; MAX_IO_CHANNELS * scratch_capacity],
         }
     }
+
+    pub(crate) fn channel_count(&self) -> usize {
+        self.inputs.len()
+    }
 }
 
 /// # Real-time safety
 /// Same reasoning as [`capture_ioproc_trampoline`]: no allocation (every
 /// buffer sized once at construction), `rtrb::Consumer::pop` is
 /// lock-free.
-unsafe extern "C" fn render_ioproc_trampoline(
+pub(crate) unsafe extern "C" fn render_ioproc_trampoline(
     _device: AudioObjectID,
     _now: *const AudioTimeStamp,
     _input_data: *const AudioBufferList,
@@ -706,48 +608,6 @@ unsafe extern "C" fn render_ioproc_trampoline(
     0
 }
 
-/// A running render IOProc registration. Stops and unregisters on drop.
-pub struct RenderIoProcHandle {
-    device: AudioObjectID,
-    proc_id: AudioDeviceIOProcID,
-    _ctx: Box<RenderIoProcContext>,
-}
-
-impl RenderIoProcHandle {
-    pub fn start(device: DeviceId, ctx: RenderIoProcContext) -> Result<Self, CoreAudioError> {
-        // Best-effort; ignored either way (see the function's doc comment).
-        let _ = set_stream_format_non_interleaved(device, Direction::Output, ctx.inputs.len());
-        let mut ctx = Box::new(ctx);
-        let mut proc_id: AudioDeviceIOProcID = None;
-        check(unsafe {
-            AudioDeviceCreateIOProcID(
-                device,
-                Some(render_ioproc_trampoline),
-                ctx.as_mut() as *mut RenderIoProcContext as *mut _,
-                &mut proc_id,
-            )
-        })?;
-        if let Err(e) = check(unsafe { AudioDeviceStart(device, proc_id) }) {
-            unsafe { AudioDeviceDestroyIOProcID(device, proc_id) };
-            return Err(e);
-        }
-        Ok(Self {
-            device,
-            proc_id,
-            _ctx: ctx,
-        })
-    }
-}
-
-impl Drop for RenderIoProcHandle {
-    fn drop(&mut self) {
-        unsafe {
-            AudioDeviceStop(self.device, self.proc_id);
-            AudioDeviceDestroyIOProcID(self.device, self.proc_id);
-        }
-    }
-}
-
 /// A boxed real-time-safe callback for the clock-master device's IOProc
 /// (spec 1.19). Receives this callback's frame count, its captured
 /// channels (empty if the device has none), and its output channels to
@@ -768,11 +628,17 @@ impl Drop for RenderIoProcHandle {
 /// crosses from this crate's code into someone else's.
 pub type MasterTickCallback = Box<dyn FnMut(u32, &[&[f32]], &mut [&mut [f32]]) + Send>;
 
-struct MasterIoProcContext {
+pub(crate) struct MasterIoProcContext {
     callback: MasterTickCallback,
 }
 
-unsafe extern "C" fn master_ioproc_trampoline(
+impl MasterIoProcContext {
+    pub(crate) fn new(callback: MasterTickCallback) -> Self {
+        Self { callback }
+    }
+}
+
+pub(crate) unsafe extern "C" fn master_ioproc_trampoline(
     _device: AudioObjectID,
     _now: *const AudioTimeStamp,
     input_data: *const AudioBufferList,
@@ -795,185 +661,6 @@ unsafe extern "C" fn master_ioproc_trampoline(
         &mut output_channels[..output_count],
     );
     0
-}
-
-/// A running master-device IOProc registration. Stops and unregisters on
-/// drop.
-pub struct MasterIoProcHandle {
-    device: AudioObjectID,
-    proc_id: AudioDeviceIOProcID,
-    _ctx: Box<MasterIoProcContext>,
-}
-
-impl MasterIoProcHandle {
-    pub fn start(device: DeviceId, callback: MasterTickCallback) -> Result<Self, CoreAudioError> {
-        let mut ctx = Box::new(MasterIoProcContext { callback });
-        let mut proc_id: AudioDeviceIOProcID = None;
-        check(unsafe {
-            AudioDeviceCreateIOProcID(
-                device,
-                Some(master_ioproc_trampoline),
-                ctx.as_mut() as *mut MasterIoProcContext as *mut _,
-                &mut proc_id,
-            )
-        })?;
-        if let Err(e) = check(unsafe { AudioDeviceStart(device, proc_id) }) {
-            unsafe { AudioDeviceDestroyIOProcID(device, proc_id) };
-            return Err(e);
-        }
-        Ok(Self {
-            device,
-            proc_id,
-            _ctx: ctx,
-        })
-    }
-}
-
-impl Drop for MasterIoProcHandle {
-    fn drop(&mut self) {
-        unsafe {
-            AudioDeviceStop(self.device, self.proc_id);
-            AudioDeviceDestroyIOProcID(self.device, self.proc_id);
-        }
-    }
-}
-
-/// A CFString built from a dynamic, caller-supplied string. Not real-time
-/// code (device creation is a one-off control-plane call, never per
-/// block), so allocating here is fine.
-fn cfstring_from_str(s: &str) -> CFStringRef {
-    let c = std::ffi::CString::new(s).expect("CoreAudio strings must not contain a NUL byte");
-    unsafe { CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), kCFStringEncodingUTF8) }
-}
-
-/// A CFString built from one of `coreaudio-sys`'s dictionary-key
-/// constants (`&[u8; N]`, already NUL-terminated C strings, e.g.
-/// `kAudioAggregateDeviceUIDKey`) rather than a dynamic string -- no
-/// `CString` round trip needed, the bytes are already in the right shape.
-fn cfstring_from_key(key: &[u8]) -> CFStringRef {
-    unsafe {
-        CFStringCreateWithCString(
-            std::ptr::null(),
-            key.as_ptr() as *const std::os::raw::c_char,
-            kCFStringEncodingUTF8,
-        )
-    }
-}
-
-/// Creates a CoreAudio aggregate device spanning `sub_device_uids` under
-/// one clock (spec 2.3's alternative to `drift.rs`'s own correction --
-/// "let the user choose" -- and spec 2.2's ASIO-multichannel-routing
-/// mapping). `master_uid` picks which sub-device's clock the aggregate
-/// follows and must be one of `sub_device_uids`; that invariant is the
-/// caller's to uphold; CoreAudio's own error is what surfaces if it isn't.
-/// Private by default (spec's own aggregate devices are Loomix-internal
-/// plumbing, not something every app's device picker needs to show),
-/// unless `visible_in_ui` is set.
-pub fn create_aggregate_device(
-    name: &str,
-    uid: &str,
-    sub_device_uids: &[&str],
-    master_uid: &str,
-    visible_in_ui: bool,
-) -> Result<DeviceId, CoreAudioError> {
-    unsafe {
-        let name_key = cfstring_from_key(kAudioAggregateDeviceNameKey);
-        let name_value = cfstring_from_str(name);
-        let uid_key = cfstring_from_key(kAudioAggregateDeviceUIDKey);
-        let uid_value = cfstring_from_str(uid);
-        let private_key = cfstring_from_key(kAudioAggregateDeviceIsPrivateKey);
-        let private_value = if visible_in_ui {
-            kCFBooleanFalse
-        } else {
-            kCFBooleanTrue
-        };
-        let master_key = cfstring_from_key(kAudioAggregateDeviceMasterSubDeviceKey);
-        let master_value = cfstring_from_str(master_uid);
-        let sub_device_list_key = cfstring_from_key(kAudioAggregateDeviceSubDeviceListKey);
-        let sub_device_uid_key = cfstring_from_key(kAudioSubDeviceUIDKey);
-
-        let sub_device_dicts: Vec<CFDictionaryRef> = sub_device_uids
-            .iter()
-            .map(|sub_uid| {
-                let value = cfstring_from_str(sub_uid);
-                let mut keys: [*const std::os::raw::c_void; 1] = [sub_device_uid_key as *const _];
-                let mut values: [*const std::os::raw::c_void; 1] = [value as *const _];
-                let dict = CFDictionaryCreate(
-                    std::ptr::null(),
-                    keys.as_mut_ptr(),
-                    values.as_mut_ptr(),
-                    1,
-                    &kCFTypeDictionaryKeyCallBacks,
-                    &kCFTypeDictionaryValueCallBacks,
-                );
-                CFRelease(value as CFTypeRef);
-                dict
-            })
-            .collect();
-        let mut sub_device_dict_ptrs: Vec<*const std::os::raw::c_void> = sub_device_dicts
-            .iter()
-            .map(|&d| d as *const std::os::raw::c_void)
-            .collect();
-        let sub_device_array = CFArrayCreate(
-            std::ptr::null(),
-            sub_device_dict_ptrs.as_mut_ptr(),
-            sub_device_dict_ptrs.len() as CFIndex,
-            &kCFTypeArrayCallBacks,
-        );
-        for &d in &sub_device_dicts {
-            CFRelease(d as CFTypeRef);
-        }
-
-        let mut keys: [*const std::os::raw::c_void; 5] = [
-            name_key as *const _,
-            uid_key as *const _,
-            private_key as *const _,
-            master_key as *const _,
-            sub_device_list_key as *const _,
-        ];
-        let mut values: [*const std::os::raw::c_void; 5] = [
-            name_value as *const _,
-            uid_value as *const _,
-            private_value as *const _,
-            master_value as *const _,
-            sub_device_array as *const _,
-        ];
-        let description = CFDictionaryCreate(
-            std::ptr::null(),
-            keys.as_mut_ptr(),
-            values.as_mut_ptr(),
-            5,
-            &kCFTypeDictionaryKeyCallBacks,
-            &kCFTypeDictionaryValueCallBacks,
-        );
-
-        let mut device_id: AudioObjectID = 0;
-        let status = AudioHardwareCreateAggregateDevice(description, &mut device_id);
-
-        for key in [
-            name_key,
-            uid_key,
-            private_key,
-            master_key,
-            sub_device_list_key,
-            sub_device_uid_key,
-        ] {
-            CFRelease(key as CFTypeRef);
-        }
-        for value in [name_value, uid_value, master_value] {
-            CFRelease(value as CFTypeRef);
-        }
-        CFRelease(sub_device_array as CFTypeRef);
-        CFRelease(description as CFTypeRef);
-
-        check(status)?;
-        Ok(device_id)
-    }
-}
-
-/// Destroys an aggregate device created by [`create_aggregate_device`].
-pub fn destroy_aggregate_device(id: DeviceId) -> Result<(), CoreAudioError> {
-    check(unsafe { AudioHardwareDestroyAggregateDevice(id) })
 }
 
 #[cfg(test)]
@@ -1063,22 +750,6 @@ mod tests {
         assert_eq!(hog_owner(id).unwrap(), Some(our_pid));
         set_hog_owner(id, -1).expect("releasing hog mode should succeed");
         assert_eq!(hog_owner(id).unwrap(), None);
-    }
-
-    #[test]
-    #[ignore = "creates a real system aggregate device; run manually, not in CI"]
-    fn create_and_destroy_an_aggregate_device_round_trip() {
-        let id = default_output_device().expect("a default output device should exist");
-        let uid = device_uid(id).expect("uid query should succeed");
-        let aggregate_id = create_aggregate_device(
-            "Loomix test aggregate",
-            "com.loomix.test-aggregate",
-            &[&uid],
-            &uid,
-            false,
-        )
-        .expect("aggregate device creation should succeed");
-        destroy_aggregate_device(aggregate_id).expect("aggregate device teardown should succeed");
     }
 
     #[test]

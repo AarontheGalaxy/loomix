@@ -188,7 +188,7 @@ impl EngineIoDriver {
     }
 
     /// Called once per callback by the clock-master device's IOProc
-    /// (`loomix_hal::device::MasterIoProcHandle`). `master_in` is that
+    /// (`loomix_hal::device_lifecycle::MasterIoProcHandle`). `master_in` is that
     /// device's own captured channels this callback (empty if it isn't
     /// also a strip's source); `master_out` is where its bus-A1 output
     /// for this callback must be written (spec 1.19 -- the main output
@@ -271,108 +271,6 @@ fn unpack_channels(src: &[Frame], dst: &mut [&mut [f32]]) {
     }
 }
 
-/// Creates `channel_count` ring buffers, registers `device` as a
-/// drift-corrected capture IOProc (`loomix-hal`'s already-proven
-/// `DriftCorrectedIoStage`), and points `driver`'s `strip` at the
-/// consumer side. Returns the handle keeping the registration alive --
-/// dropping it stops and unregisters the device.
-/// What [`attach_capture_device`]/[`attach_render_device`] hand back: the
-/// registration keeping the device active (dropping it stops and
-/// unregisters), plus the live monitoring handles a soak harness (spec
-/// 3.4 M4) polls -- the resample ratio and the dropout count -- without
-/// needing to reach back into the `EngineIoDriver` at all.
-pub struct AttachedDevice<H> {
-    pub io: H,
-    pub ratio: loomix_hal::ioproc::RatioHandle,
-    pub dropouts: DropoutCounter,
-}
-
-pub fn attach_capture_device(
-    driver: &mut EngineIoDriver,
-    strip: usize,
-    device: DeviceId,
-    channel_count: usize,
-    master_clock: Arc<MasterClock>,
-    corrector: loomix_hal::drift::DriftCorrector,
-    ring_capacity: usize,
-) -> Result<AttachedDevice<loomix_hal::device::CaptureIoProcHandle>, CoreAudioError> {
-    let mut producers = Vec::with_capacity(channel_count);
-    let mut consumers = Vec::with_capacity(channel_count);
-    for _ in 0..channel_count {
-        let (producer, consumer) = rtrb::RingBuffer::new(ring_capacity);
-        producers.push(producer);
-        consumers.push(consumer);
-    }
-    let stage = loomix_hal::ioproc::DriftCorrectedIoStage::new(channel_count, corrector);
-    let ratio = stage.ratio_handle();
-    let ctx = loomix_hal::device::CaptureIoProcContext::new(
-        stage,
-        master_clock,
-        producers,
-        ring_capacity,
-    );
-    let io = loomix_hal::device::CaptureIoProcHandle::start(device, ctx)?;
-    let source = StripSource::new(consumers);
-    let dropouts = source.underrun_counter();
-    driver.set_strip_source(strip, source);
-    Ok(AttachedDevice {
-        io,
-        ratio,
-        dropouts,
-    })
-}
-
-/// The render-side mirror of [`attach_capture_device`]: registers `device`
-/// as a drift-corrected render IOProc and points `driver`'s `bus` at the
-/// producer side.
-pub fn attach_render_device(
-    driver: &mut EngineIoDriver,
-    bus: usize,
-    device: DeviceId,
-    channel_count: usize,
-    master_clock: Arc<MasterClock>,
-    corrector: loomix_hal::drift::DriftCorrector,
-    ring_capacity: usize,
-) -> Result<AttachedDevice<loomix_hal::device::RenderIoProcHandle>, CoreAudioError> {
-    let mut producers = Vec::with_capacity(channel_count);
-    let mut consumers = Vec::with_capacity(channel_count);
-    for _ in 0..channel_count {
-        let (producer, consumer) = rtrb::RingBuffer::new(ring_capacity);
-        producers.push(producer);
-        consumers.push(consumer);
-    }
-    let stage = loomix_hal::ioproc::DriftCorrectedIoStage::new(channel_count, corrector);
-    let ratio = stage.ratio_handle();
-    let ctx =
-        loomix_hal::device::RenderIoProcContext::new(stage, master_clock, consumers, ring_capacity);
-    let io = loomix_hal::device::RenderIoProcHandle::start(device, ctx)?;
-    let sink = BusSink::new(producers);
-    let dropouts = sink.overrun_counter();
-    driver.set_bus_sink(bus, sink);
-    Ok(AttachedDevice {
-        io,
-        ratio,
-        dropouts,
-    })
-}
-
-/// Registers `device` as the clock-master IOProc (spec 1.19), driving
-/// `driver`'s engine tick from here on. Takes `driver` by value
-/// deliberately: once the master starts, `driver` lives entirely on its
-/// real-time thread inside the registered callback, not shared with
-/// anything else -- call this last, after every other device has already
-/// been attached with [`attach_capture_device`]/[`attach_render_device`].
-pub fn attach_master_device(
-    device: DeviceId,
-    mut driver: EngineIoDriver,
-) -> Result<loomix_hal::device::MasterIoProcHandle, CoreAudioError> {
-    let callback: loomix_hal::device::MasterTickCallback =
-        Box::new(move |frames, input, output| {
-            driver.on_master_tick(frames as usize, input, output);
-        });
-    loomix_hal::device::MasterIoProcHandle::start(device, callback)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +284,25 @@ mod tests {
             master_strip,
             256,
         )
+    }
+
+    // Read-only (a device enumeration, same as loomix-hal's own device
+    // tests), safe to run in CI unlike anything in device_wiring.rs --
+    // this only asserts `select_clock_master` reaches real CoreAudio and
+    // returns *some* answer, never which specific device that is.
+    #[test]
+    fn select_clock_master_resolves_against_real_enumeration() {
+        let configured = loomix_hal::device::default_output_device().ok();
+        let result = select_clock_master(configured);
+        assert!(result.is_ok(), "enumeration should succeed on any Mac");
+        if let (Some(id), Ok(loomix_hal::clock::ClockSource::Device(resolved))) =
+            (configured, result)
+        {
+            assert_eq!(
+                resolved, id,
+                "the configured default output device should resolve as itself"
+            );
+        }
     }
 
     #[test]
