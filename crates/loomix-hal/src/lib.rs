@@ -10,6 +10,7 @@
 //! verified separately (`driver` CI job, manual hardware soak).
 
 pub mod clock;
+pub mod device;
 pub mod drift;
 pub mod hog;
 pub mod hotplug;
