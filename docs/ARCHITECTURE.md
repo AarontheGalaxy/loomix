@@ -5,6 +5,75 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-22 — M4 (continued, loomix-app wiring)
+
+**`loomix-app::engine_io` -- assembling per-strip/per-bus ring buffers
+around `Engine::process_block` and deciding which device drives the
+tick -- is pure, `#![forbid(unsafe_code)]` Rust with no CoreAudio calls of
+its own, matching spec 3.2's crate boundary: `loomix-hal` stops at handing
+over correctly-resampled frames across a ring, `loomix-app` is what "wires
+everything together."** `select_clock_master` adds nothing but a live
+device enumeration on top of `loomix-hal::clock::resolve_clock_source`,
+already pure and tested; no logic is duplicated. Being pure meant the
+ring-assembly logic itself got the same offline test treatment as
+everything else in `loomix-hal` this milestone, with synthetic
+`rtrb::RingBuffer`s standing in for real devices.
+
+**The clock-master device's own strip/bus (if it has one of each) bypass
+the ring-buffer path entirely and are handled directly inside
+`EngineIoDriver::on_master_tick`, rather than going through
+`StripSource`/`BusSink` like every other device.** The first design
+considered treated the master uniformly with everyone else -- push its
+captured audio through a ring, drain its render channel from a ring, with
+an extra hook that also advanced the clock and ran the engine tick. That
+has a real ordering bug: for capture, the hook needs to run *after*
+`on_capture` has pushed this callback's fresh audio; for render, the
+engine tick needs to run *before* `on_render` pulls this callback's
+output, and a real full-duplex device's IOProc gets *both* buffers in one
+callback, so both orderings are needed in the same call. Rather than fight
+that, `loomix-hal::device::MasterIoProcHandle` (see below) hands the
+master's raw capture and render buffers to the engine driver directly,
+synchronously, in the one call CoreAudio actually makes -- no ring, no
+ordering question. `MASTER_BUS` is hardcoded to bus 0 (A1), not a
+configurable field: spec 1.19 defines the clock master *as* "the main
+output device," which spec 1.1 already fixes as bus A1.
+
+**`EngineIoDriver::on_master_tick` builds the `[&[Frame]; NUM_STRIPS]` /
+`[&mut [Frame]; NUM_BUSES]` arguments to `process_block` with
+`[T; N]::each_ref()`/`each_mut()`, not `Vec::collect()`.** The obvious way
+to build those arrays (`self.scratch_outputs.iter_mut().map(|v|
+v.as_mut_slice()).collect()`) allocates a `Vec` -- fine in the M3 tests
+that do exactly this, wrong here, since this runs on the real-time thread
+the master's IOProc calls. `each_mut()` gives disjoint mutable references
+to the array's elements structurally, with no heap allocation, which a
+naive `std::array::from_fn(|i| ...)` closure repeatedly indexing
+`self.scratch_outputs[i]` can't offer the borrow checker (each call would
+need to prove disjointness across separate closure invocations, which it
+can't) -- `each_mut()` sidesteps needing that proof at all.
+
+**Found while wiring this up: the CI `rt_safety` job only ever ran
+`loomix-core`'s own real-time tests -- every `assert_realtime` test added
+to `loomix-hal` this milestone (`resample.rs`, `master_clock.rs`,
+`ioproc.rs`) and every one now in `loomix-app::engine_io` had only ever
+run with the flag-only, non-panicking version of `assert_realtime`, never
+with the actual trapping allocator, in CI or otherwise.** The trapping
+allocator is a `#[global_allocator]`, process-wide, installed only when
+`loomix-core` is built with its `rt-assert` feature; neither `loomix-hal`
+nor `loomix-app` declared that feature themselves, and `ci.yml`'s
+`rt_safety` job only ever tested `-p loomix-core`. Fixed without adding a
+passthrough feature to either crate: Cargo's `-p <crate> --features
+<dep>/<feature>` syntax enables a dependency's feature directly, so
+`cargo test -p loomix-hal --features loomix-core/rt-assert` (and the same
+for `loomix-app`) gets the real trap without either crate's `Cargo.toml`
+knowing about `rt-assert` at all. Verified locally, not assumed: both
+commands pass with the trap active, which is proof the guarded code paths
+(`Resampler::process`, `DriftCorrectedIoStage::on_capture`/`on_render`,
+`MasterClock`, `EngineIoDriver::on_master_tick`) genuinely don't allocate,
+not just that the tests happened not to notice. Same class of gap as the
+driver-install CI leg earlier this milestone: a real-time-safety test that
+never actually exercises the trap is exactly as decorative as a
+device-enumeration check against a driver that was never installed.
+
 ## 2026-08-22 — M4 (continued, IOProc registration)
 
 **`device.rs`'s real IOProc registration (`CaptureIoProcHandle`,
