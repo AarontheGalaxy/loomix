@@ -9,8 +9,11 @@ jobs:
     # Needs packaging/build-pkg.sh (ships alongside the first release-ready
     # milestone, spec section 3.4 targets 0.1.0 at M4) and the Developer ID
     # signing secrets below configured in the repository before it can
-    # produce a real artifact; the shape is in place so tagging just works
-    # once those exist.
+    # produce a real artifact. Until then, the steps that need it are gated
+    # on the check below and skip cleanly instead of failing -- see
+    # docs/ARCHITECTURE.md, "release.yml skips packaging until it exists"
+    # for why. The build/xcodebuild steps stay unconditional: they're real
+    # signal (does the release build compile?) on every tag regardless.
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
@@ -20,14 +23,26 @@ jobs:
       - run: cargo build --workspace --release --target aarch64-apple-darwin
       - run: cargo build --workspace --release --target x86_64-apple-darwin
       - run: xcodebuild -project driver/LoomixAudioDriver.xcodeproj -scheme LoomixAudioDriver -configuration Release build ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO
+      - name: Check whether packaging is implemented yet
+        id: packaging
+        run: |
+          if [ -f packaging/build-pkg.sh ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::packaging/build-pkg.sh doesn't exist yet -- skipping signing, packaging, notarisation and the release upload for this tag. The build/xcodebuild steps above already ran and passed."
+          fi
       - name: Import Developer ID signing identity
+        if: steps.packaging.outputs.exists == 'true'
         env:
           DEVELOPER_ID_CERTIFICATE_P12: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12 }}
           DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
         run: ./packaging/scripts/import-signing-identity.sh
       - name: Build and sign the installer package
+        if: steps.packaging.outputs.exists == 'true'
         run: ./packaging/build-pkg.sh
       - name: Notarise
+        if: steps.packaging.outputs.exists == 'true'
         env:
           NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
           NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}
@@ -40,8 +55,10 @@ jobs:
             --wait
           xcrun stapler staple packaging/build/Loomix.pkg
       - name: Generate release notes from conventional commits
+        if: steps.packaging.outputs.exists == 'true'
         run: git log "$(git describe --tags --abbrev=0 HEAD^)"..HEAD --pretty=format:"- %s" > release-notes.md
       - uses: softprops/action-gh-release@v3
+        if: steps.packaging.outputs.exists == 'true'
         with:
           files: packaging/build/Loomix.pkg
           body_path: release-notes.md

@@ -5,6 +5,28 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-23 — release.yml skips packaging until it exists
+
+**`release.yml`'s signing/notarising/pkg-build/release-upload steps are
+now gated behind a check for `packaging/build-pkg.sh`, and skip cleanly
+with a `::notice::` instead of failing when it's absent.** The `v0.1.0`
+tag push actually ran this workflow and it failed, hard, at "Import
+Developer ID signing identity" — the earlier M0 log entry calling this
+job "guarded or documented as inert" was wrong; it was only documented,
+never guarded. A workflow that fails on every tag between now and M12,
+when `packaging/` actually lands (spec 3.4), trains exactly the kind of
+red-means-nothing habit CI exists to prevent. The alternative was
+disabling the workflow outright until M12; rejected because the
+`cargo build --release` (both targets) and `xcodebuild -configuration
+Release` steps are real, standing signal independent of packaging — they
+catch a release build that doesn't compile, on every tag, and disabling
+the whole workflow would throw that away for no reason. The gate mirrors
+`nightly.yml`'s existing `fuzz`/`soak` pattern (check whether the thing a
+later milestone adds exists yet; skip with a message if not) rather than
+inventing a new mechanism. No workflow edit needed at M12: the moment
+`packaging/build-pkg.sh` exists, `steps.packaging.outputs.exists` flips to
+`true` and every gated step runs for real.
+
 ## 2026-08-23 — M4's real acceptance criterion is not yet met (outstanding)
 
 **The 30-minute soak has been run (macOS 26.6, build 25G72;
