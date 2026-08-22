@@ -14,4 +14,6 @@ pub mod device;
 pub mod drift;
 pub mod hog;
 pub mod hotplug;
+pub mod ioproc;
+pub mod master_clock;
 pub mod resample;

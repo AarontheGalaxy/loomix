@@ -15,3 +15,4 @@ proptest = "1"
 
 [dependencies]
 coreaudio-sys = { version = "0.2.18", default-features = false, features = ["core_audio"] }
+rtrb = "0.4.0"
