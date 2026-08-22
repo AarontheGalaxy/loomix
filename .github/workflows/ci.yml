@@ -38,13 +38,32 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p loomix-core --features rt-assert -- realtime
+      # loomix-core's rt-assert allocator is process-wide (spec 3.3): a
+      # crate that only depends on loomix-core (never declaring its own
+      # rt-assert feature) still gets the trap by enabling loomix-core's
+      # feature directly via `dep/feature`. Full suites, not `-- realtime`
+      # only: unlike loomix-core these crates don't name every real-time
+      # test that way, and running everything under the trap costs nothing
+      # extra -- a test that never enters `assert_realtime` is unaffected.
+      - run: cargo test -p loomix-hal --features loomix-core/rt-assert
+      - run: cargo test -p loomix-app --features loomix-core/rt-assert
   coverage:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 80
+      # --ignore-filename-regex excludes exactly the files that start real
+      # CoreAudio I/O or create a real system device -- deliberately never
+      # run by the automated test suite (see each file's own doc comment:
+      # loomix-hal/src/device_lifecycle.rs, loomix-app/src/device_wiring.rs,
+      # loomix-soak/src/main.rs). Not a general carve-out for
+      # CoreAudio-adjacent code: device.rs's enumeration/trampoline logic
+      # and engine_io.rs's ring-assembly logic stay in the gate because
+      # they're exercised directly, by hand-built buffers and real
+      # (successful) enumeration calls. The gate stays meaningful for
+      # everything that can actually be tested; the threshold does not move.
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 80 --ignore-filename-regex '(device_lifecycle\.rs|device_wiring\.rs|loomix-soak/src/main\.rs)$'
       - uses: codecov/codecov-action@v7
   driver:
     runs-on: macos-15
@@ -57,7 +76,14 @@ jobs:
       - run: driver/build/test_driver_host
       - run: clang -Wall -Wextra -Werror -std=gnu17 -DLOOMIX_CALLOC=FailingCalloc -DLOOMIX_MALLOC=FailingMalloc -framework CoreFoundation -framework CoreAudio -o driver/build/test_driver_host_fault_injection driver/tests/test_driver_host.c driver/LoomixAudioDriver/LoomixAudioDriver.c driver/LoomixAudioDriver/RingBuffer.c
       - run: driver/build/test_driver_host_fault_injection
-      - run: xcodebuild -project driver/LoomixAudioDriver.xcodeproj -scheme LoomixAudioDriver -configuration Release build CODE_SIGNING_ALLOWED=NO
+      # Ad-hoc signed, `-derivedDataPath driver/build`, matching what
+      # `driver/scripts/install.sh` looks for (and what `just
+      # install-driver` builds locally) -- a plain `CODE_SIGNING_ALLOWED=NO`
+      # build here would leave install.sh with no product to find, so the
+      # M4 hal-side device-enumeration checks below would run against a
+      # driver that was never actually installed on this runner.
+      - run: xcodebuild -project driver/LoomixAudioDriver.xcodeproj -scheme LoomixAudioDriver -configuration Release -derivedDataPath driver/build build CODE_SIGN_IDENTITY=-
+      - run: ./driver/scripts/install.sh
       - run: brew install llvm
       - run: ./driver/tests/run-static-checks.sh
   ui:

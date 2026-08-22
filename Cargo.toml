@@ -9,6 +9,7 @@ members = [
     "crates/loomix-config",
     "crates/loomix-cli",
     "crates/loomix-app",
+    "crates/loomix-soak",
 ]
 
 [workspace.package]

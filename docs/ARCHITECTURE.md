@@ -5,6 +5,422 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-23 — M4's real acceptance criterion is not yet met (outstanding)
+
+**The 30-minute soak has been run (macOS 26.6, build 25G72;
+`com.loomix.audiodriver.outA1` as master, `com.loomix.audiodriver.outA2`
+as the drift-corrected device; `timeout -k 60 35m ... --duration 30m`;
+zero dropouts, exit PASS) but this run does not satisfy spec 3.4 M4's
+acceptance criterion ("a 30 minute soak test on two devices with
+different clocks shows no dropouts and bounded drift"), and M4 is not
+being called accepted on the strength of it.** Recorded here plainly
+rather than filed as a passing checkbox, on direct instruction, because
+the gap is real and specific, not a formality:
+
+1. Both devices were idle Loomix virtual outputs (`outA1`/`outA2`), not
+   two physically independent interfaces. Both are software-clocked off
+   this process's own timer -- they do not have "different clocks" in the
+   sense spec 1.19 means (two devices whose *hardware* crystals drift
+   against each other). The drift ratio stayed at exactly `1.000000` for
+   the full 1800 seconds, not "close to 1.0 and bounded" the way a
+   corrector actively holding two real clocks together would show, but
+   completely flat -- direct evidence the PI controller and the resampler
+   were never actually engaged, because there was nothing to correct.
+   This run proves the IOProc/ring-buffer/engine path stays clean under
+   real CoreAudio scheduling for 30 minutes; it does not exercise drift
+   correction, which is the entire subject of spec 2.3 and most of this
+   milestone's code.
+2. Both buses carried silence throughout (`loomix-soak`'s own printed
+   caveat -- "both buses carry silence -- this measures timing and
+   dropouts, not audio content" -- by design, for the reasons in the
+   two-output-device entry above), but it means denormal handling and
+   real per-sample DSP cost were never exercised either over a sustained
+   run.
+3. Consequently: `dropouts: 0` and `PASS` in this run's output demonstrate
+   the wiring doesn't fall over on its own, not that "bounded drift" has
+   been observed at all -- there was no drift to bound.
+
+**What would actually satisfy spec 3.4 M4's acceptance criterion:** two
+genuinely independent physical audio interfaces (e.g. this machine's
+built-in output plus a real external USB/Thunderbolt/Bluetooth interface,
+not two Loomix virtual devices, not one physical device aggregated with
+itself), carrying real signal rather than silence, run for 30 minutes,
+with a *non-zero* drift ratio actually observed and staying bounded
+(not saturating `DriftCorrector`'s `max_correction` clamp) and zero
+dropouts throughout. Until that specific run exists and is recorded here,
+M4's hardware-clocking claim rests on the synthetic fake-device tests in
+`loomix-hal::ioproc` and `loomix-hal::drift`, not on hardware evidence,
+and should be described that way.
+
+## 2026-08-23 — M4 (continued, the coverage gate)
+
+**CI's `coverage` job failed at 78.21% against the 80% gate after this
+milestone's work; fixed by excluding specifically the code that starts
+real device I/O or creates a real system device, never by lowering the
+threshold.** Measured before changing anything: three files accounted for
+nearly all of the 544 missed lines. `loomix-soak/src/main.rs` (183 of 183
+lines, 0%) had no tests at all. `loomix-hal/src/device.rs` (271 of 907)
+was mostly the `?`-error-propagation arm of real CoreAudio calls (can't be
+triggered without an actual hardware failure) plus the entirely-unexercised
+bodies of `CaptureIoProcHandle`/`RenderIoProcHandle`/`MasterIoProcHandle::start`,
+`create_aggregate_device` and `set_stream_format_non_interleaved` -- none
+run automatically, deliberately, the same reasoning the hog-mode
+round-trip test was already `#[ignore]`d for. `loomix-app/src/engine_io.rs`
+(80 of 287) was `select_clock_master` (read-only enumeration, actually
+safe to test) and `attach_capture_device`/`attach_render_device`/
+`attach_master_device` (call the `*Handle::start` functions above -- same
+category).
+
+Stable Rust has no per-function coverage exclusion -- confirmed directly:
+`#[coverage(off)]` requires `#![feature(coverage_attribute)]`, which
+`rustc 1.97.1` (this toolchain) rejects with "experimental feature."
+`cargo-llvm-cov`'s only exclusion mechanism on stable is
+`--ignore-filename-regex`, file-level. Excluding the two whole files
+(`device.rs`, `engine_io.rs`) would have thrown away real, earned coverage
+credit for the enumeration/trampoline/ring-assembly logic those files
+*do* test -- so each got split: the never-automatically-exercised
+functions moved into new files
+(`loomix-hal/src/device_lifecycle.rs`, `loomix-app/src/device_wiring.rs`)
+carrying the doc-comment explanation, leaving the tested logic
+(trampolines, `CaptureIoProcContext`/`RenderIoProcContext`,
+`StripSource`/`BusSink`/`EngineIoDriver`) in the original files, still
+counted. `ci.yml`'s `coverage` job and `justfile`'s `cover` recipe now
+pass `--ignore-filename-regex '(device_lifecycle\.rs|device_wiring\.rs|loomix-soak/src/main\.rs)$'`
+with a comment pointing at the same reasoning, so the exclusion is visible
+at the point it's applied, not just in the excluded files themselves.
+
+`loomix-soak/src/main.rs` got the same treatment for its one genuinely
+pure piece: `parse_duration` moved to `duration.rs` (not excluded, six new
+tests) and was changed from calling `std::process::exit` on a bad value to
+returning `Result<Duration, String>`, since a function that can only fail
+by killing the test process can't be tested at all -- `main()` keeps the
+same exit-with-message behaviour at the one call site that needs it.
+
+Net result, verified locally before touching CI: 78.21% (failing) to
+97.09% (`cargo llvm-cov --workspace --all-features --ignore-filename-regex
+...`), with the excluded files' own doc comments naming the reason and the
+`select_clock_master`/`parse_duration` additions being real new test
+coverage, not exclusions dressed up as fixes.
+
+## 2026-08-22 — M4 (continued, the soak harness and the interleaved-format bug)
+
+**`loomix-soak` is a new crate (spec 3.4 M4's 30-minute two-device
+acceptance test), wiring two real output devices together end to end and
+reporting a measured PASS/FAIL, not a runnable-only demo.** Two *output*
+devices, not an output and an input, even though the milestone's own
+IOProc work supports capture too: a first version defaulted to the system
+input device and measured 100% underrun in testing here, traced to a
+macOS microphone (TCC) permission gate on the terminal process, not a
+wiring bug -- confirmed by swapping to two output devices, which need no
+such permission, and matches spec 1.19's own literal example of what
+needs drift correction ("outputs A1 through A5 are not sample
+synchronous... when they run on different physical devices") at least as
+well as a capture scenario would. `nightly.yml` already referenced a
+`loomix-soak` package by name and a `--duration 2h` invocation before this
+crate existed; that leg is still M9's (recorder folded in), not this
+binary's current two-device-only shape, but the name and the
+`--duration` flag already match.
+
+**Wiring the soak harness for real surfaced a genuine bug no offline test
+could have caught: `capture_ioproc_trampoline`/`render_ioproc_trampoline`
+assumed one `AudioBuffer` per channel (non-interleaved), and every real
+output device tried on this machine -- the built-in speaker, an external
+monitor's speakers, BlackHole -- delivers one interleaved buffer instead.**
+`on_render` saw `output.len() == 1` against `channel_count == 2`
+resamplers; `debug_assert_eq!` would catch that in a debug build, but
+`cargo run --release` (what a real soak needs) compiles the assert out,
+and `zip()` silently processes only the shorter side, so the second
+channel's ring buffer is never drained and overruns forever. Manifested
+as continuous dropouts within about a second, on every real device pair
+tried, never once as a test failure -- there is no synthetic stand-in for
+a real device's actual stream format, exactly the category of bug this
+milestone's whole test strategy (pure/offline logic plus a manual
+hardware soak as final confirmation) was designed to still let through
+until the soak itself ran. First fix attempt: request a non-interleaved
+format explicitly via `AudioObjectSetPropertyData` before registering the
+IOProc (`set_stream_format_non_interleaved`). That call reports success
+and *still doesn't change what's delivered* -- confirmed by reading the
+format back immediately after setting it, which showed the interleaved
+flag unchanged. Real fix:
+`read_input_channels_planar`/`render_ioproc_trampoline`'s interleaved
+branch detect a single multi-channel `AudioBuffer` and
+deinterleave/interleave through scratch storage (`CaptureIoProcContext`'s
+`deinterleave` / `RenderIoProcContext`'s `interleave` fields, `chunks_exact_mut`
+splitting a flat scratch buffer into disjoint per-channel views, no
+allocation on the real-time thread) rather than trusting the format
+request to have taken effect. `set_stream_format_non_interleaved` is kept
+as a best-effort call whose result is now ignored -- harmless on devices
+that do honour it, irrelevant on the ones that don't since the trampolines
+adapt either way. `master_ioproc_trampoline` was *not* given the same
+fix: it hands raw buffers straight to a caller-supplied callback with no
+per-device channel count or scratch to deinterleave into, so it keeps the
+same interleaved-format gap, documented at the call site
+(`read_input_channels`'s doc comment) rather than silently carried
+forward -- not hit by the current soak scenario (the master's own
+strip/bus aren't used, `master_strip: None`), but a real gap for whenever
+a full-duplex master device and real audio content are both in play.
+
+Verified for real, not assumed, at every step of this fix: the format
+readback showing the set didn't take, the trampoline-level regression
+tests added for both the interleaved-capture and interleaved-render cases
+(`capture_trampoline_deinterleaves_a_single_interleaved_buffer`,
+`render_trampoline_interleaves_output_into_a_single_buffer`), and finally
+a 30-second `loomix-soak` run against the built-in speaker and BlackHole
+reporting zero dropouts after the fix, versus continuous overrun before
+it.
+
+## 2026-08-22 — M4 (continued, loomix-app wiring)
+
+**`loomix-app::engine_io` -- assembling per-strip/per-bus ring buffers
+around `Engine::process_block` and deciding which device drives the
+tick -- is pure, `#![forbid(unsafe_code)]` Rust with no CoreAudio calls of
+its own, matching spec 3.2's crate boundary: `loomix-hal` stops at handing
+over correctly-resampled frames across a ring, `loomix-app` is what "wires
+everything together."** `select_clock_master` adds nothing but a live
+device enumeration on top of `loomix-hal::clock::resolve_clock_source`,
+already pure and tested; no logic is duplicated. Being pure meant the
+ring-assembly logic itself got the same offline test treatment as
+everything else in `loomix-hal` this milestone, with synthetic
+`rtrb::RingBuffer`s standing in for real devices.
+
+**The clock-master device's own strip/bus (if it has one of each) bypass
+the ring-buffer path entirely and are handled directly inside
+`EngineIoDriver::on_master_tick`, rather than going through
+`StripSource`/`BusSink` like every other device.** The first design
+considered treated the master uniformly with everyone else -- push its
+captured audio through a ring, drain its render channel from a ring, with
+an extra hook that also advanced the clock and ran the engine tick. That
+has a real ordering bug: for capture, the hook needs to run *after*
+`on_capture` has pushed this callback's fresh audio; for render, the
+engine tick needs to run *before* `on_render` pulls this callback's
+output, and a real full-duplex device's IOProc gets *both* buffers in one
+callback, so both orderings are needed in the same call. Rather than fight
+that, `loomix-hal::device::MasterIoProcHandle` (see below) hands the
+master's raw capture and render buffers to the engine driver directly,
+synchronously, in the one call CoreAudio actually makes -- no ring, no
+ordering question. `MASTER_BUS` is hardcoded to bus 0 (A1), not a
+configurable field: spec 1.19 defines the clock master *as* "the main
+output device," which spec 1.1 already fixes as bus A1.
+
+**`EngineIoDriver::on_master_tick` builds the `[&[Frame]; NUM_STRIPS]` /
+`[&mut [Frame]; NUM_BUSES]` arguments to `process_block` with
+`[T; N]::each_ref()`/`each_mut()`, not `Vec::collect()`.** The obvious way
+to build those arrays (`self.scratch_outputs.iter_mut().map(|v|
+v.as_mut_slice()).collect()`) allocates a `Vec` -- fine in the M3 tests
+that do exactly this, wrong here, since this runs on the real-time thread
+the master's IOProc calls. `each_mut()` gives disjoint mutable references
+to the array's elements structurally, with no heap allocation, which a
+naive `std::array::from_fn(|i| ...)` closure repeatedly indexing
+`self.scratch_outputs[i]` can't offer the borrow checker (each call would
+need to prove disjointness across separate closure invocations, which it
+can't) -- `each_mut()` sidesteps needing that proof at all.
+
+**Found while wiring this up: the CI `rt_safety` job only ever ran
+`loomix-core`'s own real-time tests -- every `assert_realtime` test added
+to `loomix-hal` this milestone (`resample.rs`, `master_clock.rs`,
+`ioproc.rs`) and every one now in `loomix-app::engine_io` had only ever
+run with the flag-only, non-panicking version of `assert_realtime`, never
+with the actual trapping allocator, in CI or otherwise.** The trapping
+allocator is a `#[global_allocator]`, process-wide, installed only when
+`loomix-core` is built with its `rt-assert` feature; neither `loomix-hal`
+nor `loomix-app` declared that feature themselves, and `ci.yml`'s
+`rt_safety` job only ever tested `-p loomix-core`. Fixed without adding a
+passthrough feature to either crate: Cargo's `-p <crate> --features
+<dep>/<feature>` syntax enables a dependency's feature directly, so
+`cargo test -p loomix-hal --features loomix-core/rt-assert` (and the same
+for `loomix-app`) gets the real trap without either crate's `Cargo.toml`
+knowing about `rt-assert` at all. Verified locally, not assumed: both
+commands pass with the trap active, which is proof the guarded code paths
+(`Resampler::process`, `DriftCorrectedIoStage::on_capture`/`on_render`,
+`MasterClock`, `EngineIoDriver::on_master_tick`) genuinely don't allocate,
+not just that the tests happened not to notice. Same class of gap as the
+driver-install CI leg earlier this milestone: a real-time-safety test that
+never actually exercises the trap is exactly as decorative as a
+device-enumeration check against a driver that was never installed.
+
+## 2026-08-22 — M4 (continued, IOProc registration)
+
+**`device.rs`'s real IOProc registration (`CaptureIoProcHandle`,
+`RenderIoProcHandle`) is thin glue over `ioproc.rs`'s already-proven
+`DriftCorrectedIoStage`: parse CoreAudio's `AudioBufferList` into planar
+slices, call the same `on_capture`/`on_render` methods the fake-device
+harness already exercises, nothing decision-worthy added here.** Assumes
+non-interleaved streams (one `AudioBuffer` per channel) -- the common,
+controllable case, not a claim every device format is handled.
+
+**An early draft of the render trampoline had a real soundness bug caught
+before it ever ran: `array::from_fn` over the full `MAX_IO_CHANNELS` (8)
+range read `MaybeUninit` slots that were only initialised up to `count`,
+so any device with fewer than 8 channels -- the common case -- read
+uninitialised memory as a `&mut [f32]` reference.** Rewritten to build
+each of the 8 array slots directly inside the `from_fn` closure (a real
+disjoint sub-slice for `i < count`, an always-valid empty slice
+otherwise), which needs no `MaybeUninit` at all: each closure invocation
+constructs its own value, so the `Copy` bound a `[expr; N]` repeat would
+need never comes up.
+
+**The buffer-list-parsing logic got automated coverage after all, by
+calling the trampoline functions directly with a hand-built
+`AudioBufferList`, rather than being left entirely untested like the rest
+of this file.** They're plain `unsafe extern "C" fn`s; nothing requires
+going through real CoreAudio registration to call them, the same reasoning
+M2's `test_driver_host.c` used to drive the driver's vtable in-process.
+This paid off immediately: the first version of both new tests built the
+`AudioBufferList` from a temporary `&mut [ch0.clone(), ch1.clone()]`
+array, whose backing `Vec`s are dropped at the end of that `let` statement
+-- before the buffer list is ever read -- leaving every `mData` pointer
+dangling from construction. That version SIGKILLed the test binary (heap
+corruption, not a clean panic or a useful backtrace); diagnosed by running
+the two new tests individually to isolate which one crashed, since the
+whole-module run gave no other signal. Fixed by having `TestBufferList`
+*own* the channel `Vec`s (moved in, stored alongside `storage`) rather
+than borrowing them, so their lifetime is tied to the buffer list's own
+rather than to an anonymous temporary.
+
+## 2026-08-22 — M4 (continued)
+
+**`ioproc.rs`'s drift-corrected capture fed the PI controller the wrong
+error signal, and this was found by the fake-device harness, not
+predicted in advance.** The first version tracked `device_frames`, the
+device's own raw cumulative sample count (incremented every callback by
+however many frames the callback actually delivered), and computed error
+as `device_frames - master.frames()`. `a_drifting_fake_device_reconstructs_the_tone_within_bounded_drift`
+(500 ppm, 2000 callbacks) failed its frequency check by 10x, and
+`IOPROC_DEBUG` tracing showed why: with a *constant* ppm offset, a
+device's raw clock offset from the master grows without bound for as long
+as the device keeps running, no matter how well the output is being
+corrected -- correction changes what the *resampled output* looks like,
+not the device's own physical clock. Feeding that ever-growing raw offset
+into the PI controller gave it an error signal that could never converge,
+so the integral saturated within a few hundred callbacks and `ratio`
+stuck at `1.0 - max_correction` (0.99) for nearly the whole run -- a 0.7%
+mistune when the actual injected error was 0.05%, twenty-eight times too
+much correction, silently, because the controller was reacting correctly
+to a fundamentally wrong number. The fix renames the field to
+`progress_frames` and changes what accumulates into it: for capture, the
+resampler's actual output count (`written`, from `Resampler::process`);
+for render, the actual input count consumed (`consumed`). That quantity
+*is* what the correction affects and is supposed to converge to track the
+master, exactly the property drift.rs's own `simulate()` harness already
+modelled correctly (`device_cumulative += ... * applied_ratio`) -- the bug
+was introduced translating that model into the real per-callback code, not
+in the model itself.
+
+Second-order finding from chasing the above: an interim version of the
+test asserted the reconstructed tone's Goertzel magnitude stayed within
+`0.9..=1.1` of a clean reference over the full ~5.3-second run. After the
+real fix, frame-count drift was already excellent (order of a couple
+hundred frames against a quarter-million-frame run) and the resample
+ratio never left roughly a ±0.3% band -- matching drift.rs's own bound at
+the same kp/ki -- yet that assertion still failed. A frequency scan around
+1 kHz showed the tone's energy spread across neighbouring bins rather than
+missing outright, and a sample-delta scan found zero discontinuities: not
+corruption, just enough accumulated phase jitter over a long single-tone
+Goertzel measurement to fail a tight absolute-gain bound on a correctly
+bounded but not perfectly smooth ratio. The test now asserts what actually
+matters -- frame-count drift bounded (`< 300`, alongside `hotplug`-table-style
+direct measurement) and the tone dominating a clearly different frequency
+by 5x, the same "dominates" style `resample.rs`'s own non-unity-ratio test
+already uses for the identical reason -- rather than a stricter bound nothing
+else in the codebase actually asks a resampler to meet.
+
+## 2026-08-22 — M4
+
+**`loomix-hal`'s algorithmic pieces -- clock master selection, drift
+estimation, the resampler, hot-plug handling, hog-mode fallback -- are
+pure functions over plain data (`clock.rs`, `drift.rs`, `resample.rs`,
+`hotplug.rs`, `hog.rs`), with no CoreAudio calls and no wall-clock time.**
+Same move as M3's engine core, and the M1/M2 lesson logged below: push
+logic somewhere offline-testable, keep the CoreAudio-touching code thin on
+top of it. Unlike M1/M2's driver, none of this needed a host-side C
+harness at all -- it's ordinary Rust exercised by `cargo test` with
+synthetic clocks, never an installed driver or a real device.
+
+**The drift-estimator tests include two "wrong implementation actually
+fails" cases, not just "correct implementation passes" ones, on direct
+request.** `drift::tests::a_naive_fixed_ratio_fails_the_same_scenario` runs
+the identical synthetic ppm-offset scenario through a corrected loop and
+through spec 2.3's named failure mode (a fixed ratio, i.e. no correction
+at all) in the same test, and asserts the fixed-ratio version actually
+diverges past a bound the corrected version stays under --
+`drift::tests::converges_to_a_steady_ppm_offset_and_stays_bounded` alone
+would pass equally well against a broken corrector that happened to do
+nothing, same as `test_ring_buffer.c`'s poison-sentinel test below.
+`drift::tests::discontinuous_clock_jump_recovers_ratio_but_a_plain_pi_loop_stays_biased`
+covers a second, separate failure mode: a device reconfiguring or a USB
+interface renegotiating can make its reported sample time jump
+discontinuously in one block, and a plain PI controller has no way to
+distinguish that from a huge drift reading -- it integrates it, and
+because the integral term never leaks on its own, that single reading
+permanently biases the loop's steady-state ratio away from 1.0. Writing
+this test surfaced the actual fix, not just a test for one already
+written: `DriftCorrector` wraps `PiController` with a
+`discontinuity_threshold` that resets the integral instead of absorbing a
+reading past it, and the test asserts the plain `PiController` alone stays
+biased (`bias > 0.001`) long after the jump while `DriftCorrector`
+recovers to near 1.0 within ten blocks -- both driven by the identical
+synthetic jump, so the comparison is a real A/B, not two different scenarios.
+
+**The drift simulation's cumulative sample counters are `f64`, not `f32`,
+and this was found by the naive-fixed-ratio test failing, not reasoned out
+in advance.** The first version of that test asserted the fixed-ratio
+error would exceed 2000 samples after 50,000 blocks; it only reached
+1535.5 and failed. Root cause: `device_cumulative` was accumulated in
+`f32`, and at ~6.4M frames (50,000 blocks * 128 frames) `f32`'s ulp is
+already 0.5 -- larger than the ~0.064-sample fractional drift added per
+block at 500 ppm -- so most of the accumulating error was rounded away on
+every `+=` before it could show up in the difference against
+`master_cumulative`. A real 30-minute session reaches ~86M frames at 48
+kHz, past where `f32` can even represent every integer exactly, so this
+wasn't a test-only concern: `PiController::update`'s doc comment now
+states the constraint explicitly -- cumulative sample time must be tracked
+in `f64` or an integer type upstream, and only the small, bounded
+difference narrows to `f32` for the controller itself, which never sees
+values large enough for this to matter. Checked for the same assumption
+elsewhere in the workspace: `loomix-core::meter::Meter`'s peak-hold is a
+running max (`if level > *held`), not a sum, so it's scale-invariant
+regardless of session length and the bug class doesn't apply; nothing else
+in `loomix-core` carries a persistent cumulative counter across
+`process_block` calls at all. `clock::InternalClock::frames_produced` was
+already `u64` and `resample::Resampler::read_offset` is `f64` and wraps
+every 1.0, so neither needed a fix.
+
+**`resample.rs`'s polyphase resampler is a windowed-sinc filter bank (32
+taps, 256 phases), sized for drift correction's actual use case -- a ratio
+that stays within tens to hundreds of parts per million of 1.0, corrected
+slowly -- not general arbitrary-ratio sample-rate conversion.** Building a
+full production-quality SRC (adaptive filter length, dynamic cutoff
+scaling with ratio, higher phase resolution) now would be sizing for a
+requirement M4 doesn't have; `TAPS`/`NUM_PHASES` are left as the
+calibration knob spec's own framing calls for ("a real clock drifts... a
+PCA9685 runs a few percent fast"), flagged with a `ponytail:` comment
+naming the upgrade path if the real two-device soak shows audible
+artefacts. Each phase's tap coefficients are explicitly normalised to
+unity DC gain after windowing, rather than relying on the truncated
+windowed-sinc approximation to sum to 1.0 on its own.
+
+**`ci.yml`'s `driver` job built the Release driver bundle but never
+installed it**, confirmed by reading the job rather than assumed: its
+`xcodebuild` step passed `CODE_SIGNING_ALLOWED=NO` with no
+`-derivedDataPath`, so even calling `driver/scripts/install.sh` afterward
+would have found no product at the path it looks for
+(`driver/build/Build/Products/Release/LoomixAudioDriver.driver`, which
+only exists when built with `-derivedDataPath driver/build`, as `just
+install-driver` does locally). Any hal-side check assuming Loomix's
+virtual devices are enumerable in CI would have been decorative --
+exactly the class of bug the rt-safety release-mode fix below already
+cost a debugging cycle to catch once. Fixed rather than dropped: the
+`driver` job's Release build now matches `install.sh`'s expectations
+(`-derivedDataPath driver/build CODE_SIGN_IDENTITY=-`, ad-hoc signed, the
+same as the local `install-driver` recipe) and the job now actually runs
+`install.sh`. This is safe specifically because it's a GitHub-hosted
+*ephemeral* runner, not the shared dev machine the M1/M2 entries below
+describe crashing twice in one day -- a wedged `coreaudiod` here just
+fails the job; there's no persistent machine to leave in a bad state.
+`install.sh` already fails loudly (not silently) on zero devices after 15
+seconds, per the M2 entry below, so this doesn't need its own new
+failure-detection logic.
+
 ## 2026-08-21 — M3
 
 **Audio moves through the engine as `&[[f32; 8]]` — a slice of fixed-size,

@@ -5,3 +5,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dev-dependencies]
+# Reuses `rt_assert::assert_realtime` (the real-time-safety harness) and
+# `render::{sine_tone, goertzel_magnitude}` (the tone/frequency-check
+# helpers) rather than duplicating either.
+loomix-core = { path = "../loomix-core", version = "0.0.0" }
+proptest = "1"
+
+[dependencies]
+coreaudio-sys = { version = "0.2.18", default-features = false, features = ["core_audio"] }
+rtrb = "0.4.0"
