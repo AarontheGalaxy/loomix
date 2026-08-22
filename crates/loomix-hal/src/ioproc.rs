@@ -17,6 +17,24 @@ use crate::drift::DriftCorrector;
 use crate::master_clock::MasterClock;
 use crate::resample::Resampler;
 use rtrb::{Consumer, Producer};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+/// A live, lock-free view of a [`DriftCorrectedIoStage`]'s current
+/// resample ratio -- safe to poll from any thread, e.g. a soak harness's
+/// monitoring loop (spec 3.4 M4's 30-minute two-device acceptance test),
+/// since it's just a read of what the real-time thread last wrote. `1.0`
+/// means no correction currently applied; a value that stays near `1.0`
+/// and bounded, rather than drifting toward the corrector's clamp, is
+/// what "bounded drift" (spec 3.4 M4) looks like numerically.
+#[derive(Clone)]
+pub struct RatioHandle(Arc<AtomicU32>);
+
+impl RatioHandle {
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
 
 /// One non-master device's drift-corrected I/O, one instance per device
 /// (not per channel -- it owns one [`Resampler`] per channel internally,
@@ -25,6 +43,7 @@ use rtrb::{Consumer, Producer};
 pub struct DriftCorrectedIoStage {
     resamplers: Vec<Resampler>,
     corrector: DriftCorrector,
+    ratio_bits: Arc<AtomicU32>,
     /// Cumulative *master-equivalent* progress made so far -- for capture,
     /// frames written to the ring (what the resampler actually produced);
     /// for render, frames consumed from the ring (what the resampler
@@ -52,8 +71,17 @@ impl DriftCorrectedIoStage {
         Self {
             resamplers: (0..channel_count).map(|_| Resampler::new()).collect(),
             corrector,
+            ratio_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             progress_frames: 0,
         }
+    }
+
+    /// A cloneable, thread-safe handle to this stage's current resample
+    /// ratio. Not real-time code itself -- the handle is meant to be
+    /// cloned once, up front, and polled from a monitoring thread, not
+    /// from inside another IOProc callback.
+    pub fn ratio_handle(&self) -> RatioHandle {
+        RatioHandle(self.ratio_bits.clone())
     }
 
     /// The ratio to use for the callback about to run, from progress
@@ -61,7 +89,9 @@ impl DriftCorrectedIoStage {
     /// contribution isn't known until after it resamples).
     fn ratio_for_next_callback(&mut self, master: &MasterClock) -> f32 {
         let error = self.progress_frames as f64 - master.frames() as f64;
-        self.corrector.update(error as f32)
+        let ratio = self.corrector.update(error as f32);
+        self.ratio_bits.store(ratio.to_bits(), Ordering::Relaxed);
+        ratio
     }
 
     /// Called once per capture callback. `input` is planar, one slice per
@@ -346,6 +376,34 @@ mod tests {
             out_buf.iter().all(|&s| s == 0.0),
             "an underrun should produce silence, not the poisoned sentinel \
              or leftover ring contents"
+        );
+    }
+
+    #[test]
+    fn ratio_handle_reflects_the_stage_that_produced_it() {
+        let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
+        let mut stage = DriftCorrectedIoStage::new(1, corrector);
+        let handle = stage.ratio_handle();
+        assert_eq!(handle.get(), 1.0, "no callback has run yet");
+
+        let master = MasterClock::default();
+        master.advance(128);
+        let mut scratch = vec![0.0_f32; 256];
+        let input = vec![0.0_f32; 128];
+        let (mut producer, _consumer) = rtrb::RingBuffer::<f32>::new(256);
+        stage.on_capture(
+            &[&input],
+            &master,
+            std::slice::from_mut(&mut producer),
+            &mut scratch,
+        );
+
+        // Same value the stage itself would use next callback -- the
+        // handle is a live view, not a snapshot taken at construction.
+        assert!(
+            (handle.get() - 1.0).abs() < 0.01,
+            "one callback shouldn't move the ratio far from 1.0, got {}",
+            handle.get()
         );
     }
 }

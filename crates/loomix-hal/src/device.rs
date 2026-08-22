@@ -91,6 +91,77 @@ pub fn default_output_device() -> Result<DeviceId, CoreAudioError> {
     Ok(id)
 }
 
+/// The system default input device -- the render-side mirror of
+/// [`default_output_device`].
+pub fn default_input_device() -> Result<DeviceId, CoreAudioError> {
+    let addr = address(kAudioHardwarePropertyDefaultInputDevice);
+    let mut id: AudioObjectID = 0;
+    let mut size = std::mem::size_of::<AudioObjectID>() as u32;
+    check(unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut id as *mut _ as *mut _,
+        )
+    })?;
+    Ok(id)
+}
+
+/// Which scope of a device's channels to count: its input side or its
+/// output side. A device can have channels on both (a full-duplex audio
+/// interface) or just one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Input,
+    Output,
+}
+
+/// The device's channel count on `direction` (`kAudioDevicePropertyStreamConfiguration`,
+/// summed across every `AudioBuffer` in the returned list -- a device can
+/// expose several, e.g. one per physical connector). Needed up front, at
+/// wiring time, to size the ring buffers and resamplers an IOProc
+/// registration needs -- the real count only otherwise appears inside a
+/// running callback's `AudioBufferList`, too late to prepare for.
+pub fn channel_count(id: DeviceId, direction: Direction) -> Result<usize, CoreAudioError> {
+    let scope = match direction {
+        Direction::Input => kAudioDevicePropertyScopeInput,
+        Direction::Output => kAudioDevicePropertyScopeOutput,
+    };
+    let addr = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut size: u32 = 0;
+    check(unsafe { AudioObjectGetPropertyDataSize(id, &addr, 0, std::ptr::null(), &mut size) })?;
+    if size == 0 {
+        return Ok(0);
+    }
+    let mut storage = vec![0u8; size as usize];
+    let list = storage.as_mut_ptr() as *mut AudioBufferList;
+    let mut actual_size = size;
+    check(unsafe {
+        AudioObjectGetPropertyData(
+            id,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut actual_size,
+            list as *mut _,
+        )
+    })?;
+    let count = unsafe { (*list).mNumberBuffers as usize };
+    let first = unsafe { (*list).mBuffers.as_ptr() };
+    let mut total = 0usize;
+    for i in 0..count {
+        total += unsafe { (*first.add(i)).mNumberChannels as usize };
+    }
+    Ok(total)
+}
+
 fn cfstring_property(
     object: AudioObjectID,
     selector: AudioObjectPropertySelector,
@@ -747,6 +818,33 @@ mod tests {
         let uid = device_uid(id).expect("uid query should succeed");
         assert!(!name.is_empty());
         assert!(!uid.is_empty());
+    }
+
+    #[test]
+    fn default_output_device_has_at_least_one_output_channel() {
+        let id = default_output_device().expect("a default output device should exist");
+        let count =
+            channel_count(id, Direction::Output).expect("channel count query should succeed");
+        assert!(count >= 1, "every output device has at least one channel");
+        // The same device queried on the opposite scope should never
+        // error, even if the honest answer is zero -- a pure-output
+        // device correctly reports no input channels rather than failing.
+        let input_count = channel_count(id, Direction::Input)
+            .expect("opposite-scope query should still succeed, even if the answer is 0");
+        let _ = input_count;
+    }
+
+    #[test]
+    fn default_input_device_exists() {
+        // Not every CI runner or machine necessarily has one, so this
+        // only asserts the query itself behaves -- either a valid device
+        // with at least one input channel, or a clean "no such property"
+        // error, never a crash.
+        if let Ok(id) = default_input_device() {
+            let count = channel_count(id, Direction::Input)
+                .expect("channel count query should succeed for a real device");
+            assert!(count >= 1);
+        }
     }
 
     #[test]
