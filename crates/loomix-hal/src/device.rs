@@ -162,6 +162,70 @@ pub fn channel_count(id: DeviceId, direction: Direction) -> Result<usize, CoreAu
     Ok(total)
 }
 
+/// *Requests* a non-interleaved, 32-bit float stream format on
+/// `direction` -- best-effort, not load-bearing. `CaptureIoProcHandle`/
+/// `RenderIoProcHandle::start` call this and ignore whether it succeeds:
+/// confirmed against a real device on this machine that
+/// `AudioObjectSetPropertyData` can report success here and the format
+/// still comes back interleaved on readback, silently. Some devices
+/// genuinely don't support non-interleaved at all; asking anyway costs
+/// nothing on the ones that do honour it. The actual fix for a device
+/// that stays interleaved either way is `read_input_channels_planar` (and
+/// the equivalent inlined into `render_ioproc_trampoline`) adapting to
+/// whichever layout the callback actually receives, not this function --
+/// see that doc comment for the failure this was found chasing.
+///
+/// The device's own sample rate is preserved -- read from its current
+/// format and left alone -- since that's the hardware's to set, not a
+/// client's; only the interleaving and channel count are requested here.
+pub fn set_stream_format_non_interleaved(
+    id: DeviceId,
+    direction: Direction,
+    channel_count: usize,
+) -> Result<(), CoreAudioError> {
+    let scope = match direction {
+        Direction::Input => kAudioDevicePropertyScopeInput,
+        Direction::Output => kAudioDevicePropertyScopeOutput,
+    };
+    let addr = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreamFormat,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut format: AudioStreamBasicDescription = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
+    check(unsafe {
+        AudioObjectGetPropertyData(
+            id,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut format as *mut _ as *mut _,
+        )
+    })?;
+    format.mFormatID = kAudioFormatLinearPCM;
+    format.mFormatFlags =
+        kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved;
+    format.mChannelsPerFrame = channel_count as u32;
+    format.mBitsPerChannel = 32;
+    // Non-interleaved: each AudioBuffer carries exactly one channel, so a
+    // "frame" within any single buffer is one 4-byte float.
+    format.mBytesPerFrame = 4;
+    format.mFramesPerPacket = 1;
+    format.mBytesPerPacket = 4;
+    check(unsafe {
+        AudioObjectSetPropertyData(
+            id,
+            &addr,
+            0,
+            std::ptr::null(),
+            std::mem::size_of::<AudioStreamBasicDescription>() as u32,
+            &format as *const _ as *const _,
+        )
+    })
+}
+
 fn cfstring_property(
     object: AudioObjectID,
     selector: AudioObjectPropertySelector,
@@ -339,6 +403,11 @@ pub struct CaptureIoProcContext {
     master: Arc<MasterClock>,
     outputs: Vec<rtrb::Producer<f32>>,
     scratch: Vec<f32>,
+    /// Per-channel storage for deinterleaving one interleaved
+    /// `AudioBuffer` into planar form, `MAX_IO_CHANNELS` chunks of
+    /// `scratch_capacity` frames each -- see [`deinterleaved_channels`]'s
+    /// doc comment for why this exists at all.
+    deinterleave: Vec<f32>,
 }
 
 impl CaptureIoProcContext {
@@ -353,22 +422,97 @@ impl CaptureIoProcContext {
             master,
             outputs,
             scratch: vec![0.0; scratch_capacity],
+            deinterleave: vec![0.0; MAX_IO_CHANNELS * scratch_capacity],
         }
     }
 }
 
 /// Reads up to [`MAX_IO_CHANNELS`] channels from an `AudioBufferList` as
-/// planar `&[f32]` slices. Returns the array and the real channel count
-/// (`<= MAX_IO_CHANNELS`); channels beyond that are silently dropped
-/// rather than read out of bounds. Shared by every trampoline in this
-/// file that needs a device's captured audio.
+/// planar `&[f32]` slices, handling both layouts a real device can
+/// deliver: one `AudioBuffer` per channel (the simple case, returned as
+/// direct sub-slices, no copy), or one interleaved `AudioBuffer` carrying
+/// every channel (deinterleaved into `scratch`, `MAX_IO_CHANNELS` chunks
+/// of `scratch.len() / MAX_IO_CHANNELS` frames each).
+///
+/// Found necessary the hard way: `AudioObjectSetPropertyData` requesting
+/// a non-interleaved format can report success and still not change what
+/// the device actually delivers (confirmed against a real device on this
+/// machine -- the readback showed the interleaved flag unchanged after a
+/// successful-looking set). Adapting to whichever layout shows up, rather
+/// than trusting a format request to have taken effect, is the only
+/// reliable option. Before this fix, an interleaved buffer was
+/// misread as a single one-channel buffer: in a debug build that trips
+/// `on_capture`'s `debug_assert_eq!`, but `--release` (what a real soak
+/// actually uses) compiles the assert out and `zip()` silently processes
+/// only the shorter side, so every channel past the first is never
+/// touched -- discovered as the manual two-device soak (spec 3.4 M4)
+/// reporting continuous dropouts within about a second on every real
+/// device pair tried, never once as a test failure, since there's no
+/// offline stand-in for a real device's actual stream format.
+///
+/// Returns the array and the real channel count (`<= MAX_IO_CHANNELS`);
+/// channels beyond that are silently dropped rather than read out of
+/// bounds.
 ///
 /// # Safety
-/// `list` must point to a valid `AudioBufferList` with `mNumberBuffers`
-/// non-interleaved buffers, each `mData` valid for `mDataByteSize` bytes,
-/// for the duration of the borrow -- exactly what CoreAudio guarantees for
-/// the buffer list handed to an `AudioDeviceIOProc` for the callback's
-/// duration.
+/// `list` must point to a valid `AudioBufferList`, every buffer's `mData`
+/// valid for `mDataByteSize` bytes, for the duration of the borrow --
+/// exactly what CoreAudio guarantees for the buffer list handed to an
+/// `AudioDeviceIOProc` for the callback's duration. `expected_channels`
+/// should be the count this context was built for; `scratch` must outlive
+/// the returned slices.
+unsafe fn read_input_channels_planar(
+    list: *const AudioBufferList,
+    expected_channels: usize,
+    scratch: &mut [f32],
+) -> ([&[f32]; MAX_IO_CHANNELS], usize) {
+    let buffer_count = unsafe { (*list).mNumberBuffers } as usize;
+    let first = unsafe { (*list).mBuffers.as_ptr() };
+
+    if buffer_count == 1 && expected_channels > 1 {
+        let buf = unsafe { &*first };
+        let total_samples = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
+        let frames = total_samples / expected_channels;
+        let raw = unsafe { std::slice::from_raw_parts(buf.mData as *const f32, total_samples) };
+        let chunk_len = scratch.len() / MAX_IO_CHANNELS;
+        let mut channels: [&[f32]; MAX_IO_CHANNELS] = [&[]; MAX_IO_CHANNELS];
+        for (c, chunk) in scratch
+            .chunks_exact_mut(chunk_len)
+            .enumerate()
+            .take(expected_channels.min(MAX_IO_CHANNELS))
+        {
+            let dst = &mut chunk[..frames.min(chunk_len)];
+            for (f, sample) in dst.iter_mut().enumerate() {
+                *sample = raw[f * expected_channels + c];
+            }
+            channels[c] = dst;
+        }
+        return (channels, expected_channels.min(MAX_IO_CHANNELS));
+    }
+
+    let count = buffer_count.min(MAX_IO_CHANNELS);
+    let mut channels: [&[f32]; MAX_IO_CHANNELS] = [&[]; MAX_IO_CHANNELS];
+    for (i, slot) in channels.iter_mut().enumerate().take(count) {
+        let buf = unsafe { &*first.add(i) };
+        let len = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
+        *slot = unsafe { std::slice::from_raw_parts(buf.mData as *const f32, len) };
+    }
+    (channels, count)
+}
+
+/// The simple, non-interleaving-aware reader/writer pair
+/// [`read_input_channels_planar`] replaced for capture/render: still used
+/// by [`master_ioproc_trampoline`], which has no per-device channel count
+/// or deinterleave scratch to work with (it hands raw buffers straight to
+/// a caller-supplied callback). This is therefore a known, documented gap
+/// for a master device that happens to deliver interleaved audio -- see
+/// `read_input_channels_planar`'s doc comment for the failure mode this
+/// would hit, and `docs/ARCHITECTURE.md` for why it's deferred rather than
+/// fixed here.
+///
+/// # Safety
+/// Same contract as [`read_input_channels_planar`], without the
+/// deinterleaving case.
 unsafe fn read_input_channels<'a>(
     list: *const AudioBufferList,
 ) -> ([&'a [f32]; MAX_IO_CHANNELS], usize) {
@@ -383,14 +527,6 @@ unsafe fn read_input_channels<'a>(
     (channels, count)
 }
 
-/// The write side of [`read_input_channels`]: up to [`MAX_IO_CHANNELS`]
-/// channels from an `AudioBufferList` as planar `&mut [f32]` slices, built
-/// without `MaybeUninit` (see the render trampoline's own note, kept here
-/// since this replaced its inline version) -- each of the fixed slots gets
-/// a genuinely valid value, a disjoint sub-slice for `i < count` or an
-/// always-valid empty slice otherwise, never an uninitialised read for a
-/// device with fewer than `MAX_IO_CHANNELS` channels.
-///
 /// # Safety
 /// Same contract as [`read_input_channels`], for `mut` access.
 unsafe fn write_output_channels<'a>(
@@ -412,9 +548,9 @@ unsafe fn write_output_channels<'a>(
 
 /// # Real-time safety
 /// No allocation: `channels` is a fixed-size stack array, and `ctx`'s
-/// `outputs`/`scratch` were sized once at construction. No locks:
-/// `rtrb::Producer::push` is lock-free. No syscalls beyond what CoreAudio
-/// itself performs to invoke this callback.
+/// `outputs`/`scratch`/`deinterleave` were sized once at construction. No
+/// locks: `rtrb::Producer::push` is lock-free. No syscalls beyond what
+/// CoreAudio itself performs to invoke this callback.
 unsafe extern "C" fn capture_ioproc_trampoline(
     _device: AudioObjectID,
     _now: *const AudioTimeStamp,
@@ -425,7 +561,9 @@ unsafe extern "C" fn capture_ioproc_trampoline(
     client_data: *mut std::os::raw::c_void,
 ) -> OSStatus {
     let ctx = unsafe { &mut *(client_data as *mut CaptureIoProcContext) };
-    let (channels, count) = unsafe { read_input_channels(input_data) };
+    let expected_channels = ctx.outputs.len();
+    let (channels, count) =
+        unsafe { read_input_channels_planar(input_data, expected_channels, &mut ctx.deinterleave) };
     ctx.stage.on_capture(
         &channels[..count],
         &ctx.master,
@@ -444,6 +582,8 @@ pub struct CaptureIoProcHandle {
 
 impl CaptureIoProcHandle {
     pub fn start(device: DeviceId, ctx: CaptureIoProcContext) -> Result<Self, CoreAudioError> {
+        // Best-effort; ignored either way (see the function's doc comment).
+        let _ = set_stream_format_non_interleaved(device, Direction::Input, ctx.outputs.len());
         let mut ctx = Box::new(ctx);
         let mut proc_id: AudioDeviceIOProcID = None;
         check(unsafe {
@@ -483,6 +623,12 @@ pub struct RenderIoProcContext {
     master: Arc<MasterClock>,
     inputs: Vec<rtrb::Consumer<f32>>,
     scratch: Vec<f32>,
+    /// Per-channel storage for the interleaved case -- `on_render` writes
+    /// planar output here, then the trampoline interleaves it into the
+    /// real (possibly single, interleaved) `AudioBuffer` CoreAudio
+    /// actually handed over. See `read_input_channels`'s doc comment for
+    /// why this is necessary rather than assumed away.
+    interleave: Vec<f32>,
 }
 
 impl RenderIoProcContext {
@@ -497,13 +643,14 @@ impl RenderIoProcContext {
             master,
             inputs,
             scratch: vec![0.0; scratch_capacity],
+            interleave: vec![0.0; MAX_IO_CHANNELS * scratch_capacity],
         }
     }
 }
 
 /// # Real-time safety
-/// Same reasoning as [`capture_ioproc_trampoline`]: `channels` is a fixed
-/// stack array, `ctx`'s state is pre-allocated, `rtrb::Consumer::pop` is
+/// Same reasoning as [`capture_ioproc_trampoline`]: no allocation (every
+/// buffer sized once at construction), `rtrb::Consumer::pop` is
 /// lock-free.
 unsafe extern "C" fn render_ioproc_trampoline(
     _device: AudioObjectID,
@@ -515,6 +662,40 @@ unsafe extern "C" fn render_ioproc_trampoline(
     client_data: *mut std::os::raw::c_void,
 ) -> OSStatus {
     let ctx = unsafe { &mut *(client_data as *mut RenderIoProcContext) };
+    let expected_channels = ctx.inputs.len();
+    let buffer_count = unsafe { (*output_data).mNumberBuffers } as usize;
+
+    if buffer_count == 1 && expected_channels > 1 {
+        let buf = unsafe { &mut *(*output_data).mBuffers.as_mut_ptr() };
+        let total_samples = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
+        let frames =
+            (total_samples / expected_channels).min(ctx.interleave.len() / MAX_IO_CHANNELS);
+        let chunk_len = ctx.interleave.len() / MAX_IO_CHANNELS;
+        let mut channels: [&mut [f32]; MAX_IO_CHANNELS] =
+            std::array::from_fn(|_| &mut [] as &mut [f32]);
+        for (c, chunk) in ctx
+            .interleave
+            .chunks_exact_mut(chunk_len)
+            .enumerate()
+            .take(expected_channels.min(MAX_IO_CHANNELS))
+        {
+            channels[c] = &mut chunk[..frames];
+        }
+        ctx.stage.on_render(
+            &ctx.master,
+            &mut ctx.inputs,
+            &mut channels[..expected_channels.min(MAX_IO_CHANNELS)],
+            &mut ctx.scratch,
+        );
+        let raw = unsafe { std::slice::from_raw_parts_mut(buf.mData as *mut f32, total_samples) };
+        for f in 0..frames {
+            for (c, channel) in channels.iter().enumerate().take(expected_channels) {
+                raw[f * expected_channels + c] = channel[f];
+            }
+        }
+        return 0;
+    }
+
     let (mut channels, count) = unsafe { write_output_channels(output_data) };
     ctx.stage.on_render(
         &ctx.master,
@@ -534,6 +715,8 @@ pub struct RenderIoProcHandle {
 
 impl RenderIoProcHandle {
     pub fn start(device: DeviceId, ctx: RenderIoProcContext) -> Result<Self, CoreAudioError> {
+        // Best-effort; ignored either way (see the function's doc comment).
+        let _ = set_stream_format_non_interleaved(device, Direction::Output, ctx.inputs.len());
         let mut ctx = Box::new(ctx);
         let mut proc_id: AudioDeviceIOProcID = None;
         check(unsafe {
@@ -957,6 +1140,32 @@ mod tests {
             }
         }
 
+        /// A single `AudioBuffer` carrying `channel_count` interleaved
+        /// channels -- the layout `read_input_channels_planar` and
+        /// `render_ioproc_trampoline`'s interleaved branch exist for,
+        /// confirmed to be what real devices on this machine actually
+        /// deliver (see their doc comments).
+        fn new_interleaved(mut interleaved: Vec<f32>, channel_count: usize) -> Self {
+            let total = std::mem::size_of::<AudioBufferList>();
+            let mut storage = vec![0u8; total];
+            let list = storage.as_mut_ptr() as *mut AudioBufferList;
+            unsafe {
+                (*list).mNumberBuffers = 1;
+                std::ptr::write(
+                    (*list).mBuffers.as_mut_ptr(),
+                    AudioBuffer {
+                        mNumberChannels: channel_count as UInt32,
+                        mDataByteSize: (interleaved.len() * std::mem::size_of::<f32>()) as UInt32,
+                        mData: interleaved.as_mut_ptr() as *mut std::os::raw::c_void,
+                    },
+                );
+            }
+            Self {
+                storage,
+                _channels: vec![interleaved],
+            }
+        }
+
         fn as_ptr(&self) -> *const AudioBufferList {
             self.storage.as_ptr() as *const AudioBufferList
         }
@@ -1066,6 +1275,127 @@ mod tests {
             assert!(
                 buf0.iter().any(|&s| s != 1.0),
                 "the channel with data queued should not be all sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_trampoline_deinterleaves_a_single_interleaved_buffer() {
+        // The exact layout that broke a first version of this module
+        // against real hardware: one AudioBuffer, mNumberChannels = 2,
+        // samples interleaved L,R,L,R,... rather than two separate mono
+        // buffers. Needs at least TAPS (32) frames per channel to prime
+        // the resampler and actually emit output this callback.
+        let frames = 64;
+        let interleaved: Vec<f32> = (0..frames)
+            .flat_map(|f| [f as f32 * 0.01, 100.0 + f as f32 * 0.01]) // ch0 < 1.0, ch1 > 100.0
+            .collect();
+        let input_list = TestBufferList::new_interleaved(interleaved, 2);
+
+        let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
+        let stage = DriftCorrectedIoStage::new(2, corrector);
+        let master = Arc::new(MasterClock::default());
+        let (tx0, mut rx0) = rtrb::RingBuffer::<f32>::new(256);
+        let (tx1, mut rx1) = rtrb::RingBuffer::<f32>::new(256);
+        let mut ctx = Box::new(CaptureIoProcContext::new(
+            stage,
+            master,
+            vec![tx0, tx1],
+            frames * 2,
+        ));
+
+        let status = unsafe {
+            capture_ioproc_trampoline(
+                0,
+                std::ptr::null(),
+                input_list.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                ctx.as_mut() as *mut CaptureIoProcContext as *mut std::os::raw::c_void,
+            )
+        };
+        assert_eq!(status, 0);
+
+        let mut received0 = Vec::new();
+        while let Ok(s) = rx0.pop() {
+            received0.push(s);
+        }
+        let mut received1 = Vec::new();
+        while let Ok(s) = rx1.pop() {
+            received1.push(s);
+        }
+        assert!(
+            !received0.is_empty() && !received1.is_empty(),
+            "both channels of an interleaved buffer should be drained, not just the first"
+        );
+        assert!(received0.iter().all(|&s| s < 1.0));
+        assert!(received1.iter().all(|&s| s > 100.0));
+    }
+
+    #[test]
+    fn render_trampoline_interleaves_output_into_a_single_buffer() {
+        // At least TAPS (32) frames per channel so the resampler is
+        // primed and actually emits output rather than silence -- an
+        // earlier version of this test used 8, which the resampler pads
+        // with real (correct) silence, not a bug in the interleaving.
+        let frames = 64;
+        let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
+        let stage = DriftCorrectedIoStage::new(2, corrector);
+        let master = Arc::new(MasterClock::default());
+        // More than `frames` samples queued, generously: TAPS (32) of
+        // them are consumed priming the resampler before it emits
+        // anything, so requesting exactly `frames` output frames from
+        // exactly `frames` input samples would legitimately underrun
+        // partway through, silence-padding the tail -- not a bug, just
+        // not what this test is checking.
+        let queued = frames * 3;
+        let (mut tx0, rx0) = rtrb::RingBuffer::<f32>::new(queued + 16);
+        let (mut tx1, rx1) = rtrb::RingBuffer::<f32>::new(queued + 16);
+        for i in 0..queued {
+            tx0.push(i as f32 * 0.001).unwrap(); // channel 0: stays under 1.0
+            tx1.push(100.0 + i as f32 * 0.001).unwrap(); // channel 1: stays over 100.0
+        }
+        let mut ctx = Box::new(RenderIoProcContext::new(
+            stage,
+            master,
+            vec![rx0, rx1],
+            frames * 2,
+        ));
+
+        let interleaved = vec![-1.0f32; frames * 2]; // poisoned sentinel
+        let mut output_list = TestBufferList::new_interleaved(interleaved, 2);
+
+        let status = unsafe {
+            render_ioproc_trampoline(
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                output_list.as_mut_ptr(),
+                std::ptr::null(),
+                ctx.as_mut() as *mut RenderIoProcContext as *mut std::os::raw::c_void,
+            )
+        };
+        assert_eq!(status, 0);
+
+        unsafe {
+            let list = &*output_list.as_ptr();
+            let buf = &*list.mBuffers.as_ptr();
+            let raw = std::slice::from_raw_parts(buf.mData as *const f32, frames * 2);
+            // Not exact-value equality: even a primed resampler at ratio
+            // 1.0 isn't bit-exact to its input (windowed-sinc filtering),
+            // established elsewhere in this crate's own tests. What this
+            // test checks is that channel 0's values land at even
+            // interleaved positions and channel 1's at odd ones -- the
+            // actual thing that was broken.
+            assert!(
+                raw.iter().step_by(2).all(|&s| s < 1.0),
+                "channel 0 should occupy every even interleaved position"
+            );
+            assert!(
+                raw.iter().skip(1).step_by(2).all(|&s| s > 100.0),
+                "channel 1 should occupy every odd interleaved position"
             );
         }
     }
