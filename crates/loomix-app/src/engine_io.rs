@@ -30,15 +30,41 @@ pub fn select_clock_master(
     Ok(loomix_hal::clock::resolve_clock_source(configured, &alive))
 }
 
+/// A lock-free, pollable dropout counter -- incremented on the real-time
+/// thread (a plain `AtomicU64::fetch_add`, no different in cost from the
+/// counter-free version), read from a monitoring thread. Spec 3.4 M4's
+/// 30-minute two-device soak needs to report "no dropouts" as a measured
+/// fact, not an assumption.
+#[derive(Clone, Default)]
+pub struct DropoutCounter(Arc<std::sync::atomic::AtomicU64>);
+
+impl DropoutCounter {
+    fn increment(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// One strip's captured audio, arriving as one ring-buffer consumer per
 /// device channel (filled by that device's `CaptureIoProcHandle`).
 pub struct StripSource {
     channels: Vec<Consumer<f32>>,
+    underruns: DropoutCounter,
 }
 
 impl StripSource {
     pub fn new(channels: Vec<Consumer<f32>>) -> Self {
-        Self { channels }
+        Self {
+            channels,
+            underruns: DropoutCounter::default(),
+        }
+    }
+
+    pub fn underrun_counter(&self) -> DropoutCounter {
+        self.underruns.clone()
     }
 
     /// Packs available samples into `out` (one [`Frame`] per output
@@ -52,7 +78,13 @@ impl StripSource {
         }
         for (channel, consumer) in self.channels.iter_mut().enumerate().take(CHANNELS) {
             for frame in out.iter_mut() {
-                frame[channel] = consumer.pop().unwrap_or(0.0);
+                frame[channel] = match consumer.pop() {
+                    Ok(sample) => sample,
+                    Err(_) => {
+                        self.underruns.increment();
+                        0.0
+                    }
+                };
             }
         }
     }
@@ -62,11 +94,19 @@ impl StripSource {
 /// channel (drained by that device's `RenderIoProcHandle`).
 pub struct BusSink {
     channels: Vec<Producer<f32>>,
+    overruns: DropoutCounter,
 }
 
 impl BusSink {
     pub fn new(channels: Vec<Producer<f32>>) -> Self {
-        Self { channels }
+        Self {
+            channels,
+            overruns: DropoutCounter::default(),
+        }
+    }
+
+    pub fn overrun_counter(&self) -> DropoutCounter {
+        self.overruns.clone()
     }
 
     /// Pushes `input` out, channel by channel, up to [`CHANNELS`] device
@@ -76,7 +116,9 @@ impl BusSink {
     fn push_from(&mut self, input: &[Frame]) {
         for (channel, producer) in self.channels.iter_mut().enumerate().take(CHANNELS) {
             for frame in input {
-                let _ = producer.push(frame[channel]);
+                if producer.push(frame[channel]).is_err() {
+                    self.overruns.increment();
+                }
             }
         }
     }
@@ -234,6 +276,17 @@ fn unpack_channels(src: &[Frame], dst: &mut [&mut [f32]]) {
 /// `DriftCorrectedIoStage`), and points `driver`'s `strip` at the
 /// consumer side. Returns the handle keeping the registration alive --
 /// dropping it stops and unregisters the device.
+/// What [`attach_capture_device`]/[`attach_render_device`] hand back: the
+/// registration keeping the device active (dropping it stops and
+/// unregisters), plus the live monitoring handles a soak harness (spec
+/// 3.4 M4) polls -- the resample ratio and the dropout count -- without
+/// needing to reach back into the `EngineIoDriver` at all.
+pub struct AttachedDevice<H> {
+    pub io: H,
+    pub ratio: loomix_hal::ioproc::RatioHandle,
+    pub dropouts: DropoutCounter,
+}
+
 pub fn attach_capture_device(
     driver: &mut EngineIoDriver,
     strip: usize,
@@ -242,7 +295,7 @@ pub fn attach_capture_device(
     master_clock: Arc<MasterClock>,
     corrector: loomix_hal::drift::DriftCorrector,
     ring_capacity: usize,
-) -> Result<loomix_hal::device::CaptureIoProcHandle, CoreAudioError> {
+) -> Result<AttachedDevice<loomix_hal::device::CaptureIoProcHandle>, CoreAudioError> {
     let mut producers = Vec::with_capacity(channel_count);
     let mut consumers = Vec::with_capacity(channel_count);
     for _ in 0..channel_count {
@@ -251,15 +304,22 @@ pub fn attach_capture_device(
         consumers.push(consumer);
     }
     let stage = loomix_hal::ioproc::DriftCorrectedIoStage::new(channel_count, corrector);
+    let ratio = stage.ratio_handle();
     let ctx = loomix_hal::device::CaptureIoProcContext::new(
         stage,
         master_clock,
         producers,
         ring_capacity,
     );
-    let handle = loomix_hal::device::CaptureIoProcHandle::start(device, ctx)?;
-    driver.set_strip_source(strip, StripSource::new(consumers));
-    Ok(handle)
+    let io = loomix_hal::device::CaptureIoProcHandle::start(device, ctx)?;
+    let source = StripSource::new(consumers);
+    let dropouts = source.underrun_counter();
+    driver.set_strip_source(strip, source);
+    Ok(AttachedDevice {
+        io,
+        ratio,
+        dropouts,
+    })
 }
 
 /// The render-side mirror of [`attach_capture_device`]: registers `device`
@@ -273,7 +333,7 @@ pub fn attach_render_device(
     master_clock: Arc<MasterClock>,
     corrector: loomix_hal::drift::DriftCorrector,
     ring_capacity: usize,
-) -> Result<loomix_hal::device::RenderIoProcHandle, CoreAudioError> {
+) -> Result<AttachedDevice<loomix_hal::device::RenderIoProcHandle>, CoreAudioError> {
     let mut producers = Vec::with_capacity(channel_count);
     let mut consumers = Vec::with_capacity(channel_count);
     for _ in 0..channel_count {
@@ -282,11 +342,18 @@ pub fn attach_render_device(
         consumers.push(consumer);
     }
     let stage = loomix_hal::ioproc::DriftCorrectedIoStage::new(channel_count, corrector);
+    let ratio = stage.ratio_handle();
     let ctx =
         loomix_hal::device::RenderIoProcContext::new(stage, master_clock, consumers, ring_capacity);
-    let handle = loomix_hal::device::RenderIoProcHandle::start(device, ctx)?;
-    driver.set_bus_sink(bus, BusSink::new(producers));
-    Ok(handle)
+    let io = loomix_hal::device::RenderIoProcHandle::start(device, ctx)?;
+    let sink = BusSink::new(producers);
+    let dropouts = sink.overrun_counter();
+    driver.set_bus_sink(bus, sink);
+    Ok(AttachedDevice {
+        io,
+        ratio,
+        dropouts,
+    })
 }
 
 /// Registers `device` as the clock-master IOProc (spec 1.19), driving
@@ -325,17 +392,29 @@ mod tests {
     fn strip_source_underrun_fills_silence() {
         let (_producer, consumer) = rtrb::RingBuffer::<f32>::new(16);
         let mut source = StripSource::new(vec![consumer]);
+        let counter = source.underrun_counter();
         let mut out = vec![[1.0; CHANNELS]; 8]; // poisoned sentinel
         source.pull_into(&mut out);
         assert!(out.iter().all(|f| f[0] == 0.0));
+        assert_eq!(
+            counter.get(),
+            8,
+            "every frame of this callback underran, one increment each"
+        );
     }
 
     #[test]
     fn bus_sink_drops_silently_when_the_ring_is_full() {
         let (producer, _consumer) = rtrb::RingBuffer::<f32>::new(4);
         let mut sink = BusSink::new(vec![producer]);
+        let counter = sink.overrun_counter();
         let frames = vec![[1.0; CHANNELS]; 8]; // more than the ring's capacity
         sink.push_from(&frames); // must not panic
+        assert_eq!(
+            counter.get(),
+            4,
+            "the 4 frames past capacity should be counted"
+        );
     }
 
     #[test]
