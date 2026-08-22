@@ -53,7 +53,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 80
+      # --ignore-filename-regex excludes exactly the files that start real
+      # CoreAudio I/O or create a real system device -- deliberately never
+      # run by the automated test suite (see each file's own doc comment:
+      # loomix-hal/src/device_lifecycle.rs, loomix-app/src/device_wiring.rs,
+      # loomix-soak/src/main.rs). Not a general carve-out for
+      # CoreAudio-adjacent code: device.rs's enumeration/trampoline logic
+      # and engine_io.rs's ring-assembly logic stay in the gate because
+      # they're exercised directly, by hand-built buffers and real
+      # (successful) enumeration calls. The gate stays meaningful for
+      # everything that can actually be tested; the threshold does not move.
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 80 --ignore-filename-regex '(device_lifecycle\.rs|device_wiring\.rs|loomix-soak/src/main\.rs)$'
       - uses: codecov/codecov-action@v7
   driver:
     runs-on: macos-15

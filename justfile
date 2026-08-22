@@ -24,8 +24,13 @@ lint:
     npm run --prefix ui typecheck
     npm run --prefix ui lint
 
+# --ignore-filename-regex excludes exactly the files that start real
+# CoreAudio I/O or create a real system device -- deliberately never run
+# by the automated test suite; see each file's own doc comment
+# (loomix-hal/src/device_lifecycle.rs, loomix-app/src/device_wiring.rs,
+# loomix-soak/src/main.rs). Everything else stays in the gate.
 cover:
-    cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 80
+    cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 80 --ignore-filename-regex '(device_lifecycle\.rs|device_wiring\.rs|loomix-soak/src/main\.rs)$'
 
 bench:
     cargo bench -p loomix-core -- --save-baseline pr
