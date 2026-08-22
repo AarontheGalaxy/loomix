@@ -38,6 +38,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p loomix-core --features rt-assert -- realtime
+      # loomix-core's rt-assert allocator is process-wide (spec 3.3): a
+      # crate that only depends on loomix-core (never declaring its own
+      # rt-assert feature) still gets the trap by enabling loomix-core's
+      # feature directly via `dep/feature`. Full suites, not `-- realtime`
+      # only: unlike loomix-core these crates don't name every real-time
+      # test that way, and running everything under the trap costs nothing
+      # extra -- a test that never enters `assert_realtime` is unaffected.
+      - run: cargo test -p loomix-hal --features loomix-core/rt-assert
+      - run: cargo test -p loomix-app --features loomix-core/rt-assert
   coverage:
     runs-on: macos-15
     steps:
