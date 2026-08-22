@@ -5,3 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dependencies]
+loomix-core = { path = "../loomix-core", version = "0.0.0" }
+loomix-hal = { path = "../loomix-hal", version = "0.0.0" }
+rtrb = "0.4.0"
