@@ -5,6 +5,73 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-22 — M4 (continued, the soak harness and the interleaved-format bug)
+
+**`loomix-soak` is a new crate (spec 3.4 M4's 30-minute two-device
+acceptance test), wiring two real output devices together end to end and
+reporting a measured PASS/FAIL, not a runnable-only demo.** Two *output*
+devices, not an output and an input, even though the milestone's own
+IOProc work supports capture too: a first version defaulted to the system
+input device and measured 100% underrun in testing here, traced to a
+macOS microphone (TCC) permission gate on the terminal process, not a
+wiring bug -- confirmed by swapping to two output devices, which need no
+such permission, and matches spec 1.19's own literal example of what
+needs drift correction ("outputs A1 through A5 are not sample
+synchronous... when they run on different physical devices") at least as
+well as a capture scenario would. `nightly.yml` already referenced a
+`loomix-soak` package by name and a `--duration 2h` invocation before this
+crate existed; that leg is still M9's (recorder folded in), not this
+binary's current two-device-only shape, but the name and the
+`--duration` flag already match.
+
+**Wiring the soak harness for real surfaced a genuine bug no offline test
+could have caught: `capture_ioproc_trampoline`/`render_ioproc_trampoline`
+assumed one `AudioBuffer` per channel (non-interleaved), and every real
+output device tried on this machine -- the built-in speaker, an external
+monitor's speakers, BlackHole -- delivers one interleaved buffer instead.**
+`on_render` saw `output.len() == 1` against `channel_count == 2`
+resamplers; `debug_assert_eq!` would catch that in a debug build, but
+`cargo run --release` (what a real soak needs) compiles the assert out,
+and `zip()` silently processes only the shorter side, so the second
+channel's ring buffer is never drained and overruns forever. Manifested
+as continuous dropouts within about a second, on every real device pair
+tried, never once as a test failure -- there is no synthetic stand-in for
+a real device's actual stream format, exactly the category of bug this
+milestone's whole test strategy (pure/offline logic plus a manual
+hardware soak as final confirmation) was designed to still let through
+until the soak itself ran. First fix attempt: request a non-interleaved
+format explicitly via `AudioObjectSetPropertyData` before registering the
+IOProc (`set_stream_format_non_interleaved`). That call reports success
+and *still doesn't change what's delivered* -- confirmed by reading the
+format back immediately after setting it, which showed the interleaved
+flag unchanged. Real fix:
+`read_input_channels_planar`/`render_ioproc_trampoline`'s interleaved
+branch detect a single multi-channel `AudioBuffer` and
+deinterleave/interleave through scratch storage (`CaptureIoProcContext`'s
+`deinterleave` / `RenderIoProcContext`'s `interleave` fields, `chunks_exact_mut`
+splitting a flat scratch buffer into disjoint per-channel views, no
+allocation on the real-time thread) rather than trusting the format
+request to have taken effect. `set_stream_format_non_interleaved` is kept
+as a best-effort call whose result is now ignored -- harmless on devices
+that do honour it, irrelevant on the ones that don't since the trampolines
+adapt either way. `master_ioproc_trampoline` was *not* given the same
+fix: it hands raw buffers straight to a caller-supplied callback with no
+per-device channel count or scratch to deinterleave into, so it keeps the
+same interleaved-format gap, documented at the call site
+(`read_input_channels`'s doc comment) rather than silently carried
+forward -- not hit by the current soak scenario (the master's own
+strip/bus aren't used, `master_strip: None`), but a real gap for whenever
+a full-duplex master device and real audio content are both in play.
+
+Verified for real, not assumed, at every step of this fix: the format
+readback showing the set didn't take, the trampoline-level regression
+tests added for both the interleaved-capture and interleaved-render cases
+(`capture_trampoline_deinterleaves_a_single_interleaved_buffer`,
+`render_trampoline_interleaves_output_into_a_single_buffer`), and finally
+a 30-second `loomix-soak` run against the built-in speaker and BlackHole
+reporting zero dropouts after the fix, versus continuous overrun before
+it.
+
 ## 2026-08-22 — M4 (continued, loomix-app wiring)
 
 **`loomix-app::engine_io` -- assembling per-strip/per-bus ring buffers
