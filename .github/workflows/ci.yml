@@ -57,7 +57,14 @@ jobs:
       - run: driver/build/test_driver_host
       - run: clang -Wall -Wextra -Werror -std=gnu17 -DLOOMIX_CALLOC=FailingCalloc -DLOOMIX_MALLOC=FailingMalloc -framework CoreFoundation -framework CoreAudio -o driver/build/test_driver_host_fault_injection driver/tests/test_driver_host.c driver/LoomixAudioDriver/LoomixAudioDriver.c driver/LoomixAudioDriver/RingBuffer.c
       - run: driver/build/test_driver_host_fault_injection
-      - run: xcodebuild -project driver/LoomixAudioDriver.xcodeproj -scheme LoomixAudioDriver -configuration Release build CODE_SIGNING_ALLOWED=NO
+      # Ad-hoc signed, `-derivedDataPath driver/build`, matching what
+      # `driver/scripts/install.sh` looks for (and what `just
+      # install-driver` builds locally) -- a plain `CODE_SIGNING_ALLOWED=NO`
+      # build here would leave install.sh with no product to find, so the
+      # M4 hal-side device-enumeration checks below would run against a
+      # driver that was never actually installed on this runner.
+      - run: xcodebuild -project driver/LoomixAudioDriver.xcodeproj -scheme LoomixAudioDriver -configuration Release -derivedDataPath driver/build build CODE_SIGN_IDENTITY=-
+      - run: ./driver/scripts/install.sh
       - run: brew install llvm
       - run: ./driver/tests/run-static-checks.sh
   ui:

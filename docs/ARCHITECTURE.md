@@ -80,6 +80,28 @@ artefacts. Each phase's tap coefficients are explicitly normalised to
 unity DC gain after windowing, rather than relying on the truncated
 windowed-sinc approximation to sum to 1.0 on its own.
 
+**`ci.yml`'s `driver` job built the Release driver bundle but never
+installed it**, confirmed by reading the job rather than assumed: its
+`xcodebuild` step passed `CODE_SIGNING_ALLOWED=NO` with no
+`-derivedDataPath`, so even calling `driver/scripts/install.sh` afterward
+would have found no product at the path it looks for
+(`driver/build/Build/Products/Release/LoomixAudioDriver.driver`, which
+only exists when built with `-derivedDataPath driver/build`, as `just
+install-driver` does locally). Any hal-side check assuming Loomix's
+virtual devices are enumerable in CI would have been decorative --
+exactly the class of bug the rt-safety release-mode fix below already
+cost a debugging cycle to catch once. Fixed rather than dropped: the
+`driver` job's Release build now matches `install.sh`'s expectations
+(`-derivedDataPath driver/build CODE_SIGN_IDENTITY=-`, ad-hoc signed, the
+same as the local `install-driver` recipe) and the job now actually runs
+`install.sh`. This is safe specifically because it's a GitHub-hosted
+*ephemeral* runner, not the shared dev machine the M1/M2 entries below
+describe crashing twice in one day -- a wedged `coreaudiod` here just
+fails the job; there's no persistent machine to leave in a bad state.
+`install.sh` already fails loudly (not silently) on zero devices after 15
+seconds, per the M2 entry below, so this doesn't need its own new
+failure-detection logic.
+
 ## 2026-08-21 — M3
 
 **Audio moves through the engine as `&[[f32; 8]]` — a slice of fixed-size,
