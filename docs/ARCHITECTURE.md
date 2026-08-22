@@ -5,6 +5,45 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-22 — M4 (continued, IOProc registration)
+
+**`device.rs`'s real IOProc registration (`CaptureIoProcHandle`,
+`RenderIoProcHandle`) is thin glue over `ioproc.rs`'s already-proven
+`DriftCorrectedIoStage`: parse CoreAudio's `AudioBufferList` into planar
+slices, call the same `on_capture`/`on_render` methods the fake-device
+harness already exercises, nothing decision-worthy added here.** Assumes
+non-interleaved streams (one `AudioBuffer` per channel) -- the common,
+controllable case, not a claim every device format is handled.
+
+**An early draft of the render trampoline had a real soundness bug caught
+before it ever ran: `array::from_fn` over the full `MAX_IO_CHANNELS` (8)
+range read `MaybeUninit` slots that were only initialised up to `count`,
+so any device with fewer than 8 channels -- the common case -- read
+uninitialised memory as a `&mut [f32]` reference.** Rewritten to build
+each of the 8 array slots directly inside the `from_fn` closure (a real
+disjoint sub-slice for `i < count`, an always-valid empty slice
+otherwise), which needs no `MaybeUninit` at all: each closure invocation
+constructs its own value, so the `Copy` bound a `[expr; N]` repeat would
+need never comes up.
+
+**The buffer-list-parsing logic got automated coverage after all, by
+calling the trampoline functions directly with a hand-built
+`AudioBufferList`, rather than being left entirely untested like the rest
+of this file.** They're plain `unsafe extern "C" fn`s; nothing requires
+going through real CoreAudio registration to call them, the same reasoning
+M2's `test_driver_host.c` used to drive the driver's vtable in-process.
+This paid off immediately: the first version of both new tests built the
+`AudioBufferList` from a temporary `&mut [ch0.clone(), ch1.clone()]`
+array, whose backing `Vec`s are dropped at the end of that `let` statement
+-- before the buffer list is ever read -- leaving every `mData` pointer
+dangling from construction. That version SIGKILLed the test binary (heap
+corruption, not a clean panic or a useful backtrace); diagnosed by running
+the two new tests individually to isolate which one crashed, since the
+whole-module run gave no other signal. Fixed by having `TestBufferList`
+*own* the channel `Vec`s (moved in, stored alongside `storage`) rather
+than borrowing them, so their lifetime is tied to the buffer list's own
+rather than to an anonymous temporary.
+
 ## 2026-08-22 — M4 (continued)
 
 **`ioproc.rs`'s drift-corrected capture fed the PI controller the wrong
