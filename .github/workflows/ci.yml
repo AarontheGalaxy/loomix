@@ -10,7 +10,7 @@ jobs:
   lint:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with: { components: rustfmt, clippy }
       - uses: Swatinem/rust-cache@v2
@@ -23,7 +23,7 @@ jobs:
     strategy:
       matrix: { profile: [debug, release] }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - if: matrix.profile == 'debug'
@@ -35,7 +35,7 @@ jobs:
   rt_safety:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p loomix-core --features rt-assert -- realtime
       # loomix-core's rt-assert allocator is process-wide (spec 3.3): a
@@ -50,7 +50,7 @@ jobs:
   coverage:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-llvm-cov
       # --ignore-filename-regex excludes exactly the files that start real
@@ -68,7 +68,7 @@ jobs:
   driver:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: mkdir -p driver/build
       - run: clang -Wall -Wextra -Werror -std=gnu17 -o driver/build/test_ring_buffer driver/tests/test_ring_buffer.c driver/LoomixAudioDriver/RingBuffer.c
       - run: driver/build/test_ring_buffer
@@ -89,7 +89,7 @@ jobs:
   ui:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with: { node-version: 22, cache: npm, cache-dependency-path: ui/package-lock.json }
       - run: npm ci --prefix ui
@@ -99,7 +99,7 @@ jobs:
   bench:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo bench -p loomix-core -- --save-baseline pr
       - run: ./scripts/check-bench-regression.sh 10
