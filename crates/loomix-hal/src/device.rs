@@ -11,8 +11,11 @@
 
 use crate::clock::DeviceId;
 use crate::hog::Pid;
+use crate::ioproc::DriftCorrectedIoStage;
+use crate::master_clock::MasterClock;
 use coreaudio_sys::*;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// A CoreAudio `OSStatus` failure from any call in this module.
 pub type CoreAudioError = OSStatus;
@@ -241,9 +244,231 @@ impl Drop for DeviceListListener {
     }
 }
 
+/// Registers `ioproc.rs`'s already-proven [`DriftCorrectedIoStage`] as a
+/// real CoreAudio IOProc (spec 3.4 M4). Everything decision-worthy --
+/// drift correction, resampling, the ring buffer -- was already exercised
+/// against a synthetic fake device in `ioproc.rs`'s own tests; what's here
+/// is just the FFI glue that hands CoreAudio's real buffers to those same
+/// methods, which no offline test can reach (there's no synthetic stand-in
+/// for "does coreaudiod actually call this function pointer with the
+/// buffers it promises"). Assumes non-interleaved streams (one
+/// [`AudioBuffer`] per channel) -- the common, controllable case, not a
+/// claim that Loomix drives every device format.
+///
+/// A channel count above this is rejected rather than silently truncated;
+/// [`MAX_IO_CHANNELS`] matches spec 1.1's 8-channel bus width, the largest
+/// channel count anything in this codebase is built to carry.
+const MAX_IO_CHANNELS: usize = 8;
+
+/// Per-device state for a registered capture IOProc, boxed at
+/// registration time so a stable address exists to hand CoreAudio as
+/// `inClientData`, and owned for the registration's lifetime.
+pub struct CaptureIoProcContext {
+    stage: DriftCorrectedIoStage,
+    master: Arc<MasterClock>,
+    outputs: Vec<rtrb::Producer<f32>>,
+    scratch: Vec<f32>,
+}
+
+impl CaptureIoProcContext {
+    pub fn new(
+        stage: DriftCorrectedIoStage,
+        master: Arc<MasterClock>,
+        outputs: Vec<rtrb::Producer<f32>>,
+        scratch_capacity: usize,
+    ) -> Self {
+        Self {
+            stage,
+            master,
+            outputs,
+            scratch: vec![0.0; scratch_capacity],
+        }
+    }
+}
+
+/// # Real-time safety
+/// No allocation: `channels` is a fixed-size stack array, and `ctx`'s
+/// `outputs`/`scratch` were sized once at construction. No locks:
+/// `rtrb::Producer::push` is lock-free. No syscalls beyond what CoreAudio
+/// itself performs to invoke this callback.
+unsafe extern "C" fn capture_ioproc_trampoline(
+    _device: AudioObjectID,
+    _now: *const AudioTimeStamp,
+    input_data: *const AudioBufferList,
+    _input_time: *const AudioTimeStamp,
+    _output_data: *mut AudioBufferList,
+    _output_time: *const AudioTimeStamp,
+    client_data: *mut std::os::raw::c_void,
+) -> OSStatus {
+    let ctx = unsafe { &mut *(client_data as *mut CaptureIoProcContext) };
+    let count = (unsafe { (*input_data).mNumberBuffers } as usize).min(MAX_IO_CHANNELS);
+    let first = unsafe { (*input_data).mBuffers.as_ptr() };
+    let mut channels: [&[f32]; MAX_IO_CHANNELS] = [&[]; MAX_IO_CHANNELS];
+    for (i, slot) in channels.iter_mut().enumerate().take(count) {
+        let buf = unsafe { &*first.add(i) };
+        let len = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
+        *slot = unsafe { std::slice::from_raw_parts(buf.mData as *const f32, len) };
+    }
+    ctx.stage.on_capture(
+        &channels[..count],
+        &ctx.master,
+        &mut ctx.outputs,
+        &mut ctx.scratch,
+    );
+    0
+}
+
+/// A running capture IOProc registration. Stops and unregisters on drop.
+pub struct CaptureIoProcHandle {
+    device: AudioObjectID,
+    proc_id: AudioDeviceIOProcID,
+    _ctx: Box<CaptureIoProcContext>,
+}
+
+impl CaptureIoProcHandle {
+    pub fn start(device: DeviceId, ctx: CaptureIoProcContext) -> Result<Self, CoreAudioError> {
+        let mut ctx = Box::new(ctx);
+        let mut proc_id: AudioDeviceIOProcID = None;
+        check(unsafe {
+            AudioDeviceCreateIOProcID(
+                device,
+                Some(capture_ioproc_trampoline),
+                ctx.as_mut() as *mut CaptureIoProcContext as *mut _,
+                &mut proc_id,
+            )
+        })?;
+        if let Err(e) = check(unsafe { AudioDeviceStart(device, proc_id) }) {
+            unsafe { AudioDeviceDestroyIOProcID(device, proc_id) };
+            return Err(e);
+        }
+        Ok(Self {
+            device,
+            proc_id,
+            _ctx: ctx,
+        })
+    }
+}
+
+impl Drop for CaptureIoProcHandle {
+    fn drop(&mut self) {
+        unsafe {
+            AudioDeviceStop(self.device, self.proc_id);
+            AudioDeviceDestroyIOProcID(self.device, self.proc_id);
+        }
+    }
+}
+
+/// Per-device state for a registered render IOProc, symmetric to
+/// [`CaptureIoProcContext`]: the ring buffers are consumers (filled by
+/// whoever assembles bus output) instead of producers.
+pub struct RenderIoProcContext {
+    stage: DriftCorrectedIoStage,
+    master: Arc<MasterClock>,
+    inputs: Vec<rtrb::Consumer<f32>>,
+    scratch: Vec<f32>,
+}
+
+impl RenderIoProcContext {
+    pub fn new(
+        stage: DriftCorrectedIoStage,
+        master: Arc<MasterClock>,
+        inputs: Vec<rtrb::Consumer<f32>>,
+        scratch_capacity: usize,
+    ) -> Self {
+        Self {
+            stage,
+            master,
+            inputs,
+            scratch: vec![0.0; scratch_capacity],
+        }
+    }
+}
+
+/// # Real-time safety
+/// Same reasoning as [`capture_ioproc_trampoline`]: `channels` is a fixed
+/// stack array, `ctx`'s state is pre-allocated, `rtrb::Consumer::pop` is
+/// lock-free.
+unsafe extern "C" fn render_ioproc_trampoline(
+    _device: AudioObjectID,
+    _now: *const AudioTimeStamp,
+    _input_data: *const AudioBufferList,
+    _input_time: *const AudioTimeStamp,
+    output_data: *mut AudioBufferList,
+    _output_time: *const AudioTimeStamp,
+    client_data: *mut std::os::raw::c_void,
+) -> OSStatus {
+    let ctx = unsafe { &mut *(client_data as *mut RenderIoProcContext) };
+    let count = (unsafe { (*output_data).mNumberBuffers } as usize).min(MAX_IO_CHANNELS);
+    let first = unsafe { (*output_data).mBuffers.as_mut_ptr() };
+    // Built directly rather than through `MaybeUninit`: each closure
+    // invocation constructs its own value (no `Copy` bound needed the way
+    // a `[expr; N]` repeat would), and every one of the `MAX_IO_CHANNELS`
+    // slots gets a genuinely valid value -- a disjoint sub-slice of a real
+    // CoreAudio buffer for `i < count`, or an always-valid empty slice
+    // otherwise -- never an uninitialised read for a device with fewer
+    // than `MAX_IO_CHANNELS` channels, which is the common case.
+    let mut channel_refs: [&mut [f32]; MAX_IO_CHANNELS] = std::array::from_fn(|i| {
+        if i < count {
+            let buf = unsafe { &mut *first.add(i) };
+            let len = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
+            unsafe { std::slice::from_raw_parts_mut(buf.mData as *mut f32, len) }
+        } else {
+            &mut []
+        }
+    });
+    ctx.stage.on_render(
+        &ctx.master,
+        &mut ctx.inputs,
+        &mut channel_refs[..count],
+        &mut ctx.scratch,
+    );
+    0
+}
+
+/// A running render IOProc registration. Stops and unregisters on drop.
+pub struct RenderIoProcHandle {
+    device: AudioObjectID,
+    proc_id: AudioDeviceIOProcID,
+    _ctx: Box<RenderIoProcContext>,
+}
+
+impl RenderIoProcHandle {
+    pub fn start(device: DeviceId, ctx: RenderIoProcContext) -> Result<Self, CoreAudioError> {
+        let mut ctx = Box::new(ctx);
+        let mut proc_id: AudioDeviceIOProcID = None;
+        check(unsafe {
+            AudioDeviceCreateIOProcID(
+                device,
+                Some(render_ioproc_trampoline),
+                ctx.as_mut() as *mut RenderIoProcContext as *mut _,
+                &mut proc_id,
+            )
+        })?;
+        if let Err(e) = check(unsafe { AudioDeviceStart(device, proc_id) }) {
+            unsafe { AudioDeviceDestroyIOProcID(device, proc_id) };
+            return Err(e);
+        }
+        Ok(Self {
+            device,
+            proc_id,
+            _ctx: ctx,
+        })
+    }
+}
+
+impl Drop for RenderIoProcHandle {
+    fn drop(&mut self) {
+        unsafe {
+            AudioDeviceStop(self.device, self.proc_id);
+            AudioDeviceDestroyIOProcID(self.device, self.proc_id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drift::{DriftCorrector, PiController};
 
     // These hit real CoreAudio -- there's no synthetic stand-in for "does
     // this machine's coreaudiod answer a property query correctly", so
@@ -308,5 +533,169 @@ mod tests {
             DeviceListListener::register().expect("listener registration should succeed");
         assert!(!listener.take_changed());
         drop(listener);
+    }
+
+    /// Hand-builds a heap-allocated `AudioBufferList` with `channels.len()`
+    /// non-interleaved f32 channels -- the same layout a real capture or
+    /// render callback receives. Bindgen's struct declares `mBuffers` as
+    /// `[AudioBuffer; 1]` (the real C type is a flexible array member), so
+    /// more than one buffer needs its storage sized past that: starting
+    /// from `size_of::<AudioBufferList>()` (which already accounts for
+    /// whatever padding the compiler puts before a single correctly
+    /// aligned `AudioBuffer`) and extending by one more `AudioBuffer` per
+    /// additional channel is the standard idiom for this, rather than
+    /// guessing the header size by hand.
+    ///
+    /// Owns `channels` itself (rather than borrowing them) precisely
+    /// because the first version of this test didn't: it built the buffer
+    /// list from a temporary `&mut [ch0.clone(), ch1.clone()]` array,
+    /// whose backing `Vec`s were dropped -- leaving every `mData` pointer
+    /// dangling -- the instant the constructor call's statement finished,
+    /// before the buffer list was ever read. That version SIGKILLed
+    /// (heap corruption, not a clean panic). Owning `channels` for exactly
+    /// as long as `storage` needs them removes the whole class of bug.
+    struct TestBufferList {
+        storage: Vec<u8>,
+        _channels: Vec<Vec<f32>>,
+    }
+
+    impl TestBufferList {
+        fn new(mut channels: Vec<Vec<f32>>) -> Self {
+            let extra = channels.len().saturating_sub(1);
+            let total =
+                std::mem::size_of::<AudioBufferList>() + extra * std::mem::size_of::<AudioBuffer>();
+            let mut storage = vec![0u8; total];
+            let list = storage.as_mut_ptr() as *mut AudioBufferList;
+            unsafe {
+                (*list).mNumberBuffers = channels.len() as UInt32;
+                let first = (*list).mBuffers.as_mut_ptr();
+                for (i, buf) in channels.iter_mut().enumerate() {
+                    std::ptr::write(
+                        first.add(i),
+                        AudioBuffer {
+                            mNumberChannels: 1,
+                            mDataByteSize: (buf.len() * std::mem::size_of::<f32>()) as UInt32,
+                            mData: buf.as_mut_ptr() as *mut std::os::raw::c_void,
+                        },
+                    );
+                }
+            }
+            Self {
+                storage,
+                _channels: channels,
+            }
+        }
+
+        fn as_ptr(&self) -> *const AudioBufferList {
+            self.storage.as_ptr() as *const AudioBufferList
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut AudioBufferList {
+            self.storage.as_mut_ptr() as *mut AudioBufferList
+        }
+    }
+
+    /// Calls `capture_ioproc_trampoline` directly with a hand-built
+    /// multi-channel `AudioBufferList` -- no real device or `coreaudiod`
+    /// needed, exercising exactly the buffer-count and byte-size-to-
+    /// sample-count arithmetic a real callback would trigger. This is the
+    /// exact class of bug the trampoline had before it compiled once
+    /// (reading uninitialised memory past `count` in an early draft of
+    /// the render side): worth a real check now that it exists.
+    #[test]
+    fn capture_trampoline_parses_a_two_channel_buffer_list_without_crossing_channels() {
+        // At least TAPS (32) samples per channel so the resampler is
+        // primed and actually emits output on this one callback.
+        let ch0: Vec<f32> = (0..64).map(|i| i as f32 * 0.01).collect(); // stays under 1.0
+        let ch1: Vec<f32> = (0..64).map(|i| 100.0 + i as f32 * 0.01).collect(); // stays over 100.0
+        let input_len = ch0.len();
+        let input_list = TestBufferList::new(vec![ch0, ch1]);
+
+        let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
+        let stage = DriftCorrectedIoStage::new(2, corrector);
+        let master = Arc::new(MasterClock::default());
+        let (tx0, mut rx0) = rtrb::RingBuffer::<f32>::new(256);
+        let (tx1, mut rx1) = rtrb::RingBuffer::<f32>::new(256);
+        let mut ctx = Box::new(CaptureIoProcContext::new(
+            stage,
+            master,
+            vec![tx0, tx1],
+            input_len * 2,
+        ));
+
+        let status = unsafe {
+            capture_ioproc_trampoline(
+                0,
+                std::ptr::null(),
+                input_list.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                ctx.as_mut() as *mut CaptureIoProcContext as *mut std::os::raw::c_void,
+            )
+        };
+        assert_eq!(status, 0);
+
+        let mut received0 = Vec::new();
+        while let Ok(s) = rx0.pop() {
+            received0.push(s);
+        }
+        let mut received1 = Vec::new();
+        while let Ok(s) = rx1.pop() {
+            received1.push(s);
+        }
+        assert!(!received0.is_empty() && !received1.is_empty());
+        // Channel 0's samples are all under 1.0, channel 1's all over
+        // 100.0 -- if the buffer-list parsing mixed up the two channels'
+        // pointers or strides, this would catch it.
+        assert!(received0.iter().all(|&s| s < 1.0));
+        assert!(received1.iter().all(|&s| s > 100.0));
+    }
+
+    #[test]
+    fn render_trampoline_fills_every_channel_and_pads_underrun_with_silence() {
+        let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
+        let stage = DriftCorrectedIoStage::new(2, corrector);
+        let master = Arc::new(MasterClock::default());
+        let (mut tx0, rx0) = rtrb::RingBuffer::<f32>::new(64);
+        // Channel 0 has data queued; channel 1 has none, so it must
+        // underrun to silence rather than leave the poisoned sentinel.
+        for i in 0..8 {
+            tx0.push(i as f32).unwrap();
+        }
+        let (_tx1, rx1) = rtrb::RingBuffer::<f32>::new(64);
+        let mut ctx = Box::new(RenderIoProcContext::new(stage, master, vec![rx0, rx1], 256));
+
+        let out0 = vec![1.0f32; 8]; // poisoned sentinel
+        let out1 = vec![1.0f32; 8];
+        let mut output_list = TestBufferList::new(vec![out0, out1]);
+
+        let status = unsafe {
+            render_ioproc_trampoline(
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                output_list.as_mut_ptr(),
+                std::ptr::null(),
+                ctx.as_mut() as *mut RenderIoProcContext as *mut std::os::raw::c_void,
+            )
+        };
+        assert_eq!(status, 0);
+
+        unsafe {
+            let list = &*output_list.as_ptr();
+            let bufs = list.mBuffers.as_ptr();
+            let buf0 = std::slice::from_raw_parts((*bufs).mData as *const f32, 8);
+            let buf1 = std::slice::from_raw_parts((*bufs.add(1)).mData as *const f32, 8);
+            assert!(
+                buf1.iter().all(|&s| s == 0.0),
+                "underrun channel should be silence"
+            );
+            assert!(
+                buf0.iter().any(|&s| s != 1.0),
+                "the channel with data queued should not be all sentinel"
+            );
+        }
     }
 }
