@@ -10,3 +10,4 @@
 //! verified separately (`driver` CI job, manual hardware soak).
 
 pub mod clock;
+pub mod drift;
