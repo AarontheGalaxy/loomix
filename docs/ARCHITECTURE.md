@@ -5,6 +5,81 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-22 — M4
+
+**`loomix-hal`'s algorithmic pieces -- clock master selection, drift
+estimation, the resampler, hot-plug handling, hog-mode fallback -- are
+pure functions over plain data (`clock.rs`, `drift.rs`, `resample.rs`,
+`hotplug.rs`, `hog.rs`), with no CoreAudio calls and no wall-clock time.**
+Same move as M3's engine core, and the M1/M2 lesson logged below: push
+logic somewhere offline-testable, keep the CoreAudio-touching code thin on
+top of it. Unlike M1/M2's driver, none of this needed a host-side C
+harness at all -- it's ordinary Rust exercised by `cargo test` with
+synthetic clocks, never an installed driver or a real device.
+
+**The drift-estimator tests include two "wrong implementation actually
+fails" cases, not just "correct implementation passes" ones, on direct
+request.** `drift::tests::a_naive_fixed_ratio_fails_the_same_scenario` runs
+the identical synthetic ppm-offset scenario through a corrected loop and
+through spec 2.3's named failure mode (a fixed ratio, i.e. no correction
+at all) in the same test, and asserts the fixed-ratio version actually
+diverges past a bound the corrected version stays under --
+`drift::tests::converges_to_a_steady_ppm_offset_and_stays_bounded` alone
+would pass equally well against a broken corrector that happened to do
+nothing, same as `test_ring_buffer.c`'s poison-sentinel test below.
+`drift::tests::discontinuous_clock_jump_recovers_ratio_but_a_plain_pi_loop_stays_biased`
+covers a second, separate failure mode: a device reconfiguring or a USB
+interface renegotiating can make its reported sample time jump
+discontinuously in one block, and a plain PI controller has no way to
+distinguish that from a huge drift reading -- it integrates it, and
+because the integral term never leaks on its own, that single reading
+permanently biases the loop's steady-state ratio away from 1.0. Writing
+this test surfaced the actual fix, not just a test for one already
+written: `DriftCorrector` wraps `PiController` with a
+`discontinuity_threshold` that resets the integral instead of absorbing a
+reading past it, and the test asserts the plain `PiController` alone stays
+biased (`bias > 0.001`) long after the jump while `DriftCorrector`
+recovers to near 1.0 within ten blocks -- both driven by the identical
+synthetic jump, so the comparison is a real A/B, not two different scenarios.
+
+**The drift simulation's cumulative sample counters are `f64`, not `f32`,
+and this was found by the naive-fixed-ratio test failing, not reasoned out
+in advance.** The first version of that test asserted the fixed-ratio
+error would exceed 2000 samples after 50,000 blocks; it only reached
+1535.5 and failed. Root cause: `device_cumulative` was accumulated in
+`f32`, and at ~6.4M frames (50,000 blocks * 128 frames) `f32`'s ulp is
+already 0.5 -- larger than the ~0.064-sample fractional drift added per
+block at 500 ppm -- so most of the accumulating error was rounded away on
+every `+=` before it could show up in the difference against
+`master_cumulative`. A real 30-minute session reaches ~86M frames at 48
+kHz, past where `f32` can even represent every integer exactly, so this
+wasn't a test-only concern: `PiController::update`'s doc comment now
+states the constraint explicitly -- cumulative sample time must be tracked
+in `f64` or an integer type upstream, and only the small, bounded
+difference narrows to `f32` for the controller itself, which never sees
+values large enough for this to matter. Checked for the same assumption
+elsewhere in the workspace: `loomix-core::meter::Meter`'s peak-hold is a
+running max (`if level > *held`), not a sum, so it's scale-invariant
+regardless of session length and the bug class doesn't apply; nothing else
+in `loomix-core` carries a persistent cumulative counter across
+`process_block` calls at all. `clock::InternalClock::frames_produced` was
+already `u64` and `resample::Resampler::read_offset` is `f64` and wraps
+every 1.0, so neither needed a fix.
+
+**`resample.rs`'s polyphase resampler is a windowed-sinc filter bank (32
+taps, 256 phases), sized for drift correction's actual use case -- a ratio
+that stays within tens to hundreds of parts per million of 1.0, corrected
+slowly -- not general arbitrary-ratio sample-rate conversion.** Building a
+full production-quality SRC (adaptive filter length, dynamic cutoff
+scaling with ratio, higher phase resolution) now would be sizing for a
+requirement M4 doesn't have; `TAPS`/`NUM_PHASES` are left as the
+calibration knob spec's own framing calls for ("a real clock drifts... a
+PCA9685 runs a few percent fast"), flagged with a `ponytail:` comment
+naming the upgrade path if the real two-device soak shows audible
+artefacts. Each phase's tap coefficients are explicitly normalised to
+unity DC gain after windowing, rather than relying on the truncated
+windowed-sinc approximation to sum to 1.0 on its own.
+
 ## 2026-08-21 — M3
 
 **Audio moves through the engine as `&[[f32; 8]]` — a slice of fixed-size,
