@@ -446,6 +446,15 @@ name = "loomix-rpc"
 version = "0.0.0"
 
 [[package]]
+name = "loomix-soak"
+version = "0.0.0"
+dependencies = [
+ "loomix-app",
+ "loomix-core",
+ "loomix-hal",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
