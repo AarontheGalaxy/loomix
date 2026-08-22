@@ -11,4 +11,6 @@
 
 pub mod clock;
 pub mod drift;
+pub mod hog;
+pub mod hotplug;
 pub mod resample;
