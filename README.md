@@ -21,6 +21,31 @@ as a reference for building a CoreAudio `AudioServerPlugIn` on macOS;
 Loomix's driver is a separate implementation shaped for eight independent
 virtual I/O pairs with a private control channel.
 
+## Status
+
+The description above is the finished product `docs/SPEC.md` is building
+toward, milestone by milestone (section 3.4) -- it is not what's runnable
+today. As of milestone M4:
+
+**Built:**
+
+* The `AudioServerPlugIn` driver: 8 virtual I/O pairs (16 devices total),
+  stable UIDs, hot-plug and `coreaudiod`-restart survival (M1, M2).
+* The engine core: 8 hardware/virtual input strips, 8 output buses, the
+  full 8x8 assignment matrix, per-bus gain layers, mute, solo, mono, fader
+  law, metering (M3).
+* Hardware I/O and clocking: device enumeration and selection, hog mode,
+  clock master selection, drift-corrected resampling, internal-clock
+  fallback, hot-plug handling, aggregate devices (M4).
+
+**Not yet built** (milestone order): strip processing -- gate,
+compressor, limiter, denoiser, pan laws (M5); the parametric EQ engine
+(M6); bus modes and patching (M7); internal FX -- reverb, multitap delay,
+multiband compressor (M8); the recorder (M9); the control surface --
+request script, MIDI mapping, macro buttons (M10); network audio (M11);
+and the polish/release milestone -- preset scenes, installer, docs site
+(M12).
+
 ## Repository layout
 
 ```
