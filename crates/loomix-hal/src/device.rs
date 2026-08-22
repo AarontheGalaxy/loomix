@@ -286,6 +286,59 @@ impl CaptureIoProcContext {
     }
 }
 
+/// Reads up to [`MAX_IO_CHANNELS`] channels from an `AudioBufferList` as
+/// planar `&[f32]` slices. Returns the array and the real channel count
+/// (`<= MAX_IO_CHANNELS`); channels beyond that are silently dropped
+/// rather than read out of bounds. Shared by every trampoline in this
+/// file that needs a device's captured audio.
+///
+/// # Safety
+/// `list` must point to a valid `AudioBufferList` with `mNumberBuffers`
+/// non-interleaved buffers, each `mData` valid for `mDataByteSize` bytes,
+/// for the duration of the borrow -- exactly what CoreAudio guarantees for
+/// the buffer list handed to an `AudioDeviceIOProc` for the callback's
+/// duration.
+unsafe fn read_input_channels<'a>(
+    list: *const AudioBufferList,
+) -> ([&'a [f32]; MAX_IO_CHANNELS], usize) {
+    let count = (unsafe { (*list).mNumberBuffers } as usize).min(MAX_IO_CHANNELS);
+    let first = unsafe { (*list).mBuffers.as_ptr() };
+    let mut channels: [&[f32]; MAX_IO_CHANNELS] = [&[]; MAX_IO_CHANNELS];
+    for (i, slot) in channels.iter_mut().enumerate().take(count) {
+        let buf = unsafe { &*first.add(i) };
+        let len = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
+        *slot = unsafe { std::slice::from_raw_parts(buf.mData as *const f32, len) };
+    }
+    (channels, count)
+}
+
+/// The write side of [`read_input_channels`]: up to [`MAX_IO_CHANNELS`]
+/// channels from an `AudioBufferList` as planar `&mut [f32]` slices, built
+/// without `MaybeUninit` (see the render trampoline's own note, kept here
+/// since this replaced its inline version) -- each of the fixed slots gets
+/// a genuinely valid value, a disjoint sub-slice for `i < count` or an
+/// always-valid empty slice otherwise, never an uninitialised read for a
+/// device with fewer than `MAX_IO_CHANNELS` channels.
+///
+/// # Safety
+/// Same contract as [`read_input_channels`], for `mut` access.
+unsafe fn write_output_channels<'a>(
+    list: *mut AudioBufferList,
+) -> ([&'a mut [f32]; MAX_IO_CHANNELS], usize) {
+    let count = (unsafe { (*list).mNumberBuffers } as usize).min(MAX_IO_CHANNELS);
+    let first = unsafe { (*list).mBuffers.as_mut_ptr() };
+    let channels: [&mut [f32]; MAX_IO_CHANNELS] = std::array::from_fn(|i| {
+        if i < count {
+            let buf = unsafe { &mut *first.add(i) };
+            let len = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
+            unsafe { std::slice::from_raw_parts_mut(buf.mData as *mut f32, len) }
+        } else {
+            &mut []
+        }
+    });
+    (channels, count)
+}
+
 /// # Real-time safety
 /// No allocation: `channels` is a fixed-size stack array, and `ctx`'s
 /// `outputs`/`scratch` were sized once at construction. No locks:
@@ -301,14 +354,7 @@ unsafe extern "C" fn capture_ioproc_trampoline(
     client_data: *mut std::os::raw::c_void,
 ) -> OSStatus {
     let ctx = unsafe { &mut *(client_data as *mut CaptureIoProcContext) };
-    let count = (unsafe { (*input_data).mNumberBuffers } as usize).min(MAX_IO_CHANNELS);
-    let first = unsafe { (*input_data).mBuffers.as_ptr() };
-    let mut channels: [&[f32]; MAX_IO_CHANNELS] = [&[]; MAX_IO_CHANNELS];
-    for (i, slot) in channels.iter_mut().enumerate().take(count) {
-        let buf = unsafe { &*first.add(i) };
-        let len = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
-        *slot = unsafe { std::slice::from_raw_parts(buf.mData as *const f32, len) };
-    }
+    let (channels, count) = unsafe { read_input_channels(input_data) };
     ctx.stage.on_capture(
         &channels[..count],
         &ctx.master,
@@ -398,28 +444,11 @@ unsafe extern "C" fn render_ioproc_trampoline(
     client_data: *mut std::os::raw::c_void,
 ) -> OSStatus {
     let ctx = unsafe { &mut *(client_data as *mut RenderIoProcContext) };
-    let count = (unsafe { (*output_data).mNumberBuffers } as usize).min(MAX_IO_CHANNELS);
-    let first = unsafe { (*output_data).mBuffers.as_mut_ptr() };
-    // Built directly rather than through `MaybeUninit`: each closure
-    // invocation constructs its own value (no `Copy` bound needed the way
-    // a `[expr; N]` repeat would), and every one of the `MAX_IO_CHANNELS`
-    // slots gets a genuinely valid value -- a disjoint sub-slice of a real
-    // CoreAudio buffer for `i < count`, or an always-valid empty slice
-    // otherwise -- never an uninitialised read for a device with fewer
-    // than `MAX_IO_CHANNELS` channels, which is the common case.
-    let mut channel_refs: [&mut [f32]; MAX_IO_CHANNELS] = std::array::from_fn(|i| {
-        if i < count {
-            let buf = unsafe { &mut *first.add(i) };
-            let len = buf.mDataByteSize as usize / std::mem::size_of::<f32>();
-            unsafe { std::slice::from_raw_parts_mut(buf.mData as *mut f32, len) }
-        } else {
-            &mut []
-        }
-    });
+    let (mut channels, count) = unsafe { write_output_channels(output_data) };
     ctx.stage.on_render(
         &ctx.master,
         &mut ctx.inputs,
-        &mut channel_refs[..count],
+        &mut channels[..count],
         &mut ctx.scratch,
     );
     0
@@ -457,6 +486,96 @@ impl RenderIoProcHandle {
 }
 
 impl Drop for RenderIoProcHandle {
+    fn drop(&mut self) {
+        unsafe {
+            AudioDeviceStop(self.device, self.proc_id);
+            AudioDeviceDestroyIOProcID(self.device, self.proc_id);
+        }
+    }
+}
+
+/// A boxed real-time-safe callback for the clock-master device's IOProc
+/// (spec 1.19). Receives this callback's frame count, its captured
+/// channels (empty if the device has none), and its output channels to
+/// fill (empty if the device has none) -- both directions in the one
+/// synchronous call CoreAudio actually makes for a full-duplex device,
+/// deliberately not split into separate capture/render registrations the
+/// way non-master devices are: the master's own callback is what drives
+/// the engine tick, and that tick has to see this callback's captured
+/// audio *and* produce this callback's output in the right order, which
+/// two independently-scheduled registrations can't guarantee.
+///
+/// Must not allocate, lock, or perform I/O -- the same real-time
+/// discipline as everything else on this thread (spec 3.3). This crate
+/// cannot enforce that for a caller-supplied closure the way
+/// `DriftCorrectedIoStage`'s own methods are exercised under
+/// `assert_realtime`; it's the caller's obligation, documented here
+/// because it's the one boundary in this file where the obligation
+/// crosses from this crate's code into someone else's.
+pub type MasterTickCallback = Box<dyn FnMut(u32, &[&[f32]], &mut [&mut [f32]]) + Send>;
+
+struct MasterIoProcContext {
+    callback: MasterTickCallback,
+}
+
+unsafe extern "C" fn master_ioproc_trampoline(
+    _device: AudioObjectID,
+    _now: *const AudioTimeStamp,
+    input_data: *const AudioBufferList,
+    _input_time: *const AudioTimeStamp,
+    output_data: *mut AudioBufferList,
+    _output_time: *const AudioTimeStamp,
+    client_data: *mut std::os::raw::c_void,
+) -> OSStatus {
+    let ctx = unsafe { &mut *(client_data as *mut MasterIoProcContext) };
+    let (input_channels, input_count) = unsafe { read_input_channels(input_data) };
+    let (mut output_channels, output_count) = unsafe { write_output_channels(output_data) };
+    let frames = output_channels[..output_count]
+        .first()
+        .map(|c| c.len())
+        .or_else(|| input_channels[..input_count].first().map(|c| c.len()))
+        .unwrap_or(0) as u32;
+    (ctx.callback)(
+        frames,
+        &input_channels[..input_count],
+        &mut output_channels[..output_count],
+    );
+    0
+}
+
+/// A running master-device IOProc registration. Stops and unregisters on
+/// drop.
+pub struct MasterIoProcHandle {
+    device: AudioObjectID,
+    proc_id: AudioDeviceIOProcID,
+    _ctx: Box<MasterIoProcContext>,
+}
+
+impl MasterIoProcHandle {
+    pub fn start(device: DeviceId, callback: MasterTickCallback) -> Result<Self, CoreAudioError> {
+        let mut ctx = Box::new(MasterIoProcContext { callback });
+        let mut proc_id: AudioDeviceIOProcID = None;
+        check(unsafe {
+            AudioDeviceCreateIOProcID(
+                device,
+                Some(master_ioproc_trampoline),
+                ctx.as_mut() as *mut MasterIoProcContext as *mut _,
+                &mut proc_id,
+            )
+        })?;
+        if let Err(e) = check(unsafe { AudioDeviceStart(device, proc_id) }) {
+            unsafe { AudioDeviceDestroyIOProcID(device, proc_id) };
+            return Err(e);
+        }
+        Ok(Self {
+            device,
+            proc_id,
+            _ctx: ctx,
+        })
+    }
+}
+
+impl Drop for MasterIoProcHandle {
     fn drop(&mut self) {
         unsafe {
             AudioDeviceStop(self.device, self.proc_id);
@@ -850,6 +969,59 @@ mod tests {
                 buf0.iter().any(|&s| s != 1.0),
                 "the channel with data queued should not be all sentinel"
             );
+        }
+    }
+
+    #[test]
+    fn master_trampoline_hands_the_callback_both_directions_in_one_call() {
+        let input = vec![vec![1.0f32, 2.0, 3.0, 4.0]];
+        let input_list = TestBufferList::new(input);
+        let output = vec![vec![9.0f32; 4]];
+        let mut output_list = TestBufferList::new(output);
+
+        let seen_frames = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen_input_first_sample = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen_frames_cb = seen_frames.clone();
+        let seen_input_cb = seen_input_first_sample.clone();
+        let callback: MasterTickCallback = Box::new(move |frames, input, output| {
+            seen_frames_cb.store(frames, std::sync::atomic::Ordering::SeqCst);
+            seen_input_cb.store(
+                input
+                    .first()
+                    .and_then(|c| c.first())
+                    .copied()
+                    .unwrap_or(-1.0) as u32,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            // Prove this callback can write the master's own bus output
+            // directly, in the same call it saw the captured input.
+            if let Some(out_channel) = output.first_mut() {
+                out_channel.fill(42.0);
+            }
+        });
+        let mut ctx = Box::new(MasterIoProcContext { callback });
+
+        let status = unsafe {
+            master_ioproc_trampoline(
+                0,
+                std::ptr::null(),
+                input_list.as_ptr(),
+                std::ptr::null(),
+                output_list.as_mut_ptr(),
+                std::ptr::null(),
+                ctx.as_mut() as *mut MasterIoProcContext as *mut std::os::raw::c_void,
+            )
+        };
+        assert_eq!(status, 0);
+        assert_eq!(seen_frames.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(
+            seen_input_first_sample.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        unsafe {
+            let list = &*output_list.as_ptr();
+            let buf0 = std::slice::from_raw_parts(list.mBuffers[0].mData as *const f32, 4);
+            assert!(buf0.iter().all(|&s| s == 42.0));
         }
     }
 }
