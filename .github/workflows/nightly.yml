@@ -12,8 +12,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: taiki-e/install-action@cargo-fuzz
-      # Fuzz targets land with loomix-net's packet parser (M11) and
-      # loomix-rpc's request-script parser (M10); nothing to run before then.
+      # Fuzz targets land with loomix-net's packet parser (M12) and
+      # loomix-rpc's request-script parser (M11); nothing to run before then.
       - run: |
           if [ -d loomix-net/fuzz ] || [ -d crates/loomix-net/fuzz ]; then
             for target in $(cargo fuzz list --fuzz-dir crates/loomix-net/fuzz); do
@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      # The soak harness lands with the M4 engine and M9 recorder; nothing
+      # The soak harness lands with the M4 engine and M10 recorder; nothing
       # to run before then.
       - run: |
           if cargo metadata --no-deps --format-version=1 | grep -q '"name":"loomix-soak"'; then

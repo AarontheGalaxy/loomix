@@ -4,7 +4,7 @@
 //! frame ahead of the per-bus summing below. Per-bus signal flow follows
 //! spec 1.2's per-output-bus steps 1 (sum via gain layer), 3 (bus mode,
 //! M7), 4 (bus EQ, M6), 5 (mono) and 6-7 (mute, gain); step 2 (FX returns)
-//! is M8.
+//! is M9.
 
 use crate::bus::{Bus, BusMono};
 use crate::bus_mode::{self, BusMode};

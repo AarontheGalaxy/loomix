@@ -40,11 +40,12 @@ today. As of milestone M4:
 
 **Not yet built** (milestone order): strip processing -- gate,
 compressor, limiter, denoiser, pan laws (M5); the parametric EQ engine
-(M6); bus modes and patching (M7); internal FX -- reverb, multitap delay,
-multiband compressor (M8); the recorder (M9); the control surface --
-request script, MIDI mapping, macro buttons (M10); network audio (M11);
-and the polish/release milestone -- preset scenes, installer, docs site
-(M12).
+(M6); bus modes and patching (M7); the app shell and first UI -- React +
+Tauri, the strip/bus layout, faders, meters, device selection (M8);
+internal FX -- reverb, multitap delay, multiband compressor (M9); the
+recorder (M10); the control surface -- request script, MIDI mapping,
+macro buttons (M11); network audio (M12); and the polish/release
+milestone -- preset scenes, installer, docs site (M13).
 
 ## Repository layout
 
