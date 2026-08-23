@@ -1,7 +1,10 @@
-//! The M3 engine core: 8 strips, 8 buses, the full assignment matrix, no
-//! effects (spec 3.4 M3). Per-bus signal flow follows spec 1.2's per
-//! output bus steps 1 (sum via gain layer), 5 (mono) and 6-7 (mute, gain);
-//! steps 2-4 and 8 are FX returns, bus mode and bus EQ, which are M6-M8.
+//! The engine core: 8 strips, 8 buses, the full assignment matrix (spec
+//! 3.4 M3), plus (M5 onward) each strip's own effects chain (spec 1.2's
+//! denoiser-through-limiter steps, `strip_dsp.rs`), run once per input
+//! frame ahead of the per-bus summing below. Per-bus signal flow itself
+//! still follows spec 1.2's per-output-bus steps 1 (sum via gain layer), 5
+//! (mono) and 6-7 (mute, gain); steps 2-4 and 8 are FX returns, bus mode
+//! and bus EQ, which are M6-M8.
 
 use crate::bus::{Bus, BusMono};
 use crate::fader::gain_db_to_linear;
@@ -9,20 +12,27 @@ use crate::meter::Meter;
 use crate::strip::Strip;
 use crate::{Frame, CHANNELS, NUM_BUSES, NUM_STRIPS};
 
+/// spec 1.11 lists 44.1/48/88.2/96/176.4/192kHz as selectable; 48kHz is
+/// the engine's starting point until `loomix-hal`/`loomix-app` (M4) sets
+/// the real device rate via [`Engine::set_sample_rate`].
+const DEFAULT_SAMPLE_RATE: f32 = 48_000.0;
+
 pub struct Engine {
     pub strips: [Strip; NUM_STRIPS],
     pub buses: [Bus; NUM_BUSES],
     strip_meters: [Meter; NUM_STRIPS],
     bus_meters: [Meter; NUM_BUSES],
+    sample_rate: f32,
 }
 
 impl Default for Engine {
     fn default() -> Self {
         Self {
-            strips: std::array::from_fn(|_| Strip::default()),
+            strips: std::array::from_fn(|i| Strip::for_topology_index(i, DEFAULT_SAMPLE_RATE)),
             buses: std::array::from_fn(|_| Bus::default()),
             strip_meters: [Meter::default(); NUM_STRIPS],
             bus_meters: [Meter::default(); NUM_BUSES],
+            sample_rate: DEFAULT_SAMPLE_RATE,
         }
     }
 }
@@ -40,12 +50,29 @@ impl Engine {
         &self.bus_meters[bus]
     }
 
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+
+    /// Propagates to every strip's effects chain (filter coefficients are
+    /// sample-rate dependent) — spec 1.11's device-selection-driven rate
+    /// change, wired through by `loomix-app` (M4's clock-master selection).
+    pub fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.sample_rate = sample_rate;
+        for strip in &mut self.strips {
+            strip.chain.set_sample_rate(sample_rate);
+        }
+    }
+
     /// Renders one block. `strip_inputs[s]` and `bus_outputs[b]` must each
     /// have the same length (the block's frame count); `strip_inputs` must
     /// have [`NUM_STRIPS`] entries and `bus_outputs` [`NUM_BUSES`].
     ///
     /// Never allocates, locks or performs I/O: every buffer is caller
     /// owned, every per-strip/per-bus state array is fixed size (spec 3.3).
+    /// Strips are processed outer, buses inner (not the reverse): each
+    /// strip's effects chain carries mutable envelope/filter state and
+    /// must run exactly once per input frame, not once per bus it feeds.
     pub fn process_block(&mut self, strip_inputs: &[&[Frame]], bus_outputs: &mut [&mut [Frame]]) {
         debug_assert_eq!(strip_inputs.len(), NUM_STRIPS);
         debug_assert_eq!(bus_outputs.len(), NUM_BUSES);
@@ -60,26 +87,32 @@ impl Engine {
             out.fill([0.0; CHANNELS]);
         }
 
-        for (b, out) in bus_outputs.iter_mut().enumerate() {
-            for (s, strip) in self.strips.iter().enumerate() {
-                if !strip.bus_assign[b] || strip.mute || (any_solo && !strip.solo) {
-                    continue;
+        for (s, strip) in self.strips.iter_mut().enumerate() {
+            if strip.mute || (any_solo && !strip.solo) {
+                continue;
+            }
+            for (n, in_frame) in strip_inputs[s].iter().enumerate() {
+                let mut processed = *in_frame;
+                strip.chain.process(&mut processed);
+                if strip.mono {
+                    sum_to_mono(&mut processed);
                 }
-                let gain = gain_db_to_linear(strip.gain_layer_db(b));
-                if gain == 0.0 {
-                    continue;
-                }
-                for (out_frame, in_frame) in out.iter_mut().zip(strip_inputs[s].iter()) {
-                    let mut contribution = *in_frame;
-                    if strip.mono {
-                        sum_to_mono(&mut contribution);
+                for (b, out) in bus_outputs.iter_mut().enumerate() {
+                    if !strip.bus_assign[b] {
+                        continue;
                     }
-                    for (o, c) in out_frame.iter_mut().zip(contribution.iter()) {
+                    let gain = gain_db_to_linear(strip.gain_layer_db(b));
+                    if gain == 0.0 {
+                        continue;
+                    }
+                    for (o, c) in out[n].iter_mut().zip(processed.iter()) {
                         *o += c * gain;
                     }
                 }
             }
+        }
 
+        for (b, out) in bus_outputs.iter_mut().enumerate() {
             match self.buses[b].mono {
                 BusMono::Off => {}
                 BusMono::Mono => out.iter_mut().for_each(sum_to_mono),
