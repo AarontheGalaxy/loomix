@@ -5,6 +5,114 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-23 — M6: parametric EQ
+
+**A clippy regression was reported to the user as "pre-existing" without
+actually being checked, and the claim was wrong — caught by the user, not
+found independently.** Late in this milestone,
+`RUSTFLAGS="-D warnings" cargo clippy --workspace` failed on
+`intellipan.rs`'s `Intellipan` enum (`large_enum_variant`). The first
+clippy run of the session happened *after* `biquad.rs` had already been
+changed (the coefficient-ramp smoothing below, which grows every
+`Biquad`), so there was no actual evidence the warning predated this
+branch's work — it was reported as pre-existing anyway, on the strength of
+"it showed up in an early run" without checking what that run was actually
+early *relative to*. Told to fix it regardless of origin on a solo
+project (correctly — there is no "whoever owns it" to defer to), the
+claim was checked properly this time: `git stash` back to the branch
+point (`b4bb8b9`) and re-running clippy there is clean, so the regression
+is real and traced to this branch's own `biquad.rs` change growing
+`ColorPad`'s four biquads past the threshold against `Position`/
+`Modulation`'s already-boxed pointer size. Fixed by boxing `Color` too —
+the identical fix already applied twice this session to `StripChain`'s
+variants, logged in its own commit stating plainly that it isn't
+pre-existing. The lesson isn't "box enum variants," it's that "pre-
+existing" is a factual claim that needs the same evidence discipline as
+any other claim in this log — a `git stash` and a re-run costs one command
+and would have caught this the first time.
+
+**Coefficient changes are smoothed (`biquad.rs`'s `Biquad::set_coeffs`),
+on direct instruction, because M6's cells are the first callers to sweep
+a biquad's parameters live rather than setting them once at construction
+or on a discrete control change.** See `docs/DSP.md`'s Parametric EQ
+section for the mechanism (a fixed 64-sample linear coefficient ramp,
+applied inside `process()`) and the formula-level reasoning for why raw-
+coefficient interpolation was chosen over a provably-stable parameter
+domain. Logged here because of how it was verified: told explicitly not
+to let the test define the behaviour after the fact, so the click-
+avoidance claim is backed by an A/B test that computes what an
+*instantaneous* coefficient swap would have produced on the same
+accumulated filter state (a hand-evaluated one-step difference-equation
+application, not a second `Biquad`) and asserts the real, smoothed
+`Biquad` stays far below that on the identical input — the same
+"wrong implementation actually fails the identical scenario" technique
+`drift.rs` already used for the PI controller. Bypass transitions
+(entering/leaving a cell's `on` state) were deliberately *not* smoothed —
+a scope boundary stated explicitly rather than left to be discovered
+later, on the reasoning that a cell's on/off toggle is a discrete UI
+gesture, unlike a dragged knob, and every other block's neutral setting
+in this crate is already a true instantaneous bit-exact identity.
+
+**`ParametricEq<const N: usize>` is generic over channel count instead of
+being two separate types for the strip (2ch) and bus (8ch) EQs**, because
+spec 1.7 states the two are one shared implementation, not two
+similar ones. A/B memory doubles the *parameters* only, not the live DSP
+state (biquads, delay line) — see `docs/DSP.md` for the reasoning, the
+same "recompute live state from params on change" shape M5's blocks
+already established, not a new pattern. The public surface is a single-
+sample `process_channel(&mut self, channel, x) -> f32`, not a
+`Frame`-shaped `process()`: the strip (stereo) and bus (8-channel) callers
+each wire it into their own layout in a couple of lines
+(`strip_dsp.rs::HardwareChain::process`, `engine.rs`'s bus loop) rather
+than fighting Rust's const generics for two different `N`-specific
+`process(Frame)` implementations that would each be a few lines shorter
+at the cost of real type-system complexity for no behavioural gain.
+
+**`Bus` lost its `Default` impl in favour of `Bus::new(sample_rate: f32)`,
+the identical move M5's log already made for `Strip` and for the identical
+reason:** the bus EQ's biquads/delay-line state is sample-rate dependent,
+so a bus can no longer be constructed without knowing the engine's rate.
+`Engine::set_sample_rate` now propagates to every bus's EQ alongside every
+strip's chain, which it didn't need to do before this milestone (bus
+state had no sample-rate dependence until now).
+
+**Bus EQ's position in the per-bus chain (spec 1.2 step 4, before step
+5's mono/stereo-reverse) was checked the same way the M1 ring-buffer test
+and the M5 gate-chatter test were validated, on direct request: the real
+order was temporarily inverted in `engine.rs`, the order-proof test
+(`bus_eq_runs_before_stereo_reverse_provably`) was confirmed to actually
+fail against the inverted order, then the code was reverted.** The test
+itself uses a channel-specific EQ boost plus `StereoReverse` rather than
+any EQ-changes-the-output check, specifically because a channel *swap*
+only disagrees with a per-channel EQ setting about which channel ends up
+affected if the two operations are genuinely non-commutative — an EQ-
+changed-the-output assertion alone would pass under either order and prove
+nothing about which one actually runs. Confirmed non-vacuous by construc-
+tion (swapping the real code and watching the test fail), not just by
+argument. The equivalent strip-side check (EQ after the compressor, not
+before) was validated identically.
+
+**The cross-language EQ-graph fixture (`crates/loomix-core/tests/
+eq_response_fixture.rs` → `testdata/fixtures/eq_response_reference.json`
+→ `ui/src/eqResponse.ts`'s own test) needed two real fixes to actually
+agree at a tight tolerance, found by the TS-side test failing, not
+designed in advance.** First: probe frequencies that weren't exact bins
+of the analysis window leaked spectral energy in a way a steep filter
+(a notch center, a stopband) turned into >1dB of spurious disagreement —
+fixed by snapping every probe to `k * sample_rate / NUM_SAMPLES`. Second,
+surfacing only after the first fix: `render::goertzel_magnitude`'s `f32`
+accumulation over the long buffer needed for fine low-frequency bin
+resolution wasn't precise enough at sub-0.1dB tolerance in deep
+attenuation — fixed with a local `f64`-accumulating Goertzel scoped to
+this one test file (`render.rs`'s own shared function is untouched, since
+its existing callers' shorter blocks and looser tolerances don't need
+this), the identical class of fix M4's drift-simulation counters needed
+for the identical reason (`f32`'s precision floor reached by a long-
+running accumulator, not by any single sample). The final tolerance
+(0.05dB) was set empirically after both fixes, not guessed in advance:
+0.005dB still failed on residual engine-side `f32` filter-state precision
+alone, unrelated to either bug above.
+
 ## 2026-08-23 — M5: strip processing
 
 **`Engine::process_block` changed loop order — strips outer, buses inner —

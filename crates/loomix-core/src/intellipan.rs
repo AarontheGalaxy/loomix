@@ -245,23 +245,28 @@ impl ModulationPad {
     }
 }
 
-/// `Position`/`Modulation` are boxed: their delay-line buffers (2048 and
-/// 8192 `f32` samples respectively, sized for high sample rates) would
-/// otherwise set this enum's size to its *largest* variant regardless of
-/// which mode is active — every `Strip` would pay Modulation's ~64KB
-/// whether or not it's ever selected, and constructing all 8 blew the test
-/// thread's stack before this fix. Boxing only happens on mode
-/// construction/switching (a configuration-time operation, not inside
-/// `process()`), never on the audio thread.
+/// All three variants are boxed: an unboxed enum is sized for its
+/// *largest* variant regardless of which mode is active. `Position`/
+/// `Modulation` were boxed first, for their delay-line buffers (2048 and
+/// 8192 `f32` samples respectively, sized for high sample rates) — every
+/// `Strip` would otherwise pay Modulation's ~64KB whether or not it's ever
+/// selected, and constructing all 8 blew the test thread's stack before
+/// that fix. `Color` was boxed later (M6): its four `Biquad`s each grew by
+/// a coefficient-ramp field (`biquad.rs`'s click-avoidance smoothing,
+/// spec 4.1), pushing `ColorPad` past clippy's `large_enum_variant`
+/// threshold against the other two variants' now-pointer size — the same
+/// fix, applied for the same reason, on a different variant. Boxing only
+/// happens on mode construction/switching (a configuration-time
+/// operation, not inside `process()`), never on the audio thread.
 pub enum Intellipan {
-    Color(ColorPad),
+    Color(Box<ColorPad>),
     Position(Box<PositionPad>),
     Modulation(Box<ModulationPad>),
 }
 
 impl Intellipan {
     pub fn color(sample_rate: f32) -> Self {
-        Self::Color(ColorPad::new(sample_rate))
+        Self::Color(Box::new(ColorPad::new(sample_rate)))
     }
     pub fn position(sample_rate: f32) -> Self {
         Self::Position(Box::new(PositionPad::new(sample_rate)))

@@ -21,6 +21,7 @@ pub mod knob_curve;
 pub mod limiter;
 pub mod meter;
 pub mod pan;
+pub mod parametric_eq;
 pub mod render;
 pub mod rt_assert;
 pub mod strip;

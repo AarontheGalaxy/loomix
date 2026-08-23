@@ -13,14 +13,17 @@ use crate::intellipan::Intellipan;
 use crate::karaoke::Karaoke;
 use crate::limiter::Limiter;
 use crate::pan::{PositionPad5_1, StereoBalance};
+use crate::parametric_eq::ParametricEq;
 use crate::{Frame, CH_FC};
 
-/// spec 1.2's hardware-strip order: denoiser, gate, compressor, Intellipan
-/// pad, pan pot, limiter (strip EQ/FX-sends steps are M6/M8, not yet here).
+/// spec 1.2's hardware-strip order: denoiser, gate, compressor, strip
+/// parametric EQ (M6, spec 1.7: stereo, 2 channels), Intellipan pad, pan
+/// pot, limiter (FX-sends step is M8, not yet here).
 pub struct HardwareChain {
     pub denoiser: Denoiser,
     pub gate: Gate,
     pub compressor: Compressor,
+    pub eq: ParametricEq<2>,
     pub pad: Intellipan,
     pub pan: StereoBalance,
     pub limiter: Limiter,
@@ -32,6 +35,7 @@ impl HardwareChain {
             denoiser: Denoiser::new(sample_rate),
             gate: Gate::new(sample_rate),
             compressor: Compressor::new(sample_rate),
+            eq: ParametricEq::new(sample_rate),
             pad: Intellipan::color(sample_rate), // spec names no default pad mode; Color is as good as any, and (0,0) is neutral regardless
             pan: StereoBalance::default(),
             limiter: Limiter::default(),
@@ -42,6 +46,7 @@ impl HardwareChain {
         self.denoiser.set_sample_rate(sample_rate);
         self.gate.set_sample_rate(sample_rate);
         self.compressor.set_sample_rate(sample_rate);
+        self.eq.set_sample_rate(sample_rate);
         match &mut self.pad {
             Intellipan::Color(p) => p.set_sample_rate(sample_rate),
             Intellipan::Position(p) => p.set_sample_rate(sample_rate),
@@ -54,6 +59,8 @@ impl HardwareChain {
         self.denoiser.process(&mut l, &mut r);
         self.gate.process(&mut l, &mut r);
         self.compressor.process(&mut l, &mut r);
+        l = self.eq.process_channel(0, l);
+        r = self.eq.process_channel(1, r);
         frame[0] = l;
         frame[1] = r;
         self.pad.process(frame);
@@ -110,17 +117,28 @@ impl VirtualChain {
 }
 
 pub enum StripChain {
-    Hardware(HardwareChain),
-    Virtual(VirtualChain),
+    // Boxed for the same reason `Intellipan`'s Position/Modulation
+    // variants are (see `docs/ARCHITECTURE.md`'s M5 entry): M6's strip EQ
+    // added two `EqChannel`s (each 6 biquads plus a delay line) to
+    // `HardwareChain`, and an unboxed enum is sized for its *largest*
+    // variant regardless of which is active -- every `Strip`, hardware or
+    // virtual, would otherwise pay the bigger side's size. Both variants
+    // are boxed, not just `HardwareChain` alone: boxing only one side
+    // still leaves clippy's `large_enum_variant` tripped by whichever
+    // variant is left unboxed against the other's now-pointer size, and
+    // M8's FX sends are going to grow both chains again anyway. Boxing
+    // happens only at construction, never inside `process()`.
+    Hardware(Box<HardwareChain>),
+    Virtual(Box<VirtualChain>),
 }
 
 impl StripChain {
     pub fn hardware(sample_rate: f32) -> Self {
-        Self::Hardware(HardwareChain::new(sample_rate))
+        Self::Hardware(Box::new(HardwareChain::new(sample_rate)))
     }
 
     pub fn virtual_strip(sample_rate: f32, is_aux: bool) -> Self {
-        Self::Virtual(VirtualChain::new(sample_rate, is_aux))
+        Self::Virtual(Box::new(VirtualChain::new(sample_rate, is_aux)))
     }
 
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
@@ -199,6 +217,49 @@ mod tests {
         assert!(
             peak_gr_seen > -3.0,
             "compressor reacted as if it saw the pre-gate signal: {peak_gr_seen}dB"
+        );
+    }
+
+    #[test]
+    fn hardware_chain_compressor_does_not_see_the_eq_boosted_signal() {
+        // spec 1.2 places the strip EQ (step 7) after the compressor (step
+        // 6): the compressor's detector must see the *pre-EQ* signal. This
+        // proves it, the same technique as the gate-before-compressor test
+        // above -- an EQ boost large enough to drive the compressor hard
+        // if it ran first, then checking the compressor barely reacted.
+        let mut chain = HardwareChain::new(SR);
+        chain.compressor.set_knob(10.0); // threshold -40dB, ratio 8:1
+        chain.compressor.params.auto_makeup = false;
+        chain.eq.on = true;
+        chain.eq.set_cell(
+            0,
+            0,
+            crate::parametric_eq::EqCellParams {
+                on: true,
+                cell_type: crate::parametric_eq::EqCellType::Peak,
+                freq_hz: 1000.0,
+                gain_db: 18.0,
+                q: 1.0,
+            },
+        );
+        chain.eq.set_cell(1, 0, chain.eq.channel_params(0).cells[0]);
+
+        let mut peak_gr_seen = 0.0f32;
+        for n in 0..2000 {
+            // -46dBFS: below the compressor's -40dB threshold pre-EQ (no
+            // reduction expected), but +18dB post-EQ would land at -28dB,
+            // well above threshold -- if the compressor saw *that*, it'd
+            // react hard.
+            let s = (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / SR).sin() * 0.005;
+            let mut frame: Frame = [0.0; CHANNELS];
+            frame[0] = s;
+            frame[1] = s;
+            chain.process(&mut frame);
+            peak_gr_seen = peak_gr_seen.min(chain.compressor.gain_reduction_db());
+        }
+        assert!(
+            peak_gr_seen > -3.0,
+            "compressor reacted as if it saw the post-EQ boosted signal: {peak_gr_seen}dB"
         );
     }
 
