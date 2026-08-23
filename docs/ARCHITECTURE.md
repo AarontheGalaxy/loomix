@@ -5,6 +5,176 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-23 — M5: strip processing
+
+**`Engine::process_block` changed loop order — strips outer, buses inner —
+because M5 gives every strip mutable, stateful DSP (envelope followers,
+biquad filter state) for the first time.** M3's original loop was bus-outer/
+strip-inner, recomputing each strip's (stateless) contribution once per bus
+it fed. Running a stateful effects chain that way would process the same
+strip's chain once per bus it's assigned to — corrupting envelope/filter
+state and applying attack/release timing multiple times per audio frame.
+Each strip's chain (`strip_dsp.rs`) now runs exactly once per input frame,
+producing one processed frame that's then summed into every bus the strip
+feeds, at that bus's own gain layer. `Engine` also gained a `sample_rate`
+field (default 48kHz, spec 1.11) and `set_sample_rate()`, propagated into
+every strip's chain — filter coefficients are sample-rate dependent, and
+nothing in the engine previously had any notion of sample rate at all.
+
+**`Strip::default()` was removed; strips are now built by
+`Strip::for_topology_index(index, sample_rate)`, matching spec 1.1's fixed
+Potato layout exactly (indices 0-4 hardware, 5-7 virtual, index 6 the
+Karaoke-capable AUX strip).** M5 is the first code that needs to know which
+strips are hardware vs virtual — M3/M4 treated all 8 uniformly since
+nothing distinguished them yet. `StripChain` (hardware vs virtual effects
+chain) is stored directly on `Strip` rather than as a separate array
+alongside it in `Engine` (the way `strip_meters` is): one owner for a
+strip's config and its DSP state, matching how `bus_assign`/gain layers
+already live on `Strip` rather than in a parallel structure.
+
+**`Intellipan`'s `Position`/`Modulation` pad variants are `Box`ed — found
+by a genuine stack overflow, not decided in advance.** `ModulationPad`'s
+chorus delay line is a fixed `[f32; 8192]` per channel (sized for the
+longest depth+base delay at 192kHz), and `PositionPad`'s ITD line is
+`[f32; 2048]` per channel. An unboxed `enum Intellipan { Color(..),
+Position(PositionPad), Modulation(ModulationPad) }` is sized for its
+*largest* variant regardless of which is active — every `Strip` paid
+Modulation's ~64KB even when its pad defaults to Color, and constructing
+all 8 strips inside `Engine::default()` overflowed the test thread's stack
+before this fix (`default_engine_routes_every_strip_to_bus_zero_at_unity`
+aborted with SIGABRT, not a normal test failure). Boxing only happens at
+pad-mode construction/switching, never inside `process()` — the audio
+thread never allocates because of this.
+
+**Pan laws (hardware pan pot, virtual 5.1 position pad) use a balance law,
+not constant-power, on direct instruction.** Spec 4.1 layer 2 lists
+"pan law preserves energy... across the sweep" as a property test, which
+usually implies a constant-power (equal-power sine/cosine) law — but a
+constant-power law is constant-power *because* both channels sit at -3dB
+at center, trading a neutral center for constant total power at the
+extremes. Spec 4.1 layer 1 also requires every effect to have a true
+bit-exact neutral setting, and direct instruction was to keep center
+exactly unity on both channels and reject the silent -3dB dip most
+panners default to — the two requirements are in real tension for a
+literal constant-power law, and neutral-center won on instruction. Both
+`StereoBalance` (hardware) and `PositionPad5_1` (virtual) give the
+favoured channel exact unity across the whole sweep, verified explicitly (
+`pan::tests::center_gain_is_exactly_unity_on_both_channels_not_minus_3db`,
+`pan::tests::pad_center_gain_is_exactly_unity_front_not_minus_3db`) so a
+future accidental -3dB regression reads as a broken test, not a rounding
+question. The property test this replaces spec 4.1's literal reading with
+is the balance law's actual invariant: the favoured channel never leaves
+unity, the sweep is monotonic and continuous — not constant total power,
+which a balance law cannot have alongside a neutral center.
+
+**Intellipan's Color pad ships tonal-shaping only this milestone; its
+"small reverb on the upper half" (spec 1.3) is deferred to M8, and the
+same reasoning is applied to Position pad's "small room effect" even
+though only Color was named directly.** Building a strip-local reverb now,
+ahead of M8's real send/return reverb engine (spec 1.8), means two reverb
+implementations and a migration later — rejected on direct instruction.
+Position's room effect is the same category of effect (small reverb-family
+processing) facing the identical two-implementations problem, so it's
+deferred the same way rather than built now just because it wasn't named
+explicitly. Both pads' `y` axis is accepted and stored (so the parameter
+exists for M8 to wire up) but does not affect audio yet; each pad's null
+test at `y=0` is explicit in its own comment that this does not prove the
+reverb/room path works, since there is no such path yet — a deliberate
+guard against a future reader assuming the null test covers more than it
+does.
+
+**Virtual-strip chain order (3-band EQ → M.C. → Karaoke → 5.1 pan pad →
+limiter) is a judgement call, checked by an order-*proving* test rather
+than asserted.** Spec 1.2 gives the hardware strip's processing order
+explicitly, step by step; spec 1.4's virtual-strip control list (EQ, pan
+pad, M.C., Karaoke, limiter) is not ordered at all. M.C. and Karaoke are
+placed before the pan pad because they're channel-content operations
+(muting a channel, removing vocal content) that read most sensibly as
+acting on the strip's original multichannel material before the pad
+repositions it — reasonable, but not spec-mandated, so on direct
+instruction the test proves this empirically rather than asserting it:
+`strip_dsp::tests::virtual_chain_eq_runs_before_the_pan_pad_provably`
+computes the actual `VirtualChain`'s output alongside two independently-
+built hypotheses (EQ-then-pad and pad-then-EQ, using the same public block
+APIs, not the chain under test), confirms the two hypotheses actually
+disagree for the chosen input (so the test isn't vacuously satisfiable),
+and asserts the real chain matches only the declared order. If this
+placement ever changes, the test is designed to catch it rather than
+silently keep passing.
+
+**Macro-knob curves for Gate/Compressor/Denoiser are Loomix's own,
+documented in `docs/DSP.md`, not a reproduction of Voicemeeter's.** The
+reference manual this project verifies parameter *ranges* against (spec
+front matter) doesn't publish the macro-knob-to-detail-parameter mapping
+itself, so there's no external reference to match. Each curve is linear
+in `knob/10` between a "just engaged" and "maximum" value per detail
+parameter, tested for monotonicity and its two endpoints rather than
+exact-value known-answer tests, since no independent reference exists to
+compare against. `knob <= 0.0` is a true bypass on all three (spec 4.1's
+neutral-setting requirement) — not just a very permissive setting, an
+explicit branch that skips processing entirely, the same guaranteed-exact
+pattern the biquad primitive uses for its own neutral state.
+
+**Compressor and Denoiser both needed an RMS-smoothing stage ahead of
+their attack/release envelope follower — found by tests failing, not
+designed in up front.** An early version fed each block's attack/release
+follower a raw instantaneous rectified sample directly. Because attack was
+fast enough to react within a single audio-rate cycle, the follower chased
+the input waveform's own ripple (a rectified sine dips to nearly zero every
+half-cycle) rather than its actual level, ratcheting the envelope toward
+the signal's peak instead of its RMS value — an asymmetric fast-attack/
+slow-release filter applied to a rapidly oscillating target is biased, not
+neutral. `compressor::tests::a_steady_tone_above_threshold_settles_to_the_static_curve`
+caught this directly (measured gain reduction was ~2.7dB off the static-
+curve prediction); the denoiser hit the identical failure mode for the
+same reason and got the identical fix. Both blocks now low-pass the
+instantaneous power (fixed 5ms time constant) into a mean-square estimate
+before ever comparing it to a threshold or feeding it to attack/release.
+
+**The gate was checked for the same ratcheting bug found in the compressor
+and denoiser, on direct request, and does not have it — verified
+empirically, not just argued.** The concern: a gate is also an attack/
+hold/release follower reacting to a detector, so the same missing-
+smoothing failure mode would show up as chatter (rapid open/close
+toggling) on sustained near-threshold material rather than compressor/
+denoiser's peak-ratcheting. Structurally the gate is already built the
+way the fix left the other two: `Gate::process` smooths the sidechain-
+filtered detector through a 5ms one-pole (`self.envelope`) *before* ever
+comparing it to `threshold_db` — this stage already existed when
+`gate.rs` was first written, it wasn't added in response to this check.
+It also has a second layer the other two don't: `self.gain` is itself a
+slow attack/release-filtered variable (tens to hundreds of ms), not a
+direct function of the instantaneous threshold decision, so a single-
+sample flicker in the (already-smoothed) envelope crossing the threshold
+gets absorbed by gain's own inertia rather than producing an audible
+toggle. Argument alone wasn't treated as sufficient: verified by feeding
+broadband noise (deliberately harsher than a periodic tone — real
+sustained low-level material behaves more like noise, and noise has far
+more residual envelope variance after smoothing) at both a low sidechain
+frequency (100Hz, worst case for the 5ms smoother's relative attenuation)
+and swept finely across the exact open/close boundary. Every trial showed
+at most the one expected settling transition, never repeated flapping —
+`gate::tests::sustained_near_threshold_noise_does_not_chatter` is the
+permanent regression test for this, kept rather than discarded as a
+one-off diagnostic since it guards against a future change to
+`DETECTOR_SMOOTHING_MS` or the attack/release curve silently
+reintroducing chatter.
+
+**Karaoke's K-1/K-2/K-v and the denoiser's floor-tracker time constants
+have no spec-given values — chosen by simulating the tracker's actual
+convergence in Python against the unit tests' own assertions, not guessed
+directly into the Rust code.** The denoiser's floor-rise time constant in
+particular went through several wrong values that either let a loud held
+tone go unrecognised as signal (never converging within the test's
+duration) or, at the other extreme, let a *steady* quiet floor and a
+*steady* loud tone become numerically indistinguishable once the tracker
+fully converges to match whatever level it's given (a real limitation of
+this simplified single-band model: a sound held perfectly constant for
+long enough eventually reads as the new floor, real or not — acceptable
+for real audio, which has natural dynamic range, less so for a
+synthetic held-tone test). `docs/DSP.md` documents the numeric outcome per
+knob step, not just the formula.
+
 ## 2026-08-23 — release.yml skips packaging until it exists
 
 **`release.yml`'s signing/notarising/pkg-build/release-upload steps are
