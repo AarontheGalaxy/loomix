@@ -5,6 +5,39 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-23 — new M8 inserted: app shell and first UI
+
+**A new milestone, "App shell and first UI" (React + Tauri scaffolding,
+the strip/bus layout, faders, mute, solo, bus assignment, meters, device
+selection, and the EQ graph wired to a live engine), is inserted into
+spec 3.4 between M7 and M8, on direct instruction. Old M8-M12 (Internal
+FX, Recorder, Control surface, Network audio, Polish/release) shift to
+M9-M13; `docs/SPEC.md` and every forward-pointing milestone-number
+reference across the codebase (doc comments, `CHANGELOG.md`, `README.md`,
+`nightly.yml`, and this file's own earlier entries) were updated to
+match, not just the milestone table itself.**
+
+Why now rather than at the position it originally held (after M8-M11):
+M3 through M7 built a complete signal path (the 8x8 matrix, strip
+processing, the parametric EQ, all 12 bus modes and patching) that has
+never been driven by anything but test harnesses and the offline render
+fixture. Every milestone from here on (internal FX, the recorder, the
+control surface) adds more engine surface that would go the same way —
+built, tested, never actually heard — without something to operate it
+first. `ui/` has been a bare TypeScript project with no framework since
+M0 specifically because nothing needed one yet (M0's own log entry); that
+stops being true once there's a mixer worth listening to. Scoped
+deliberately short of the full reference surface (spec 1.17's companion
+tools, macro buttons, MIDI, the recorder transport, Intellipan's pads) —
+the goal is the smallest UI that closes the loop from a control to real
+audio, not a second front working in parallel with the DSP milestones.
+
+`ui/src/eqGraph.ts`/`eqResponse.ts` (M6) already exist as pure response
+math and a framework-free SVG renderer, cross-checked against the real
+Rust engine's own math via a generated fixture — this milestone's job is
+wiring that existing, already-verified math to a live `ParametricEq`'s
+actual cell values, not rebuilding it.
+
 ## 2026-08-23 — M7: bus modes and patching
 
 **`process_block`'s loop is now sample-outer / strip-middle / bus-inner
@@ -307,16 +340,16 @@ unity, the sweep is monotonic and continuous — not constant total power,
 which a balance law cannot have alongside a neutral center.
 
 **Intellipan's Color pad ships tonal-shaping only this milestone; its
-"small reverb on the upper half" (spec 1.3) is deferred to M8, and the
+"small reverb on the upper half" (spec 1.3) is deferred to M9, and the
 same reasoning is applied to Position pad's "small room effect" even
 though only Color was named directly.** Building a strip-local reverb now,
-ahead of M8's real send/return reverb engine (spec 1.8), means two reverb
+ahead of M9's real send/return reverb engine (spec 1.8), means two reverb
 implementations and a migration later — rejected on direct instruction.
 Position's room effect is the same category of effect (small reverb-family
 processing) facing the identical two-implementations problem, so it's
 deferred the same way rather than built now just because it wasn't named
 explicitly. Both pads' `y` axis is accepted and stored (so the parameter
-exists for M8 to wire up) but does not affect audio yet; each pad's null
+exists for M9 to wire up) but does not affect audio yet; each pad's null
 test at `y=0` is explicit in its own comment that this does not prove the
 reverb/room path works, since there is no such path yet — a deliberate
 guard against a future reader assuming the null test covers more than it
@@ -422,17 +455,17 @@ with a `::notice::` instead of failing when it's absent.** The `v0.1.0`
 tag push actually ran this workflow and it failed, hard, at "Import
 Developer ID signing identity" — the earlier M0 log entry calling this
 job "guarded or documented as inert" was wrong; it was only documented,
-never guarded. A workflow that fails on every tag between now and M12,
+never guarded. A workflow that fails on every tag between now and M13,
 when `packaging/` actually lands (spec 3.4), trains exactly the kind of
 red-means-nothing habit CI exists to prevent. The alternative was
-disabling the workflow outright until M12; rejected because the
+disabling the workflow outright until M13; rejected because the
 `cargo build --release` (both targets) and `xcodebuild -configuration
 Release` steps are real, standing signal independent of packaging — they
 catch a release build that doesn't compile, on every tag, and disabling
 the whole workflow would throw that away for no reason. The gate mirrors
 `nightly.yml`'s existing `fuzz`/`soak` pattern (check whether the thing a
 later milestone adds exists yet; skip with a message if not) rather than
-inventing a new mechanism. No workflow edit needed at M12: the moment
+inventing a new mechanism. No workflow edit needed at M13: the moment
 `packaging/build-pkg.sh` exists, `steps.packaging.outputs.exists` flips to
 `true` and every gated step runs for real.
 
@@ -548,7 +581,7 @@ needs drift correction ("outputs A1 through A5 are not sample
 synchronous... when they run on different physical devices") at least as
 well as a capture scenario would. `nightly.yml` already referenced a
 `loomix-soak` package by name and a `--duration 2h` invocation before this
-crate existed; that leg is still M9's (recorder folded in), not this
+crate existed; that leg is still M10's (recorder folded in), not this
 binary's current two-device-only shape, but the name and the
 `--duration` flag already match.
 
@@ -882,7 +915,7 @@ is the one every routing-truth-table combination in
 `crates/loomix-core/tests/routing_truth_table.rs` can actually assert
 against; it degrades cleanly to per-bus monitor scoping later; the
 solo-then-monitor-select wiring is deferred to whichever milestone adds
-monitor selection (M10's control surface is the current best guess, spec
+monitor selection (M11's control surface is the current best guess, spec
 1.5/1.10).
 
 **Bus mono (spec 1.5) only ever touches channels 0 and 1.** "First press
@@ -1145,7 +1178,7 @@ under `cfg(test)`. See `crates/loomix-core/src/rt_assert.rs`.
 An M0 `main()` with nothing to do but print a version string can't be
 exercised by `cargo test`, and dragged the workspace under the 80% line
 coverage gate for no real benefit. The executable entry point lands with
-the milestone that gives each crate actual behaviour: M10 for the CLI's
+the milestone that gives each crate actual behaviour: M11 for the CLI's
 subcommands, the first milestone that needs a UI surface for the Tauri
 backend.
 
@@ -1190,7 +1223,7 @@ failures.
 
 **`nightly.yml`'s fuzz, soak and `release.yml`'s packaging jobs are
 guarded or documented as inert until the milestones that create their
-inputs land** (fuzz targets at M10/M11, the soak harness at M4/M9,
+inputs land** (fuzz targets at M11/M12, the soak harness at M4/M10,
 `packaging/build-pkg.sh` and the Developer ID secrets at M4). The
 workflows ship now per the M0 requirement to have all of section 4.3 in
 place from the start; they activate themselves the moment those milestones

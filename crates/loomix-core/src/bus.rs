@@ -1,5 +1,5 @@
 //! An output bus's state: spec 1.2's per-bus chain reduced to what's left
-//! once FX returns (M8) are out of scope — the sum of assigned strips, the
+//! once FX returns (M9) are out of scope — the sum of assigned strips, the
 //! bus mode transform (M7, 12 modes, `bus_mode.rs`), the bus parametric EQ
 //! (M6, spec 1.7: 8 independent channels), the mono button, mute and the
 //! bus gain fader (spec 1.5).

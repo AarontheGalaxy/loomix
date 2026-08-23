@@ -6,7 +6,7 @@
 //! **Reverb/room-effect scope, decided explicitly, not silently dropped:**
 //! spec 1.3 describes Color as "3 band tonal shaping plus a small reverb on
 //! the upper half" and Position as "binaural placement with a small room
-//! effect". Building a strip-local reverb now, ahead of M8's real
+//! effect". Building a strip-local reverb now, ahead of M9's real
 //! send/return reverb engine, means a second reverb implementation and a
 //! migration later — skipped on direct instruction for Color, and the same
 //! reasoning applies identically to Position's room effect (also a small
@@ -14,7 +14,7 @@
 //! way. **`ColorPad`'s `y` and `PositionPad`'s `y` are accepted and stored
 //! but do not affect audio this milestone** — `y == 0.0` neutrality does
 //! *not* prove the reverb/room path works, because there is no reverb/room
-//! path yet. Both land when M8's reverb engine exists.
+//! path yet. Both land when M9's reverb engine exists.
 
 use crate::biquad::{Biquad, BiquadCoeffs};
 use crate::Frame;
