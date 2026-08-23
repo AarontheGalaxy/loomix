@@ -7,13 +7,24 @@
 // `rt_assert`, so the forbid only applies to the shipped (non-test) build.
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+pub mod biquad;
 pub mod bus;
+pub mod compressor;
+pub mod denoiser;
 pub mod engine;
+pub mod eq3;
 pub mod fader;
+pub mod gate;
+pub mod intellipan;
+pub mod karaoke;
+pub mod knob_curve;
+pub mod limiter;
 pub mod meter;
+pub mod pan;
 pub mod render;
 pub mod rt_assert;
 pub mod strip;
+pub mod strip_dsp;
 
 pub use bus::Bus;
 pub use engine::Engine;
@@ -31,3 +42,15 @@ pub const CHANNELS: usize = 8;
 
 /// One sample per channel, one instant in time.
 pub type Frame = [f32; CHANNELS];
+
+/// Named indices into a [`Frame`], spec 1.1/1.6's fixed channel layout
+/// (`FL FR FC SW RL RR SL SR`). M5 onward is the first code that needs to
+/// address specific channels by role rather than just 0/1.
+pub const CH_FL: usize = 0;
+pub const CH_FR: usize = 1;
+pub const CH_FC: usize = 2;
+pub const CH_SW: usize = 3;
+pub const CH_RL: usize = 4;
+pub const CH_RR: usize = 5;
+pub const CH_SL: usize = 6;
+pub const CH_SR: usize = 7;

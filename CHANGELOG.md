@@ -5,6 +5,51 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Strip processing (spec 3.4 M5): the per-strip effects chain, run once per
+  input frame ahead of bus summing (`loomix-core::strip_dsp`).
+  - Hardware strips (spec 1.2's order): denoiser (adaptive noise-floor
+    expander), gate (band-pass sidechain detector), compressor (soft-knee,
+    auto makeup), the three mutually exclusive Intellipan pad modes (Color
+    tonal tilt, Position binaural ILD/ITD, Modulation chorus/feedback), a
+    balance-law pan pot, and a sample-accurate brickwall limiter.
+  - Virtual strips: a 3-band peaking EQ, M.C. (center-channel mute), Karaoke
+    (K-m/K-1/K-2/K-v, AUX strip only), a balance-law 5.1 position pad, and
+    the same limiter.
+  - Gate, Compressor and Denoiser share one macro-knob curve (0..10,
+    `knob_curve.rs`) — Loomix's own documented mapping, not a reproduction
+    of Voicemeeter's unpublished one (`docs/DSP.md`); `knob <= 0.0` is a
+    true bypass on all three.
+  - A shared RBJ/Audio EQ Cookbook biquad (`biquad.rs`) backs the gate
+    sidechain, the 3-band EQ, Color's tonal shaping and Karaoke.
+  - `Strip` is now built per spec 1.1's fixed Potato topology
+    (`Strip::for_topology_index`) rather than uniformly, since hardware vs.
+    virtual strips now have materially different chains.
+  - `Engine` gained a `sample_rate` field/setter, propagated to every
+    strip's chain, and `process_block`'s loop is now strip-outer/bus-inner
+    so each strip's stateful chain runs exactly once per frame.
+- Every block above has a null test at its own true-neutral setting (spec
+  4.1's bit-exact passthrough requirement), a known-answer test, a
+  frequency-response or static-curve test where applicable, and a
+  stability test under randomised parameter automation — written before
+  each block's implementation.
+
+### Known limitations
+
+- Intellipan's Color pad tonal-shaping ships without its "small reverb on
+  the upper half" (spec 1.3); Position pad ships without its "small room
+  effect" for the same reason. Both are strip-local reverb-family effects
+  that would duplicate M8's real send/return reverb engine if built now —
+  deferred to M8, not silently dropped. See `docs/ARCHITECTURE.md`.
+- Virtual-strip processing order (EQ/M.C./Karaoke relative to the 5.1 pan
+  pad) is not specified by spec 1.4 and is Loomix's own judgement call,
+  checked by an order-proving test rather than the spec's own wording. See
+  `docs/DSP.md`'s "Per-strip chain order" and `docs/ARCHITECTURE.md`.
+- Karaoke's K-1/K-2/K-v depths and every macro-knob curve are Loomix's own
+  values, not derived from or verified against Voicemeeter, since no
+  published reference exists for either.
+
 ## [0.1.0] - 2026-08-23
 
 Spec 3.4 milestones M0 through M4: virtual audio driver, engine core, and
