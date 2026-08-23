@@ -414,6 +414,12 @@ version = "0.0.0"
 [[package]]
 name = "loomix-config"
 version = "0.0.0"
+dependencies = [
+ "loomix-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "loomix-core"
@@ -421,6 +427,8 @@ version = "0.0.0"
 dependencies = [
  "criterion",
  "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

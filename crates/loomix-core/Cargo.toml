@@ -13,9 +13,20 @@ bench = false
 # Enables the panicking test allocator from the rt-assert harness (spec 3.3).
 rt-assert = []
 
+[dependencies]
+# Derive only, on the EQ parameter types (`parametric_eq.rs`) -- so
+# `loomix-config` can serialise them for spec 1.7's load/save without a
+# parallel mirror struct tree. No (de)serialisation *format* crate here;
+# that's `loomix-config`'s job, this crate stays I/O-free.
+serde = { version = "1", features = ["derive"] }
+
 [dev-dependencies]
 criterion = "0.8"
 proptest = "1"
+# Test-only, for `tests/eq_response_fixture.rs`'s cross-language fixture
+# (checked into `testdata/fixtures/`, read back by `ui/src/eqResponse.ts`'s
+# own test) -- never linked into the shipped library.
+serde_json = "1"
 
 [[bench]]
 name = "rt_assert"
