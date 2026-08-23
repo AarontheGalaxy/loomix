@@ -1,9 +1,10 @@
 //! An output bus's state: spec 1.2's per-bus chain reduced to what's left
-//! once bus mode (12 modes, M7) and FX returns (M8) are out of scope — the
-//! sum of assigned strips, the bus parametric EQ (M6, spec 1.7: 8
-//! independent channels), the mono button, mute and the bus gain fader
-//! (spec 1.5).
+//! once FX returns (M8) are out of scope — the sum of assigned strips, the
+//! bus mode transform (M7, 12 modes, `bus_mode.rs`), the bus parametric EQ
+//! (M6, spec 1.7: 8 independent channels), the mono button, mute and the
+//! bus gain fader (spec 1.5).
 
+use crate::bus_mode::BusMode;
 use crate::parametric_eq::ParametricEq;
 use crate::CHANNELS;
 
@@ -22,6 +23,11 @@ pub enum BusMono {
 pub struct Bus {
     pub mute: bool,
     pub mono: BusMono,
+    /// spec 1.5/1.6: which of the 12 bus modes transforms the summed
+    /// signal, applied at spec 1.2 step 3 -- before the EQ below (step 4).
+    /// `Composite` is filled directly by `Engine::process_block` from
+    /// `Engine::patch`, not by `bus_mode::transform`.
+    pub mode: BusMode,
     /// spec 1.7: independent EQ per channel, all 8 (unlike the strip EQ's
     /// stereo 2). spec 1.2 step 4: runs after summing/FX-returns, before
     /// the mono transform (step 5) below — see `engine.rs`'s bus loop and
@@ -42,6 +48,7 @@ impl Bus {
         Self {
             mute: false,
             mono: BusMono::Off,
+            mode: BusMode::Normal,
             eq: ParametricEq::new(sample_rate),
             gain_db: 0.0, // spec 1.5: "Gain fader ... Default" is unity, same law as strips
         }
@@ -67,6 +74,7 @@ mod tests {
         let bus = Bus::new(SR);
         assert!(!bus.mute);
         assert_eq!(bus.mono, BusMono::Off);
+        assert_eq!(bus.mode, BusMode::Normal);
         assert_eq!(bus.gain_db(), 0.0);
         assert!(!bus.eq.on);
     }

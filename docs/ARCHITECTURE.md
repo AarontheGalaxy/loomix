@@ -5,6 +5,137 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-23 — M7: bus modes and patching
+
+**`process_block`'s loop is now sample-outer / strip-middle / bus-inner
+(was strip-outer / bus-inner), required for Composite bus mode, not a
+style choice.** Spec 1.6's Composite mode can source *any* strip's signal
+into *any* bus's channel, independent of that strip's own `bus_assign` —
+so the bus loop needs random access to every strip's just-processed frame
+at the current sample. Under the old strip-outer shape that frame only
+ever existed as a transient local, gone once the next strip started; the
+only way to get it back inside a later bus-loop pass would have been to
+call a strip's (stateful) `chain.process()` a second time, which is
+exactly the corruption bug M5's log already fixed once (running a
+strip's envelope/filter chain more than once per input frame). The new
+shape still runs each strip's chain exactly once per sample — it just
+does so before the bus loop that needs the result, inside a fixed-size
+`[Frame; NUM_STRIPS]` stack array (no heap allocation, `NUM_STRIPS` is a
+compile-time constant) rather than after it.
+
+**Composite's PRE/POST-fader tap forced a real choice about which strips'
+chains have to run, and it was checked against a bench, not assumed.**
+Spec 1.2 places the fader (step 12) before mute/solo (step 13), so a
+composite tap must see a muted strip's real signal, not silence. The
+first version of this took the simplest reading of that — run every
+strip's chain unconditionally, every sample, regardless of mute — and was
+flagged before merging as a real regression risk: on a mixer where most
+strips are muted (the ordinary case), CPU cost would stop scaling with
+strips actually in use.
+
+Measured directly rather than assumed acceptable. `benches/engine.rs` (new
+this milestone — `rt_assert.rs` had carried a placeholder comment naming
+this exact bench as owed since M3) models that ordinary case: all 8 strips
+carry real, engaged processing (gate/compressor/denoiser/EQ all on, not
+neutral), only strip 0 is unmuted, 128-sample blocks. Compared on this
+machine (a stored CI baseline is a separate step, per the M1 log's rule
+below):
+
+- Always running all 8 chains unconditionally: **58.78 µs/block**
+- Running only strips that are unmuted (or soloed-in), or actually
+  referenced by an active POST-fader composite tap: **22.66 µs/block**
+
+A 2.6x regression for the common case, confirmed real rather than assumed.
+The shipped version gates chain execution on
+`strip_active[s] = ordinarily_unmuted || composite_tapped`, computed once
+per block (not per sample) from `Patch::composite_references_strip`, so a
+muted strip's chain only runs when something in the current patch
+actually needs its audio. PRE-fader taps need no chain output at all (they
+read `strip_inputs` directly), so they never force a strip active — only
+`composite_post_fader == true` plus an active Composite-mode bus can.
+
+**Consequence, chosen deliberately rather than picked arbitrarily: mute no
+longer freezes a strip's envelope state, except when nothing needs it
+to keep running.** A strip that's muted and not referenced by any active
+POST-fader composite slot still has its chain skipped entirely for the
+whole block — same as before this milestone, chain state stays frozen,
+CPU cost stays zero. A strip that's muted *and* actively POST-tapped keeps
+running (and its gate/compressor keep tracking, "warm") for exactly as
+long as the tap needs it to, because there is no other way for that tap to
+see real audio. This isn't a free choice between "always warm" (correct
+for unmuting, wrong for CPU) and "always frozen" (cheap, but a real mixer
+doesn't freeze a gate's envelope when you hit mute) — the gating that
+fixes the CPU regression above resolves it as a side effect: warmth is now
+scoped to exactly the strips something is actually listening to. This is
+audible: unmuting a composite-tapped strip resumes from wherever its
+envelope actually is, not from a stale pre-mute snapshot the way an
+always-frozen strip's would.
+
+**No stored bench baseline was committed for `engine_process_block_
+mostly_muted` in this PR.** Per the M1 log entry below ("capture a bench
+baseline from a CI run, never a local machine" — the M0 baseline recorded
+locally was ~1.15ns and failed the first real CI run by +60%, a real
+hardware difference, not noise), the 22.66 µs number above is this
+machine's number for this PR's own review, not the number that should
+ship as the regression gate's baseline. `scripts/check-bench-regression.sh`
+already skips and reports rather than fails when a bench has no stored
+baseline yet, so `ci.yml`'s `bench` job records the real one on its own
+first run against this PR, same as any new benchmark's first baseline.
+
+**Composite/insert patch sources are addressed as `(strip, channel)`, not
+spec 1.11/1.15's literal flat `0..22` index.** That range is Voicemeeter's
+own count of raw hardware input channels across its Windows/ASIO-specific
+hardware strips — a number this engine has no equivalent for, since every
+strip here already carries a fixed 8-channel `Frame` regardless of role
+(M3's log entry, `crates/loomix-core/src/lib.rs`). Inventing a mapping
+from "input channel 17" onto a `(strip, channel)` pair, just to match a
+number nothing else in this codebase uses, would be undocumented
+guesswork standing in for a real spec answer. `CompositeSource::{Default,
+Strip{strip, channel}}` (`patch.rs`) addresses the model this engine
+actually has. `insert: [bool; 22]` keeps the spec's literal size, since
+unlike composite it's inert config with no addressing scheme to invent at
+all this milestone (see below).
+
+**The 12 bus modes (`bus_mode.rs`) are a pure `Frame -> Frame` function,
+called for every mode except Composite, which `engine.rs` fills directly**
+since it needs cross-strip access `bus_mode::transform` doesn't have (and
+shouldn't — keeping it pure keeps every other mode's known-answer test a
+plain input/output check). Spec 1.6's Mix Down A/B formulas literally put
+`RL` on the right-hand side of the RIGHT channel in the vendor manual —
+implemented as the corrected `FR`-based formula per spec 1.6's own
+instruction, covered by
+`bus_mode::tests::mix_down_a_right_channel_uses_fr_not_the_published_
+rl_typo`, which feeds `FR` and `RL` far-apart values and asserts the
+actual output matches the corrected formula and not the published one.
+
+**Up Mix 2.1/4.1/6.1, Center Only, LFE Only and Rear Only silence every
+channel spec 1.6 doesn't name for that mode, rather than leaving the
+pre-transform content in place.** Spec 1.6 lists these modes by the
+channels they populate ("2.1 plus RL=L, RR=R") without saying what happens
+to the rest. Read as: these modes exist to render a signal for a specific,
+smaller speaker layout (an actual N.1 setup genuinely has no signal on the
+channels it doesn't have), not as a partial overlay on top of whatever the
+bus happened to be carrying before the mode ran — matching, e.g., why a
+real 2.1 or 4.1 layout has no center channel at all. `bus_mode.rs`'s tests
+assert every unlisted channel is exactly `0.0`.
+
+**No stated default for the composite and insert pre/post-fader switches
+(spec 1.11), so both default to PRE (`false`)** — matching the order both
+the spec's system-settings prose and 1.15's parameter list mention the two
+options in, the same "no stated default, first-listed wins" convention
+already used elsewhere (Karaoke's depths, the EQ shelf alpha, M6's log).
+
+**Insert patch (`Patch::insert`, `Patch::insert_post_fx`) is config only
+this milestone, with no audio effect** — the identical deferral M5 already
+made for Intellipan's Color-pad reverb. Spec 2.3 explicitly defers the
+real send/return path past M7 (an AUv3 host slot, or a hardware channel
+loop — neither exists yet, both are HAL/app-layer concerns `loomix-core`
+doesn't own). `engine::tests::insert_patch_and_pre_post_switch_are_inert_
+this_milestone` runs one block with every insert toggle on and the
+pre/post switch flipped against the same block with defaults, and asserts
+bit-exact identical output — proving the config is currently inert, not
+that insert processing works, since there is no such processing yet.
+
 ## 2026-08-23 — M6: parametric EQ
 
 **A clippy regression was reported to the user as "pre-existing" without
