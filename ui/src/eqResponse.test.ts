@@ -85,7 +85,7 @@ describe("channelResponseDb neutral and stability", () => {
     ];
     for (let i = 0; i < 2000; i++) {
       const channel: EqChannelParams = {
-        cells: Array.from({ length: 6 }, (_, cellIndex) => ({
+        cells: Array.from({ length: 6 }, () => ({
           on: rand() > 0.3,
           cell_type: cellTypes[Math.floor(rand() * cellTypes.length)]!,
           freq_hz: 20 + rand() * 19_980,
