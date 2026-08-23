@@ -1,10 +1,10 @@
 //! The engine core: 8 strips, 8 buses, the full assignment matrix (spec
 //! 3.4 M3), plus (M5 onward) each strip's own effects chain (spec 1.2's
 //! denoiser-through-limiter steps, `strip_dsp.rs`), run once per input
-//! frame ahead of the per-bus summing below. Per-bus signal flow itself
-//! still follows spec 1.2's per-output-bus steps 1 (sum via gain layer), 5
-//! (mono) and 6-7 (mute, gain); steps 2-4 and 8 are FX returns, bus mode
-//! and bus EQ, which are M6-M8.
+//! frame ahead of the per-bus summing below. Per-bus signal flow follows
+//! spec 1.2's per-output-bus steps 1 (sum via gain layer), 4 (bus EQ, M6),
+//! 5 (mono) and 6-7 (mute, gain); steps 2-3 are FX returns and bus mode,
+//! M7-M8.
 
 use crate::bus::{Bus, BusMono};
 use crate::fader::gain_db_to_linear;
@@ -29,7 +29,7 @@ impl Default for Engine {
     fn default() -> Self {
         Self {
             strips: std::array::from_fn(|i| Strip::for_topology_index(i, DEFAULT_SAMPLE_RATE)),
-            buses: std::array::from_fn(|_| Bus::default()),
+            buses: std::array::from_fn(|_| Bus::new(DEFAULT_SAMPLE_RATE)),
             strip_meters: [Meter::default(); NUM_STRIPS],
             bus_meters: [Meter::default(); NUM_BUSES],
             sample_rate: DEFAULT_SAMPLE_RATE,
@@ -54,13 +54,17 @@ impl Engine {
         self.sample_rate
     }
 
-    /// Propagates to every strip's effects chain (filter coefficients are
-    /// sample-rate dependent) — spec 1.11's device-selection-driven rate
-    /// change, wired through by `loomix-app` (M4's clock-master selection).
+    /// Propagates to every strip's effects chain and every bus's EQ
+    /// (filter/delay-line state is sample-rate dependent) — spec 1.11's
+    /// device-selection-driven rate change, wired through by `loomix-app`
+    /// (M4's clock-master selection).
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate;
         for strip in &mut self.strips {
             strip.chain.set_sample_rate(sample_rate);
+        }
+        for bus in &mut self.buses {
+            bus.eq.set_sample_rate(sample_rate);
         }
     }
 
@@ -113,6 +117,15 @@ impl Engine {
         }
 
         for (b, out) in bus_outputs.iter_mut().enumerate() {
+            // spec 1.2 step 4, before step 5 (mono) below -- see
+            // `tests::bus_eq_runs_before_stereo_reverse_provably` for the
+            // order proof.
+            for frame in out.iter_mut() {
+                for (c, sample) in frame.iter_mut().enumerate() {
+                    *sample = self.buses[b].eq.process_channel(c, *sample);
+                }
+            }
+
             match self.buses[b].mono {
                 BusMono::Off => {}
                 BusMono::Mono => out.iter_mut().for_each(sum_to_mono),
@@ -240,6 +253,97 @@ mod tests {
             // Only strip 1 (soloed) contributes; strip 0 is silenced by solo.
             assert!((out[0][0] - 1.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn bus_eq_runs_before_stereo_reverse_provably() {
+        // spec 1.2 places bus EQ (step 4) before the mono/stereo-reverse
+        // transform (step 5). Proven, not asserted: a per-channel EQ
+        // setting and a channel *swap* only disagree about which channel
+        // ends up boosted if the two operations are genuinely non-
+        // commutative, which is why this uses StereoReverse plus a
+        // channel-specific EQ setting rather than checking "EQ changed
+        // the output" -- that alone would pass regardless of which order
+        // actually runs, and would prove nothing about wiring order.
+        use crate::biquad::test_support::{goertzel_magnitude, sine};
+        use crate::biquad::{Biquad, BiquadCoeffs};
+        use crate::parametric_eq::{EqCellParams, EqCellType};
+
+        let mut engine = Engine::new();
+        for strip in &mut engine.strips {
+            strip.bus_assign = [false; NUM_BUSES];
+        }
+        engine.strips[0].bus_assign[0] = true;
+        engine.buses[0].mono = BusMono::StereoReverse;
+        engine.buses[0].eq.on = true;
+        engine.buses[0].eq.set_cell(
+            0,
+            0,
+            EqCellParams {
+                on: true,
+                cell_type: EqCellType::Peak,
+                freq_hz: 1000.0,
+                gain_db: 18.0,
+                q: 1.0,
+            },
+        );
+        // Channel 1's EQ is left at its neutral default -- unboosted.
+
+        let tone = sine(4096, 48_000.0, 1000.0);
+        let probe: Vec<Frame> = tone
+            .iter()
+            .map(|&s| {
+                let mut f = [0.0; CHANNELS];
+                f[0] = s; // channel 1 starts silent
+                f
+            })
+            .collect();
+        let silence = vec![[0.0; CHANNELS]; probe.len()];
+        let input_refs: Vec<&[Frame]> = std::iter::once(probe.as_slice())
+            .chain(std::iter::repeat_n(silence.as_slice(), NUM_STRIPS - 1))
+            .collect();
+
+        let mut out_bufs: Vec<Vec<Frame>> = vec![vec![[0.0; CHANNELS]; probe.len()]; NUM_BUSES];
+        {
+            let mut out_refs: Vec<&mut [Frame]> =
+                out_bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
+            engine.process_block(&input_refs, &mut out_refs);
+        }
+        // After StereoReverse, whatever channel 0 became ends up in
+        // channel 1.
+        let actual_ch1: Vec<f32> = out_bufs[0].iter().map(|f| f[1]).collect();
+        let actual_gain = goertzel_magnitude(&actual_ch1, 1000.0, 48_000.0)
+            / goertzel_magnitude(&tone, 1000.0, 48_000.0);
+        let actual_db = 20.0 * actual_gain.log10();
+
+        // Hypothesis A (EQ first, the declared order): boost channel 0,
+        // then swap -- channel 1 should carry the *boosted* tone. Built
+        // independently with a raw `Biquad`, not by calling the engine
+        // under test.
+        let mut boost = Biquad::bypassed();
+        boost.set_coeffs(BiquadCoeffs::peaking(48_000.0, 1000.0, 1.0, 18.0));
+        let hyp_a: Vec<f32> = tone.iter().map(|&x| boost.process(x)).collect();
+        let a_gain = goertzel_magnitude(&hyp_a, 1000.0, 48_000.0)
+            / goertzel_magnitude(&tone, 1000.0, 48_000.0);
+        let a_db = 20.0 * a_gain.log10();
+
+        // Hypothesis B (swap first, the wrong order): channel 1 ends up
+        // carrying the *original, unboosted* tone, since channel 1's own
+        // EQ setting was left neutral -- unity, 0dB, by construction.
+        let b_db = 0.0;
+
+        assert!(
+            (a_db - b_db).abs() > 6.0,
+            "hypotheses aren't distinguishable: a={a_db}dB b={b_db}dB"
+        );
+        assert!(
+            (actual_db - a_db).abs() < 0.5,
+            "actual ({actual_db}dB) should match hypothesis A/EQ-first ({a_db}dB)"
+        );
+        assert!(
+            (actual_db - b_db).abs() > 6.0,
+            "actual ({actual_db}dB) should NOT match hypothesis B/swap-first ({b_db}dB)"
+        );
     }
 
     #[test]
