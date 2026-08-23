@@ -34,6 +34,29 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   frequency-response or static-curve test where applicable, and a
   stability test under randomised parameter automation — written before
   each block's implementation.
+- Parametric EQ (spec 3.4 M6): the shared 6-cell engine (`parametric_eq.rs`),
+  wired into both the hardware strip EQ (stereo, spec 1.2 step 7) and the
+  bus EQ (8 independent channels, spec 1.2 step 4).
+  - 7 cell types (spec 1.7): peak, low pass, high pass, low shelf, high
+    shelf, band pass, notch — 4 new RBJ/Cookbook coefficient constructors
+    added to `biquad.rs` alongside the existing peaking/band-pass.
+  - Per-channel trim (-24..+24dB) and delay (0..500ms, a fixed-capacity
+    ring sized to the current sample rate).
+  - A/B memory, `FLAT` reset, `CH COPY` / `COPY ALL` (including copying
+    between a strip's and a bus's differently-sized channel sets, since
+    the parameter model is shared per spec 1.7).
+  - Load/save as a versioned JSON file (`loomix-config::eq_file`).
+  - `Biquad::set_coeffs` now smooths coefficient changes over a fixed
+    64-sample ramp instead of applying them in one step, since M6's cells
+    are the first callers swept live by a dragged control — an
+    instantaneous coefficient swap on accumulated filter state is an
+    audible discontinuity, worst on a cell-type switch. Engaging/leaving
+    bypass stays instantaneous, matching every block's existing true-
+    neutral convention.
+  - `ui/src/eqResponse.ts` / `eqGraph.ts`: an independent TypeScript
+    implementation of the same response math plus a framework-free SVG
+    renderer, cross-checked against a fixture generated from the real
+    Rust engine rather than trusted independently by either side.
 
 ### Known limitations
 
@@ -49,6 +72,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Karaoke's K-1/K-2/K-v depths and every macro-knob curve are Loomix's own
   values, not derived from or verified against Voicemeeter, since no
   published reference exists for either.
+- The EQ graph is response-curve math and an SVG renderer only, not yet an
+  interactive UI control — `ui/` stays a bare TypeScript project (no
+  React/Tauri) until the milestone that stands up the app shell. Right-
+  click-to-type-a-value and right-click-to-change-the-dB-scale (spec 1.7)
+  are real UI work for that milestone; the renderer already takes a dB
+  range as a parameter so that control has something to drive.
 
 ## [0.1.0] - 2026-08-23
 

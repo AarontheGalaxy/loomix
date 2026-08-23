@@ -239,9 +239,9 @@ guaranteed bit-exact null.
 ## Per-strip chain order (`strip_dsp.rs`)
 
 Hardware strips follow spec 1.2's explicit order: denoiser → gate →
-compressor → Intellipan pad → pan pot → limiter (strip EQ and FX-send
-steps aren't in scope until M6/M8). This is a direct reading of spec
-text, not an inferred placement.
+compressor → strip parametric EQ (M6, below) → Intellipan pad → pan pot →
+limiter (the FX-send step is M8, not yet in scope). This is a direct
+reading of spec text, not an inferred placement.
 
 Virtual strips' order is **not** given by spec — spec 1.2 only orders the
 hardware chain; spec 1.4's virtual-strip control list (EQ, pan pad, M.C.,
@@ -257,3 +257,136 @@ it drives both the declared order and the alternative order through the
 same public block APIs independently, and asserts the real `VirtualChain`
 matches only the declared one — not an assertion that assumes its own
 implementation's order is correct.
+
+## Parametric EQ (`parametric_eq.rs`, M6)
+
+The shared 6-cell engine spec 1.7 calls for, generic over channel count:
+`ParametricEq<2>` for the hardware strip EQ (stereo, inserted per spec
+1.2's order above), `ParametricEq<8>` for the bus EQ (independent per
+channel, spec 1.2 step 4 — after summing/FX-returns, before the mono
+transform, `engine.rs`'s bus loop). One implementation serves both, per
+spec 1.7's own text.
+
+**Cell types → `biquad.rs` constructors.** Spec 1.7's 7 types, index 0..6:
+Peak (`BiquadCoeffs::peaking`, already existed for M5), LowPass, HighPass,
+LowShelf, HighShelf, BandPass (already existed), Notch. The four new
+constructors are standard RBJ/Cookbook forms, known-answer tested the same
+way as the existing ones (independently in Python, `1e-6` tolerance).
+Shelving cells use `alpha = sin(w0)/(2Q)` — the same alpha every other
+cell type in this file uses — rather than RBJ's canonical `S`-parameterised
+shelf form, since spec 1.7 gives one shared `q` range (1..100) across all
+7 types and there is no spec-given `Q`-to-`S` conversion; Loomix's own
+choice where the spec underspecifies, same category as Karaoke's/the
+macro-knob curves' entries above.
+
+**Coefficient changes are smoothed, not instantaneous** (`biquad.rs`,
+`Biquad::set_coeffs`). M6's cells are the first callers that sweep a
+biquad's parameters live — a user dragging frequency/gain/Q, or switching
+a cell's type while it's engaged. Applying new coefficients to a filter's
+existing `(x1,x2,y1,y2)` state in one step computes that sample as if the
+filter's entire input history had always run through the new
+coefficients, a real, audible discontinuity — worst on a cell-type switch,
+where the whole transfer function changes at once, not just one
+parameter. `Biquad::set_coeffs` ramps linearly from the current
+coefficient set to the new one over a fixed 64-sample window (applied
+inside `process()`, so no caller needs to know a ramp is in flight) rather
+than swapping in one step. This only smooths *engaged→engaged* changes:
+entering/leaving bypass stays instantaneous, matching every block's
+established true-neutral convention (spec 4.1) and the real UI gesture
+(a cell's on/off toggle is a discrete click, not something dragged).
+`ponytail:` the ramp interpolates raw `b0/b1/b2/a1/a2` linearly, not a
+provably-stable parameter domain (pole radius/angle, or RBJ's `S`); fine
+for two nearby, well-formed coefficient sets (a knob sweep, a switch
+between this cell's own 7 types), not proven for arbitrarily divergent
+endpoints — upgrade path is interpolating in a parameter domain instead,
+if an extreme jump is ever found to click or destabilise mid-ramp.
+Proven, not just asserted, in two ways: an "instantaneous swap would click,
+the smoothed one doesn't" A/B test on identical accumulated filter state
+(`biquad::tests::coefficient_sweeps_do_not_click_...`, same technique
+`drift.rs` uses — a wrong implementation actually fails the same
+scenario), and a fixed-cell-count random continuous sweep across all 7
+types including hard type switches, bounding the smoothed output's
+sample-to-sample delta against the naive one's.
+
+**A/B memory doubles params, not live DSP state.** `ParametricEq<N>`
+stores two full `[EqChannelParams; N]` (spec 1.7's A/B memories) but only
+one live `[EqChannel; N]` (the actual biquads/trim/delay-line state),
+rebuilt from whichever memory is active whenever a param changes or the
+active memory switches. Cheaper than two full sets of live filter/delay
+state, and the same "recompute from params on every change" shape every
+other block in this crate already uses (`ThreeBandEq::recompute`, the
+macro-knob blocks) — not a new pattern invented for this file.
+
+**Per-channel delay (`DelayLine`, 0..500ms per spec 1.7) is sized to the
+current sample rate, not always pre-sized for the 192kHz worst case.**
+Reallocated only in `set_sample_rate`, matching the "reallocate outside
+`process()`, never inside it" rule every sample-rate-dependent block in
+this crate already follows (spec 3.3). `delay_ms == 0.0` is a true
+bypass — the buffer isn't touched at all, the same guaranteed-bit-exact
+pattern every other neutral setting in this crate uses, not "reading a
+zero-sample delay" through the general code path.
+
+**`DelayLine::set_sample_rate`'s concurrency contract, and what a
+`debug_assert!` there does and does not prove:** it must never run while
+`process()` could be in flight for the same instance — it reallocates,
+which is a spec 3.3 violation on the audio thread regardless, and also
+corrupts whatever's currently buffered. A same-thread reentrant violation
+of that (a `set_sample_rate` call nested inside `process()` on the one
+thread that owns the instance) is real-time-unsafe and audio-corrupting
+but *not* a memory-safety violation — Rust's own `&mut self` aliasing
+rules already rule out true concurrent mutation of one instance in safe
+code. A cross-thread violation — reachable only if a caller uses `unsafe`
+to alias the instance across threads, exactly the shape `loomix-hal`'s
+CoreAudio FFI trampolines take reaching into `Engine` — is a genuine data
+race on the buffer's backing allocation: Undefined Behavior, not merely a
+wrong sample. The type's own doc comment states this distinction
+explicitly, because it changes how carefully a caller has to treat the
+contract. A `debug_assert!` catches the same-thread case, compiled out in
+release builds — proven to actually fire, in a debug/test build, by
+`tests::set_sample_rate_panics_if_called_while_process_is_in_flight`
+(the same technique `rt_assert.rs` uses: set the private flag directly,
+simulating the reentrant call, then `catch_unwind`), with a companion
+test proving that assertion isn't just unconditionally panicking. It
+verifies the contract in tests; it does not enforce it in a shipped
+release binary — the real protection against the cross-thread case is
+architectural (spec 3.3's SPSC/triple-buffer parameter crossing, never a
+directly shared `&mut`), not this flag.
+
+**Bus EQ runs before the mono/stereo-reverse transform (spec 1.2 step 4
+before step 5), proven with a genuinely non-commutative case, not just
+"EQ changed the output."** A per-channel EQ setting and a channel *swap*
+only disagree about which channel ends up affected if the two operations
+don't commute, so
+`engine::tests::bus_eq_runs_before_stereo_reverse_provably` boosts one
+channel, sets `StereoReverse`, and checks which channel the boost lands
+in against two independently-built hypotheses — the same drives-both-
+hypotheses technique `virtual_chain_eq_runs_before_the_pan_pad_provably`
+(M5) uses. Checked further, on request, the same way the M1 ring-buffer
+test and the M5 gate-chatter test were: the real order was temporarily
+inverted in `engine.rs`, the test was confirmed to fail against that
+inverted order, then reverted — so the test is confirmed to actually
+distinguish the two orders, not just pass regardless of which one ships.
+The equivalent strip-side check
+(`strip_dsp::tests::hardware_chain_compressor_does_not_see_the_eq_boosted_signal`)
+was validated the same way.
+
+**Cross-language verification for the UI's EQ graph.** Per direct
+instruction: the graph's TypeScript math (`ui/src/eqResponse.ts`) is a
+second, independent implementation of the same Cookbook formulas, checked
+against a fixture generated *from* the real Rust engine
+(`crates/loomix-core/tests/eq_response_fixture.rs` →
+`testdata/fixtures/eq_response_reference.json`, regenerated deliberately,
+reviewed in the diff — the same convention as `testdata/golden/`), not
+against numbers copied by hand and not trusted as ground truth by either
+side without the other agreeing. Getting the two sides to actually agree
+at a tight tolerance surfaced two real bugs in the fixture generator, not
+in the EQ math itself: probe frequencies that weren't exact bins of the
+analysis window leaked energy across the spectrum in a way that a steep
+filter (a notch's own center, a stopband) amplified into >1dB of spurious
+error — fixed by snapping every probe frequency to `k * sample_rate /
+NUM_SAMPLES`; and `render::goertzel_magnitude`'s `f32` accumulation over
+a long (32768-sample) buffer wasn't precise enough at sub-0.1dB
+tolerance in deep attenuation — fixed with a local `f64`-accumulating
+Goertzel in the fixture generator only, the same class of fix as the M4
+drift-simulation counters (`docs/ARCHITECTURE.md`). The TS side's own
+formulas are otherwise a direct line-for-line port of `biquad.rs`'s.
