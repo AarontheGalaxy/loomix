@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "channels": [
+    {
+      "cells": [
+        {
+          "on": true,
+          "cell_type": "Peak",
+          "freq_hz": 1000.0,
+          "gain_db": 6.0,
+          "q": 2.0
+        },
+        {
+          "on": false,
+          "cell_type": "Peak",
+          "freq_hz": 1000.0,
+          "gain_db": 0.0,
+          "q": 1.0
+        },
+        {
+          "on": false,
+          "cell_type": "Peak",
+          "freq_hz": 1000.0,
+          "gain_db": 0.0,
+          "q": 1.0
+        },
+        {
+          "on": false,
+          "cell_type": "Peak",
+          "freq_hz": 1000.0,
+          "gain_db": 0.0,
+          "q": 1.0
+        },
+        {
+          "on": false,
+          "cell_type": "Peak",
+          "freq_hz": 1000.0,
+          "gain_db": 0.0,
+          "q": 1.0
+        },
+        {
+          "on": false,
+          "cell_type": "Peak",
+          "freq_hz": 1000.0,
+          "gain_db": 0.0,
+          "q": 1.0
+        }
+      ],
+      "trim_db": 3.0,
+      "delay_ms": 0.0
+    },
+    {
+      "cells": [
+        {
+          "on": false,
+          "cell_type": "Peak",
+          "freq_hz": 1000.0,
+          "gain_db": 0.0,
+          "q": 1.0
+        },
+        {
+          "on": false,
+          "cell_type": "Peak",
+          "freq_hz": 1000.0,
+          "gain_db": 0.0,
+          "q": 1.0
+        },
+        {
+          "on": false,
+          "cell_type": "Peak",
+          "freq_hz": 1000.0,
+          "gain_db": 0.0,
+          "q": 1.0
+        },
+        {
+          "on": false,
+          "cell_type": "Peak",
+          "freq_hz": 1000.0,
+          "gain_db": 0.0,
+          "q": 1.0
+        },
+        {
+          "on": false,
+          "cell_type": "Peak",
+          "freq_hz": 1000.0,
+          "gain_db": 0.0,
+          "q": 1.0
+        },
+        {
+          "on": false,
+          "cell_type": "Peak",
+          "freq_hz": 1000.0,
+          "gain_db": 0.0,
+          "q": 1.0
+        }
+      ],
+      "trim_db": 0.0,
+      "delay_ms": 50.0
+    }
+  ]
+}
