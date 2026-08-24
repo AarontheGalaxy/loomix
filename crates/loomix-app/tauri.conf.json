@@ -4,10 +4,10 @@
   "version": "0.0.0",
   "identifier": "com.loomix.app",
   "build": {
-    "beforeDevCommand": "npm run dev --prefix ../../ui",
-    "beforeBuildCommand": "npm run build --prefix ../../ui",
+    "beforeDevCommand": "npm run dev --prefix ../ui",
+    "beforeBuildCommand": "npm run build --prefix ../ui",
     "devUrl": "http://localhost:1420",
-    "frontendDist": "../../ui/dist"
+    "frontendDist": "../ui/dist"
   },
   "app": {
     "windows": [

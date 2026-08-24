@@ -5,6 +5,45 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-24 — M8 (continued): `tauri.conf.json`'s relative paths, and actually running it
+
+**`beforeDevCommand`/`beforeBuildCommand`/`frontendDist`'s relative paths
+in `tauri.conf.json` are resolved one directory above wherever
+`tauri.conf.json` itself lives, not from that directory** -- `../ui`, not
+`../../ui`, even though the config sits in `crates/loomix-app/` and `ui/`
+is two path segments up from there by plain filesystem navigation.
+`cargo tauri dev` prepended a directory somewhere in its own resolution
+(unconfirmed exactly where or why -- not worth guessing further once the
+fix was verified empirically) before applying the relative path. Found by
+actually running `cargo tauri dev` and reading the real error (`beforeDevCommand`
+failing with `ENOENT` on `/Users/.../Projelerim/ui/package.json`, one
+level above the repo root) rather than reasoning about the path in the
+abstract a second time -- the first version of this config was written
+and believed correct without ever being executed, which is exactly the
+unverified-verification pattern this project's CLAUDE.md exists to rule
+out, called out directly on this milestone.
+
+**Verified by actually launching the app and inspecting the live window,
+not by re-reading the source.** `screencapture` isn't available (no
+Screen Recording permission for this process), so verification went
+through macOS's Accessibility API (`osascript`/System Events) instead,
+which turned out to prove more than a screenshot would have: the live
+window's accessibility tree was dumped and checked against the actual
+React source rather than assumed from it -- exact strings ("Editing gain
+layers for bus", "HW 1"), the right button count (40: 8 strips x 3 +
+8 bus mutes + 8 bus-select labels, matching the component tree exactly),
+and a real interactive round trip -- `AXIncrement` on the first strip's
+fader moved its value from 0.0 to 0.1 and it *stayed* there across
+multiple 500ms reconciliation-poll cycles, meaning the chain UI ->
+`invoke()` -> Tauri command -> `EngineCommand::SetStripGainLayer` -> real
+`Engine` -> `ControlSnapshot` poll -> UI actually round-tripped through a
+running process, not just that the DOM accepted a value. (Setting the
+slider's `AXValue` directly first, as a natural first attempt, did
+nothing -- native `<input type=range>` inside a WKWebView doesn't
+dispatch real DOM events from an externally-set accessibility value, only
+from real input like `AXIncrement`/keyboard/pointer events; a limitation
+of the test method, not a finding about the app.)
+
 ## 2026-08-24 — M8 (continued): Tauri scaffolding and the first React UI
 
 **`loomix-app` gets its `[[bin]]` (`loomix`) and the Tauri dependency
