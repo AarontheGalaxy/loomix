@@ -41,8 +41,8 @@ function peakToUnit(level: number): number {
 function Meter({ levels }: { levels: number[] | undefined }) {
   const level = levels ? Math.max(levels[0] ?? 0, levels[1] ?? 0) : 0;
   return (
-    <div className="meter">
-      <div className="meter-fill" style={{ width: `${peakToUnit(level) * 100}%` }} />
+    <div className="meter-vertical">
+      <div className="meter-vertical-fill" style={{ height: `${peakToUnit(level) * 100}%` }} />
     </div>
   );
 }
@@ -93,19 +93,21 @@ function StripColumn({ index, snapshot, meterLevels, selectedBus, onChange }: St
         />
         {BUS_LABELS[selectedBus]}
       </label>
-      <input
-        className="fader"
-        type="range"
-        min={-60}
-        max={12}
-        step={0.1}
-        value={gainDb}
-        onChange={(e) =>
-          void setStripGainLayer(index, selectedBus, Number(e.target.value)).then(onChange)
-        }
-      />
+      <div className="fader-meter-row">
+        <input
+          className="fader"
+          type="range"
+          min={-60}
+          max={12}
+          step={0.1}
+          value={gainDb}
+          onChange={(e) =>
+            void setStripGainLayer(index, selectedBus, Number(e.target.value)).then(onChange)
+          }
+        />
+        <Meter levels={meterLevels} />
+      </div>
       <div className="fader-value">{gainDb.toFixed(1)} dB</div>
-      <Meter levels={meterLevels} />
     </div>
   );
 }
@@ -143,17 +145,19 @@ function BusColumn({ index, snapshot, meterLevels, selected, onSelect, onChange 
           </option>
         ))}
       </select>
-      <input
-        className="fader"
-        type="range"
-        min={-60}
-        max={12}
-        step={0.1}
-        value={snapshot.gain_db}
-        onChange={(e) => void setBusGain(index, Number(e.target.value)).then(onChange)}
-      />
+      <div className="fader-meter-row">
+        <input
+          className="fader"
+          type="range"
+          min={-60}
+          max={12}
+          step={0.1}
+          value={snapshot.gain_db}
+          onChange={(e) => void setBusGain(index, Number(e.target.value)).then(onChange)}
+        />
+        <Meter levels={meterLevels} />
+      </div>
       <div className="fader-value">{snapshot.gain_db.toFixed(1)} dB</div>
-      <Meter levels={meterLevels} />
     </div>
   );
 }
@@ -205,31 +209,33 @@ export default function App() {
           below to edit its layer instead.
         </p>
       </header>
-      <section className="strip-rack">
-        {Array.from({ length: NUM_STRIPS }, (_, i) => (
-          <StripColumn
-            key={i}
-            index={i}
-            snapshot={snapshot?.strips[i]}
-            meterLevels={meters?.strips[i]}
-            selectedBus={selectedBus}
-            onChange={onChange}
-          />
-        ))}
-      </section>
-      <section className="bus-rack">
-        {Array.from({ length: NUM_BUSES }, (_, i) => (
-          <BusColumn
-            key={i}
-            index={i}
-            snapshot={snapshot?.buses[i]}
-            meterLevels={meters?.buses[i]}
-            selected={i === selectedBus}
-            onSelect={() => setSelectedBus(i)}
-            onChange={onChange}
-          />
-        ))}
-      </section>
+      <div className="mixer">
+        <section className="strip-rack">
+          {Array.from({ length: NUM_STRIPS }, (_, i) => (
+            <StripColumn
+              key={i}
+              index={i}
+              snapshot={snapshot?.strips[i]}
+              meterLevels={meters?.strips[i]}
+              selectedBus={selectedBus}
+              onChange={onChange}
+            />
+          ))}
+        </section>
+        <section className="bus-rack">
+          {Array.from({ length: NUM_BUSES }, (_, i) => (
+            <BusColumn
+              key={i}
+              index={i}
+              snapshot={snapshot?.buses[i]}
+              meterLevels={meters?.buses[i]}
+              selected={i === selectedBus}
+              onSelect={() => setSelectedBus(i)}
+              onChange={onChange}
+            />
+          ))}
+        </section>
+      </div>
       <footer className="app-footer">
         {CHANNELS} channels per bus -- strip processing, the EQ graph and device selection land
         next.

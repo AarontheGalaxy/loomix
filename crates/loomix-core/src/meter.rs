@@ -73,16 +73,20 @@ impl Meter {
 
     pub(crate) fn observe(&mut self, block: &[Frame]) {
         for frame in block {
-            for c in 0..CHANNELS {
-                let level = frame[c].abs();
-                if level > self.peak_hold[c] {
-                    self.peak_hold[c] = level;
-                    self.hold_remaining[c] = self.hold_samples;
-                } else if self.hold_remaining[c] > 0 {
-                    self.hold_remaining[c] -= 1;
+            let channels = frame
+                .iter()
+                .zip(self.peak_hold.iter_mut())
+                .zip(self.hold_remaining.iter_mut());
+            for ((&sample, held), remaining) in channels {
+                let level = sample.abs();
+                if level > *held {
+                    *held = level;
+                    *remaining = self.hold_samples;
+                } else if *remaining > 0 {
+                    *remaining -= 1;
                 } else {
-                    let decayed = self.peak_hold[c] * self.decay_per_sample;
-                    self.peak_hold[c] = if decayed < SILENCE_FLOOR {
+                    let decayed = *held * self.decay_per_sample;
+                    *held = if decayed < SILENCE_FLOOR {
                         0.0
                     } else {
                         decayed

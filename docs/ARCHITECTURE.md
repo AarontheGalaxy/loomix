@@ -5,6 +5,55 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-24 — M8 (continued): the layout read as a settings panel, not a mixer
+
+**Found by the user looking at the running app, not by review of the
+source: horizontal faders over thin horizontal meter bars, stacked in a
+row of auto-height cards, read as a form -- Voicemeeter's actual idiom is
+a tall, narrow vertical channel strip (fader and meter side by side,
+running the full height of the strip), and most of the window sat empty
+above and below a cramped top band.** Direct instruction: rework the
+shape, not the polish, and change no controls -- same mute/solo/mono,
+bus-assign, fader, mode dropdown, meter, just arranged the way a mixer
+actually reads.
+
+**`.app` now claims the full window height (`100dvh`, `overflow: hidden`)
+instead of being a flex column of auto-height sections that left
+whatever the content didn't use empty.** `.mixer` splits the remaining
+height 3:2 between the strip rack and the bus rack (`flex: 3` /
+`flex: 2`) -- strips get more room since there are the same count of
+them but they're the side a musician spends more time on, not because
+buses matter less; both racks use the identical column module (label,
+controls, then a `.fader-meter-row` that eats whatever height is left)
+so the bus row reads as a matching set of columns, not a visually
+different afterthought, per the direct instruction.
+
+**Vertical faders use `-webkit-appearance: slider-vertical`, not the
+`orient="vertical"` HTML attribute or a CSS `writing-mode` transform
+trick.** Tauri's macOS webview is always WKWebView, so betting on a
+WebKit-specific CSS property is a safe, project-specific call here, not
+a general cross-browser risk; it also needed no new markup or a
+React-typing workaround the `orient` attribute would have (that
+attribute isn't in React's DOM typings and getting a plain object spread
+past strict JSX prop checking would have been the less honest fix). The
+vertical meter fill is a `position: absolute; bottom: 0` div inside a
+`position: relative` track, growing by `height`, mirroring the old
+horizontal version's `width` growth exactly.
+
+**The synthetic test tone gained a slow amplitude envelope (a raised
+cosine, 0 -> peak -> 0 over 6 seconds) because a constant-level tone
+gives a meter nothing to prove -- a peak reached once and held forever is
+visually identical to the stuck-channel bug the M8 log's peak-hold entry
+above just fixed.** The envelope doesn't need to be a hard gate to make
+hold-then-decay visible: `Meter::observe` only advances `peak_hold` on a
+*new* high, so the moment the envelope starts falling -- smoothly or not
+-- the meter's own 1s-hold/20dB-per-s decay takes over regardless of the
+source's own fall shape, which is exactly what makes a smooth swell
+enough to demonstrate it, not just an on/off burst. Confirmed by
+actually watching it, not assumed from the math: two screenshots of the
+running app, taken ~30 seconds apart, show the same channel's meter
+fill at visibly different heights.
+
 ## 2026-08-24 — M8 (continued): meters were a permanent running max, not peak-hold-then-decay
 
 **Found by actually looking at the running app, not by inspecting the

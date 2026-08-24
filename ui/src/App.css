@@ -1,18 +1,25 @@
 :root {
   color-scheme: dark;
-  --bg: #17181c;
-  --panel: #202226;
-  --border: #33363d;
+  --bg: #0f0f17;
+  --panel: #1a1b22;
+  --border: #2e303a;
   --text: #e6e6ea;
   --text-dim: #8b8d94;
   --accent: #5a8cff;
   --mute: #e05a5a;
   --solo: #e0b95a;
   --meter: #4ade80;
+  --meter-hot: #f87171;
 }
 
 * {
   box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
 }
 
 body {
@@ -21,33 +28,71 @@ body {
   color: var(--text);
   font-family:
     -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  overflow: hidden;
 }
 
+/* Dense, always-visible control surface, not a scrolling document: the
+   whole window is spoken for by the header, the racks and the footer --
+   see docs/ARCHITECTURE.md's M8 layout-rework entry for why this
+   replaced a flex-column-of-auto-height-rows layout that left most of
+   the window empty. */
 .app {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 16px;
-  min-height: 100vh;
+  height: 100dvh;
+  padding: 10px 12px;
+  gap: 8px;
+}
+
+.app-header {
+  flex: 0 0 auto;
 }
 
 .app-header h1 {
-  margin: 0 0 4px;
-  font-size: 20px;
+  margin: 0 0 2px;
+  font-size: 15px;
+  font-weight: 600;
 }
 
 .app-subtitle,
 .app-footer {
   margin: 0;
   color: var(--text-dim);
-  font-size: 13px;
+  font-size: 11px;
+}
+
+.app-footer {
+  flex: 0 0 auto;
+}
+
+/* The two racks share the rest of the window's height. Strips get more
+   of it (3:2) -- they're the side with more of them and the side a
+   musician spends more time on -- but both are the same module shape
+   (label/controls above, a tall fader+meter pair below), so the bus row
+   reads as a matching set of columns, not an afterthought. */
+.mixer {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.strip-rack {
+  flex: 3;
+  min-height: 0;
+}
+
+.bus-rack {
+  flex: 2;
+  min-height: 0;
 }
 
 .strip-rack,
 .bus-rack {
   display: grid;
-  grid-template-columns: repeat(8, minmax(90px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(8, minmax(64px, 1fr));
+  gap: 6px;
 }
 
 .channel-strip {
@@ -55,7 +100,9 @@ body {
   flex-direction: column;
   align-items: stretch;
   gap: 6px;
-  padding: 10px;
+  height: 100%;
+  min-height: 0;
+  padding: 8px 6px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -66,33 +113,36 @@ body {
 }
 
 .channel-label {
+  flex: 0 0 auto;
   text-align: center;
   font-weight: 600;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .bus-select {
   background: none;
   border: none;
   color: inherit;
+  font: inherit;
   cursor: pointer;
-  padding: 2px;
+  padding: 1px;
 }
 
 .channel-buttons {
+  flex: 0 0 auto;
   display: flex;
-  gap: 4px;
+  gap: 3px;
   justify-content: center;
 }
 
 .toggle {
   flex: 1;
-  padding: 4px 0;
-  background: #2a2c31;
+  padding: 3px 0;
+  background: #26272f;
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 10px;
   cursor: pointer;
 }
 
@@ -115,43 +165,73 @@ body {
 }
 
 .bus-assign {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 4px;
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text-dim);
   justify-content: center;
 }
 
 .bus-mode {
+  flex: 0 0 auto;
   width: 100%;
-  font-size: 11px;
-  background: #2a2c31;
+  font-size: 10px;
+  background: #26272f;
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 2px;
 }
 
+/* The vertical fader + vertical meter, side by side, filling whatever
+   height the channel strip has left -- this is the actual mixer shape:
+   a tall, narrow strip, not a settings-panel row of horizontal sliders. */
+.fader-meter-row {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  align-items: stretch;
+  gap: 10px;
+  padding: 4px 0;
+}
+
 .fader {
-  width: 100%;
+  /* Vertical range slider: WebKit-specific (Tauri's macOS webview is
+     always WKWebView, so this is a safe bet here, not a general web
+     cross-browser control) -- min at the bottom, max at the top, like a
+     real fader, with no extra markup or JS needed. */
+  -webkit-appearance: slider-vertical;
+  width: 24px;
+  height: 100%;
+  cursor: pointer;
 }
 
 .fader-value {
+  flex: 0 0 auto;
   text-align: center;
-  font-size: 11px;
+  font-size: 10px;
   color: var(--text-dim);
 }
 
-.meter {
-  height: 6px;
-  background: #2a2c31;
+.meter-vertical {
+  flex: 0 0 auto;
+  position: relative;
+  width: 12px;
+  height: 100%;
+  background: #26272f;
   border-radius: 3px;
   overflow: hidden;
 }
 
-.meter-fill {
-  height: 100%;
+.meter-vertical-fill {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
   background: var(--meter);
-  transition: width 60ms linear;
+  transition: height 60ms linear;
 }

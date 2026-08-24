@@ -27,6 +27,15 @@ const RECONCILE_QUEUE_CAPACITY: usize = 8;
 const SAMPLE_RATE: f32 = 48_000.0;
 const BLOCK_LEN: usize = 128;
 const TEST_TONE_HZ: f32 = 440.0;
+const TEST_TONE_PEAK: f32 = 0.4;
+/// A constant-level test tone gives the meters nothing to show: a peak
+/// reached once and held forever looks identical to a stuck channel,
+/// which is exactly the bug the M8 log's meter-ballistics entry
+/// (`docs/ARCHITECTURE.md`) just fixed. A slow envelope makes the level
+/// actually move -- rising and falling over several seconds -- so both
+/// the live tracking and the 1s-hold/20dB-per-s decay are visible in
+/// motion, not just provable in a unit test.
+const ENVELOPE_PERIOD_S: f32 = 6.0;
 
 struct AppState {
     sink: Mutex<CommandSink>,
@@ -245,6 +254,7 @@ fn spawn_audio_thread(
         engine.set_sample_rate(SAMPLE_RATE);
         let block_duration = Duration::from_secs_f32(BLOCK_LEN as f32 / SAMPLE_RATE);
         let mut phase = 0.0f32;
+        let mut envelope_phase = 0.0f32;
 
         loop {
             drain.drain_into(&mut engine, 64);
@@ -253,10 +263,14 @@ fn spawn_audio_thread(
                 .map(|_| vec![[0.0; CHANNELS]; BLOCK_LEN])
                 .collect();
             for frame in inputs[0].iter_mut() {
-                let sample = (phase * std::f32::consts::TAU).sin() * 0.4;
+                // Raised cosine, 0 -> 1 -> 0 once per ENVELOPE_PERIOD_S:
+                // a smooth swell, not a hard on/off gate.
+                let envelope = 0.5 - 0.5 * (envelope_phase * std::f32::consts::TAU).cos();
+                let sample = (phase * std::f32::consts::TAU).sin() * TEST_TONE_PEAK * envelope;
                 frame[0] = sample;
                 frame[1] = sample;
                 phase = (phase + TEST_TONE_HZ / SAMPLE_RATE).fract();
+                envelope_phase = (envelope_phase + 1.0 / (ENVELOPE_PERIOD_S * SAMPLE_RATE)).fract();
             }
             let input_refs: Vec<&[Frame]> = inputs.iter().map(|v| v.as_slice()).collect();
             let mut out_bufs: Vec<Vec<Frame>> = vec![vec![[0.0; CHANNELS]; BLOCK_LEN]; NUM_BUSES];
