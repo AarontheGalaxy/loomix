@@ -130,7 +130,7 @@ impl BusSink {
 /// stay silent (input) or simply have nothing draining them (output) --
 /// exactly spec 1.11's "clearing it leaves the strip fed only by network
 /// audio" / a bus with no device selected, extended to "no device
-/// attached yet" during M4, before M11's network audio exists to fill
+/// attached yet" during M4, before M12's network audio exists to fill
 /// that gap.
 pub struct EngineIoDriver {
     engine: Engine,

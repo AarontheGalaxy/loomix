@@ -171,13 +171,13 @@ leak state between them.
 **Reverb/room-effect scope, decided explicitly:** spec 1.3 describes Color
 as "3 band tonal shaping plus a small reverb on the upper half" and
 Position as "binaural placement with a small room effect". Building a
-strip-local reverb ahead of M8's real send/return reverb engine would mean
+strip-local reverb ahead of M9's real send/return reverb engine would mean
 two implementations and a migration — skipped for Color on direct
 instruction, and the same reasoning applies identically to Position's room
 effect, so both are skipped and logged here. **Both pads' `y` axis is
 accepted and stored but does not affect audio this milestone** — `y==0`
 neutrality does not exercise the reverb/room path, because there is no
-reverb/room path yet. Both land when M8 exists.
+reverb/room path yet. Both land when M9 exists.
 
 - **Color**: a bass/treble tilt driven by `x` alone (spec's "3 band"
   wording, but only one control axis is actually available once `y` is
@@ -240,7 +240,7 @@ guaranteed bit-exact null.
 
 Hardware strips follow spec 1.2's explicit order: denoiser → gate →
 compressor → strip parametric EQ (M6, below) → Intellipan pad → pan pot →
-limiter (the FX-send step is M8, not yet in scope). This is a direct
+limiter (the FX-send step is M9, not yet in scope). This is a direct
 reading of spec text, not an inferred placement.
 
 Virtual strips' order is **not** given by spec — spec 1.2 only orders the

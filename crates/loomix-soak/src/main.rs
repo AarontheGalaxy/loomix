@@ -20,7 +20,7 @@
 //! on this specific machine and process, not a bug in the wiring.
 //!
 //! `nightly.yml`'s `soak` job already looks for this package by name and
-//! runs it with `--duration 2h`; that leg is M9's (with the recorder
+//! runs it with `--duration 2h`; that leg is M10's (with the recorder
 //! folded in), not exercised by this binary's current two-device-only
 //! shape.
 //!

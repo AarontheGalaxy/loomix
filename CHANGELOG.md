@@ -92,8 +92,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Intellipan's Color pad tonal-shaping ships without its "small reverb on
   the upper half" (spec 1.3); Position pad ships without its "small room
   effect" for the same reason. Both are strip-local reverb-family effects
-  that would duplicate M8's real send/return reverb engine if built now —
-  deferred to M8, not silently dropped. See `docs/ARCHITECTURE.md`.
+  that would duplicate M9's real send/return reverb engine if built now —
+  deferred to M9, not silently dropped. See `docs/ARCHITECTURE.md`.
 - Virtual-strip processing order (EQ/M.C./Karaoke relative to the 5.1 pan
   pad) is not specified by spec 1.4 and is Loomix's own judgement call,
   checked by an order-proving test rather than the spec's own wording. See

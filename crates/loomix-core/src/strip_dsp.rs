@@ -1,5 +1,5 @@
 //! The per-strip M5 processing chain (spec 1.2's ordered steps, less M6's
-//! strip EQ / M7's bus modes / M8's FX sends, which aren't in scope yet).
+//! strip EQ / M7's bus modes / M9's FX sends, which aren't in scope yet).
 //! One instance per strip, owned by [`crate::strip::Strip`], run exactly
 //! once per input frame — every block here holds mutable envelope/filter
 //! state, so it must not be invoked more than once for the same frame (see
@@ -18,7 +18,7 @@ use crate::{Frame, CH_FC};
 
 /// spec 1.2's hardware-strip order: denoiser, gate, compressor, strip
 /// parametric EQ (M6, spec 1.7: stereo, 2 channels), Intellipan pad, pan
-/// pot, limiter (FX-sends step is M8, not yet here).
+/// pot, limiter (FX-sends step is M9, not yet here).
 pub struct HardwareChain {
     pub denoiser: Denoiser,
     pub gate: Gate,
@@ -126,7 +126,7 @@ pub enum StripChain {
     // are boxed, not just `HardwareChain` alone: boxing only one side
     // still leaves clippy's `large_enum_variant` tripped by whichever
     // variant is left unboxed against the other's now-pointer size, and
-    // M8's FX sends are going to grow both chains again anyway. Boxing
+    // M9's FX sends are going to grow both chains again anyway. Boxing
     // happens only at construction, never inside `process()`.
     Hardware(Box<HardwareChain>),
     Virtual(Box<VirtualChain>),

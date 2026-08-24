@@ -527,15 +527,17 @@ Work strictly in order. Each milestone ends with a green CI run, a tagged commit
 
 **M7 — Bus modes and patching.** All 12 modes, composite patch, insert patch, pre and post switches.
 
-**M8 — Internal FX.** Reverb, multitap delay with tempo, multiband compressor, sends and returns with pre and post buttons.
+**M8 — App shell and first UI.** React + Tauri v2 scaffolding (spec 3.1), running in-process against the real engine, not a mock. The strip and bus layout, faders, mute, solo, the bus assignment matrix, metering, device selection, and the EQ graph (spec 1.7, M6's math) wired to live cell values on a running strip or bus EQ. Not the full reference surface: no macro buttons, no recorder transport, no Intellipan pads, no MIDI mapping, no network audio, no preset scenes — those stay with the milestones that already own them. **Acceptance:** run the mixer, route a real device's audio through it end to end, and hear it.
 
-**M9 — Recorder.** Playback and recording, all source modes, formats, multitrack, pre-record buffer, timer.
+**M9 — Internal FX.** Reverb, multitap delay with tempo, multiband compressor, sends and returns with pre and post buttons.
 
-**M10 — Control surface.** Request script parser, unix socket, C ABI, CLI, MIDI mapping with learn and feedback, macro buttons with all trigger types including the audio level trigger.
+**M10 — Recorder.** Playback and recording, all source modes, formats, multitrack, pre-record buffer, timer.
 
-**M11 — Network audio.** Incoming and outgoing streams, discovery, jitter buffer, error indicators, text and MIDI sub protocols. Fuzz the parser before merging.
+**M11 — Control surface.** Request script parser, unix socket, C ABI, CLI, MIDI mapping with learn and feedback, macro buttons with all trigger types including the audio level trigger.
 
-**M12 — Polish and release.** Preset scenes, simplified remote view, menu bar mode, login item, first run wizard, signed and notarised installer, uninstaller, documentation site.
+**M12 — Network audio.** Incoming and outgoing streams, discovery, jitter buffer, error indicators, text and MIDI sub protocols. Fuzz the parser before merging.
+
+**M13 — Polish and release.** Preset scenes, simplified remote view, menu bar mode, login item, first run wizard, signed and notarised installer, uninstaller, documentation site.
 
 ---
 
