@@ -5,6 +5,96 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-24 — M8 (continued): Tauri scaffolding and the first React UI
+
+**`loomix-app` gets its `[[bin]]` (`loomix`) and the Tauri dependency
+itself, per the M0 log's own forecast ("the first milestone that needs a
+UI surface for the Tauri backend").** `tauri.conf.json`/`build.rs`/
+`capabilities/default.json` live directly in `crates/loomix-app/` (no
+separate `src-tauri/` directory -- spec 3.2 already designates this crate
+as the Tauri backend, so nesting a second Cargo-adjacent directory inside
+it would just be indirection). `capabilities/default.json` grants only
+`core:default` -- enough to invoke this app's own custom commands; no
+file system, shell or dialog plugin access, since nothing here needs it.
+`ui/` gains its Vite config, `index.html` and React entry point
+(`main.tsx`/`App.tsx`), replacing `index.ts`'s placeholder `ping()`
+function, whose own doc comment named this exact milestone as the one
+that would make it obsolete.
+
+**`main.rs` deliberately does not wire real CoreAudio device I/O yet,**
+despite spec 3.4 M8 listing device selection in scope. `spawn_audio_thread`
+simulates the real-time thread instead: a timer-paced loop calling the
+same `CommandDrain::drain_into` -> `Engine::process_block` sequence a real
+IOProc callback would, feeding strip 0 a synthetic 440Hz tone, publishing
+`ControlSnapshot`/`MeterSnapshot` exactly like the real thing would. This
+proves the entire UI <-> bridge <-> engine loop end to end -- every
+control in the M8 surface actually reaching a running `Engine`, meters
+actually moving -- without also taking on live device enumeration,
+selection and IOProc (re)registration in the same pass, which is a
+materially riskier piece of work (the M1/M2 log entries below record two
+`coreaudiod` crashes from exactly this class of live-device work) that
+deserves its own review rather than being bundled in. Explicitly the next
+step, not a silently dropped part of scope.
+
+**`loomix-app::control`'s `snapshot_channel`/`SnapshotPublisher`/
+`SnapshotReader` were generalised to `latest_value_channel`/
+`LatestValuePublisher<T>`/`LatestValueReader<T>`, so meters could reuse
+the exact same "latest value wins" crossing as the reconciliation
+snapshot instead of a second, copy-pasted implementation.** `MeterSnapshot`
+(new) wraps `[Meter; NUM_STRIPS]`/`[Meter; NUM_BUSES]`, captured and
+published alongside `ControlSnapshot` every callback -- the crossing
+`Meter`'s own doc comment named as owed "once a UI thread exists," which
+is now. Polled by the frontend much closer to per-frame than
+`ControlSnapshot`'s deliberately low reconciliation rate, since meters
+are meant to move visibly.
+
+**Tauri command arguments/return values are plain, JSON-friendly
+primitives and strings (`set_bus_mode(bus: usize, mode: String)`), not
+`EngineCommand`/`BusMode` serialised directly across the IPC boundary.**
+Neither `BusMode` nor `BusMono` derive `serde::Serialize`/`Deserialize`
+today (only `EqCellParams` does, for `loomix-config`'s existing EQ-file
+format), and adding those derives just to cross an IPC boundary would
+couple `loomix-core`'s public enums to a wire format they don't otherwise
+need. `main.rs`'s `bus_mode_to_str`/`bus_mode_from_str` (and the `BusMono`
+equivalents) are the one, explicit translation point instead -- an unknown
+string from the frontend is a clean `Result::Err` back across `invoke()`,
+not a deserialisation panic.
+
+**A placeholder icon (`icons/icon.png`, a flat mid-grey square, generated
+programmatically) stands in until real branding exists.** `tauri::
+generate_context!` reads an icon at compile time unconditionally, even
+with `bundle.active: false` (packaging itself is M13's job, spec 3.4) --
+without one, the binary doesn't compile at all, dev or not. `bundle.active:
+false` means `cargo tauri build`'s installer/signing path stays inert
+here the same way `release.yml`'s packaging gate already does (M0 log,
+below) until M13 actually needs it.
+
+**Diagnosed, not worked around: `npm run lint`/`typecheck` intermittently
+stalled for minutes during this milestone's `npm install`s, traced to real
+OS-level I/O contention, not a code or config bug.** Sampling the stuck
+`eslint` process (`sample <pid>`) showed its entire call stack inside
+`uv_run` -> `uv__io_poll` -> `AfterStat` -- the Node event loop genuinely
+blocked waiting on a kernel filesystem callback, not spinning in JS. A
+swarm of `mdworker_shared` processes (macOS Spotlight) had spawned in the
+same window as the `npm install`s and `cargo build`s that just created
+hundreds of thousands of small files across `node_modules/` and `target/`
+on a disk that was down to 15GB free at the time. On instruction, fixed at
+the source rather than by retrying or increasing timeouts: `touch
+target/.metadata_never_index ui/node_modules/.metadata_never_index`
+excludes both trees from Spotlight going forward (the marker stops future
+indexing of a directory; it doesn't retroactively cancel an already
+in-flight scan, so the already-queued backlog still had to drain once).
+Confirmed by re-running lint to a genuinely fresh pass afterward, not by
+accepting the clean run from before the contention started -- accepting a
+verification that predates the change it's meant to verify is exactly the
+failure class this project's CLAUDE.md already calls out by name, and
+doing it here anyway would have been the same mistake in a new disguise.
+`eslint-plugin-react-hooks` was also pinned to `^5` instead of the latest
+`^7`: v7 bundles the new React Compiler analysis rule (a ~55K-line
+generated file), which this project doesn't use and which measurably
+worsened the same contention while diagnosing it -- a real, if secondary,
+fix, not the actual root cause.
+
 ## 2026-08-24 — M8 (continued): unchecked indices in `EngineCommand::apply`
 
 **A pushed-commit security review flagged an under-validated sink

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default permissions for the main window -- just enough to invoke this app's own custom commands (spec 3.4 M8). No file system, shell, dialog or other built-in plugin access is granted, since nothing here needs it yet.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

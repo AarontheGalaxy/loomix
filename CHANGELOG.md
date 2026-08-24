@@ -7,6 +7,26 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- App shell and first UI (spec 3.4 M8, in progress): Tauri v2 scaffolding
+  and a React frontend running in-process against the real engine.
+  - `loomix-app::control`: the lock-free UI-to-audio-thread bridge --
+    `EngineCommand`s coalesced per parameter and pushed through an `rtrb`
+    SPSC queue, applied on the audio thread before `process_block`; a
+    `ControlSnapshot`/`MeterSnapshot` published back out over a small
+    "latest value wins" channel for UI reconciliation and live metering.
+    A failed push under load is retried, never dropped; every command's
+    indices are bounds-checked before touching `Engine`, since this runs
+    on the real-time thread.
+  - `loomix-app` gains its `[[bin]]` (`loomix`): Tauri commands for
+    mute/solo/mono, bus assignment, gain layers, bus mute/mono/mode/gain,
+    and both meter/state polling endpoints.
+  - `ui/`: React + Vite, a typed `bridge.ts` command layer, and an `App.tsx`
+    rendering the 8-strip/8-bus grid with faders, mute/solo, bus
+    assignment, a bus-mode selector and live meters.
+  - Not yet wired: real CoreAudio device I/O (the audio thread currently
+    simulates rendering with a synthetic test tone, not a live device) and
+    the EQ graph -- both explicit next steps for this milestone, not
+    dropped scope.
 - Bus modes and patching (spec 3.4 M7): all 12 bus modes (`loomix-core::
   bus_mode`), the composite bus patch, the insert patch, and both pre/post
   switches.
