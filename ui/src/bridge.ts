@@ -71,6 +71,35 @@ export interface MeterSnapshot {
   buses: number[][];
 }
 
+export interface DeviceInfo {
+  uid: string;
+  name: string;
+  input_channels: number;
+  output_channels: number;
+}
+
+export interface AudioStatus {
+  connected: boolean;
+  /** `null` when connected with no input device attached, not just "0 so far". */
+  capture_underruns: number | null;
+}
+
+export function listAudioDevices(): Promise<DeviceInfo[]> {
+  return invoke("list_audio_devices");
+}
+
+export function getAudioStatus(): Promise<AudioStatus> {
+  return invoke("get_audio_status");
+}
+
+export function connectAudio(inputUid: string | null, outputUid: string): Promise<void> {
+  return invoke("connect_audio", { inputUid, outputUid });
+}
+
+export function disconnectAudio(): Promise<void> {
+  return invoke("disconnect_audio");
+}
+
 export function getControlSnapshot(): Promise<ControlSnapshot> {
   return invoke("get_control_snapshot");
 }

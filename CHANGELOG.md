@@ -20,13 +20,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `loomix-app` gains its `[[bin]]` (`loomix`): Tauri commands for
     mute/solo/mono, bus assignment, gain layers, bus mute/mono/mode/gain,
     and both meter/state polling endpoints.
-  - `ui/`: React + Vite, a typed `bridge.ts` command layer, and an `App.tsx`
-    rendering the 8-strip/8-bus grid with faders, mute/solo, bus
-    assignment, a bus-mode selector and live meters.
-  - Not yet wired: real CoreAudio device I/O (the audio thread currently
-    simulates rendering with a synthetic test tone, not a live device) and
-    the EQ graph -- both explicit next steps for this milestone, not
-    dropped scope.
+  - `ui/`: React + Vite, a typed `bridge.ts` command layer, and vertical
+    channel-strip UI -- tall faders beside tall meters, strips filling
+    the window's height, a matching bus row below, plus a device picker
+    in the header.
+  - Meters gained real peak-hold-then-decay ballistics (1.0s hold,
+    20dB/s decay, `docs/DSP.md`) in place of the original plain running
+    max, which read identically whether a channel was loud or had been
+    muted for the whole session.
+  - Real CoreAudio device I/O, replacing the synthetic test tone: a
+    selected output device becomes the clock master (spec 1.19, its bus
+    is always A1) and an optional input device attaches into strip 0,
+    reusing `loomix-app::device_wiring` and `loomix-soak`'s
+    already-proven device-ordering. Verified against real hardware: a
+    real output device connects and stays stable; real microphone
+    capture is wired correctly but currently blocked by a TCC
+    permission gate specific to running an unbundled dev binary (not a
+    bug -- see `docs/ARCHITECTURE.md`), the same finding `loomix-soak`'s
+    own history already recorded for capture devices.
+  - Not yet wired: the EQ graph.
 - Bus modes and patching (spec 3.4 M7): all 12 bus modes (`loomix-core::
   bus_mode`), the composite bus patch, the insert patch, and both pre/post
   switches.

@@ -5,8 +5,12 @@ import {
   CHANNELS,
   NUM_BUSES,
   NUM_STRIPS,
+  connectAudio,
+  disconnectAudio,
+  getAudioStatus,
   getControlSnapshot,
   getMeters,
+  listAudioDevices,
   setBusGain,
   setBusMode,
   setBusMute,
@@ -15,7 +19,9 @@ import {
   setStripMono,
   setStripMute,
   setStripSolo,
+  type AudioStatus,
   type ControlSnapshot,
+  type DeviceInfo,
   type MeterSnapshot,
 } from "./bridge";
 
@@ -33,6 +39,9 @@ const CONTROL_POLL_MS = 500;
 // Meters are meant to move visibly, so this polls much closer to the
 // audio thread's own publish rate.
 const METER_POLL_MS = 50;
+// The device list rarely changes mid-session; polling it at the control
+// rate would just be wasted enumeration calls.
+const DEVICE_POLL_MS = 3000;
 
 function peakToUnit(level: number): number {
   return Math.min(1, Math.max(0, level));
@@ -162,14 +171,107 @@ function BusColumn({ index, snapshot, meterLevels, selected, onSelect, onChange 
   );
 }
 
+interface DevicePickerProps {
+  devices: DeviceInfo[];
+  status: AudioStatus | null;
+  onConnectionChange: () => void;
+}
+
+function DevicePicker({ devices, status, onConnectionChange }: DevicePickerProps) {
+  const inputs = devices.filter((d) => d.input_channels > 0);
+  const outputs = devices.filter((d) => d.output_channels > 0);
+  const [inputUid, setInputUid] = useState("");
+  const [outputUid, setOutputUid] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const connected = status?.connected ?? false;
+
+  const connect = () => {
+    if (!outputUid) {
+      setError("choose an output device first");
+      return;
+    }
+    setConnecting(true);
+    setError(null);
+    void connectAudio(inputUid || null, outputUid)
+      .then(onConnectionChange)
+      .catch((e: unknown) => setError(String(e)))
+      .finally(() => setConnecting(false));
+  };
+
+  const disconnect = () => {
+    void disconnectAudio().then(onConnectionChange);
+  };
+
+  return (
+    <div className="device-picker">
+      <select
+        className="device-select"
+        value={inputUid}
+        onChange={(e) => setInputUid(e.target.value)}
+        disabled={connected}
+      >
+        <option value="">No input</option>
+        {inputs.map((d) => (
+          <option key={d.uid} value={d.uid}>
+            {d.name} ({d.input_channels}ch in)
+          </option>
+        ))}
+      </select>
+      <select
+        className="device-select"
+        value={outputUid}
+        onChange={(e) => setOutputUid(e.target.value)}
+        disabled={connected}
+      >
+        <option value="">Choose output...</option>
+        {outputs.map((d) => (
+          <option key={d.uid} value={d.uid}>
+            {d.name} ({d.output_channels}ch out)
+          </option>
+        ))}
+      </select>
+      {connected ? (
+        <button className="device-connect" onClick={disconnect}>
+          Disconnect
+        </button>
+      ) : (
+        <button className="device-connect" onClick={connect} disabled={connecting}>
+          {connecting ? "Connecting..." : "Connect"}
+        </button>
+      )}
+      <span className="device-status">
+        {connected
+          ? `Connected${
+              status?.capture_underruns != null
+                ? ` -- ${status.capture_underruns} input underrun(s)`
+                : ""
+            }`
+          : "Not connected"}
+      </span>
+      {error && <span className="device-error">{error}</span>}
+    </div>
+  );
+}
+
 export default function App() {
   const [snapshot, setSnapshot] = useState<ControlSnapshot | null>(null);
   const [meters, setMeters] = useState<MeterSnapshot | null>(null);
   const [selectedBus, setSelectedBus] = useState(0);
+  const [devices, setDevices] = useState<DeviceInfo[]>([]);
+  const [audioStatus, setAudioStatus] = useState<AudioStatus | null>(null);
   const pendingRefresh = useRef(false);
 
   const refreshControl = () => {
     void getControlSnapshot().then(setSnapshot);
+  };
+
+  const refreshDevices = () => {
+    void listAudioDevices().then(setDevices);
+  };
+
+  const refreshStatus = () => {
+    void getAudioStatus().then(setAudioStatus);
   };
 
   useEffect(() => {
@@ -182,6 +284,18 @@ export default function App() {
     const id = setInterval(() => {
       void getMeters().then(setMeters);
     }, METER_POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    refreshDevices();
+    const id = setInterval(refreshDevices, DEVICE_POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    refreshStatus();
+    const id = setInterval(refreshStatus, CONTROL_POLL_MS);
     return () => clearInterval(id);
   }, []);
 
@@ -203,11 +317,23 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Loomix</h1>
-        <p className="app-subtitle">
-          Editing gain layers for bus <strong>{BUS_LABELS[selectedBus]}</strong> -- select a bus
-          below to edit its layer instead.
-        </p>
+        <div className="app-header-row">
+          <div>
+            <h1>Loomix</h1>
+            <p className="app-subtitle">
+              Editing gain layers for bus <strong>{BUS_LABELS[selectedBus]}</strong> -- select a
+              bus below to edit its layer instead.
+            </p>
+          </div>
+          <DevicePicker
+            devices={devices}
+            status={audioStatus}
+            onConnectionChange={() => {
+              refreshStatus();
+              refreshControl();
+            }}
+          />
+        </div>
       </header>
       <div className="mixer">
         <section className="strip-rack">
@@ -236,10 +362,7 @@ export default function App() {
           ))}
         </section>
       </div>
-      <footer className="app-footer">
-        {CHANNELS} channels per bus -- strip processing, the EQ graph and device selection land
-        next.
-      </footer>
+      <footer className="app-footer">{CHANNELS} channels per bus -- the EQ graph lands next.</footer>
     </div>
   );
 }

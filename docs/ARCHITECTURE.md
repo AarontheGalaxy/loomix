@@ -5,6 +5,83 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-24 — M8 (continued): real device I/O, and a real TCC wall found, not assumed
+
+**The synthetic test tone is gone.** `main.rs`'s `connect_audio` wires a
+real output device as the clock master (spec 1.19 -- its bus is always
+A1/bus 0) and, optionally, a real input device into strip 0, using
+`loomix-app::device_wiring::attach_capture_device` and a hand-inlined
+equivalent of `attach_master_device` (inlined, not called directly,
+specifically so the command-drain step and the `ControlSnapshot`/
+`MeterSnapshot` publishes could sit inside the exact same real-time
+callback the master device drives -- `docs/ARCHITECTURE.md`'s earlier M8
+entries already established that pattern for the simulated thread this
+replaces). The ordering is `loomix-soak`'s own proven ordering, not a new
+invention: every non-master device attached first, the master attached
+last, since starting it takes the driver by value and runs it
+immediately. `loomix_hal::device::nominal_sample_rate` (new, small,
+read-only) lets `Engine::set_sample_rate` follow the real selected
+output device's actual rate instead of assuming 48kHz, per spec 1.11.
+
+**Host-testable work was done and verified on the host before a device
+was ever touched, per direct instruction:** the new `nominal_sample_rate`
+function has its own real-enumeration test (same pattern as
+`device.rs`'s existing ones, read-only, safe in CI), and the full
+`cargo fmt` / `clippy` / `cargo test --workspace` pass was green before
+`cargo tauri dev` ever ran. Only once that was clean did the running app
+become the final confirmation, not the debugging loop.
+
+**Verified live, with two distinct real outcomes, not one assumed
+success:**
+
+1. **Output-only: real, clean, verified.** Selected the machine's actual
+   `MacBook Pro Hoparlörü` (Speakers) via the picker (using the
+   Accessibility API again, as established in the earlier M8 entries --
+   `AXPress`/`click` on a WebKit `<select>` doesn't open its native menu
+   the same way a real event does, so this used a genuine synthetic
+   mouse click at the element's actual screen coordinates instead, the
+   same class of finding as the fader's `AXIncrement`-vs-`AXValue`
+   distinction earlier). Connected cleanly, stayed connected, `coreaudiod`
+   stayed healthy (CPU nominal, every other driver on the machine --
+   BlackHole, this project's own `LoomixAudioDriver.driver`, several
+   others -- still running normally) for the whole session. Disconnected
+   cleanly on request.
+
+2. **Input capture: wired correctly, blocked by a real TCC gate, exactly
+   as `loomix-soak`'s own log already predicted for this class of
+   process.** Selecting the real `MacBook Pro Mikrofonu` (built-in
+   microphone) and connecting produced a *stable, non-crashing* session
+   with the capture-underrun counter climbing without bound (tens of
+   thousands within 1.5s, over a million within 5s) -- 100% underrun, not
+   corrupted or partial audio. This is the identical finding
+   `loomix-soak`'s own module doc already recorded for capture devices:
+   "a first version defaulting to the system input device measured 100%
+   underrun... a TCC permission gate on this specific machine and
+   process, not a bug in the wiring." `cargo tauri dev` runs a bare
+   `target/debug/loomix` executable, not a signed `.app` bundle with an
+   `NSMicrophoneUsageDescription` Info.plist entry -- there is no bundle
+   identity for TCC to prompt on, so the request is silently denied
+   rather than surfaced. `TCC.db` itself is SIP-protected and couldn't be
+   read directly to confirm the denial by inspection; the sustained,
+   total underrun count is the evidence instead, and the graceful
+   handling of it (zero dropped frames misreported as real audio, no
+   crash, no wedge, an honestly climbing counter the UI actually shows)
+   is exactly what `ioproc.rs`'s underrun-fills-silence design was built
+   to do under real starvation, not just the synthetic gaps its own
+   tests construct.
+
+**Net effect: the output path is proven end to end against real
+hardware; the input path is proven correct in code but not yet
+demonstrated audibly, and that gap is a macOS permission fact, not an
+open bug.** Fixing it needs either a one-time manual grant (Terminal, or
+whatever process TCC ends up attributing this to, added under System
+Settings > Privacy & Security > Microphone) for local development, or --
+the real, durable fix -- a properly signed and bundled `.app` with a
+`NSMicrophoneUsageDescription`, which is M13's packaging milestone, not
+something to bolt onto a dev-mode `cargo tauri dev` binary now. Recorded
+here rather than papered over, the same discipline every TCC/permission
+finding in this log already gets.
+
 ## 2026-08-24 — M8 (continued): the layout read as a settings panel, not a mixer
 
 **Found by the user looking at the running app, not by review of the

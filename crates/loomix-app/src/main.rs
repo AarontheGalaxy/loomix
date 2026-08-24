@@ -2,45 +2,74 @@
 //! bridge to a running `Engine` and exposes it to the React frontend as a
 //! set of `#[tauri::command]`s.
 //!
-//! **Deliberately not wired to real device I/O yet.** `spawn_audio_thread`
-//! below simulates the audio thread with a timer-paced loop and a
-//! synthetic 440Hz test tone on strip 0, not `loomix-hal`'s real IOProc
-//! callbacks (`engine_io`/`device_wiring`, already built in M4). This
-//! proves the whole UI <-> bridge <-> engine loop end to end -- live
-//! meters, mute/solo/fader/bus-mode controls actually reaching a real
-//! `Engine` -- without also taking on live CoreAudio device selection in
-//! the same pass; that's the explicit next step, not a silently dropped
-//! part of spec 3.4 M8's scope. See `docs/ARCHITECTURE.md`.
+//! **Real CoreAudio device I/O**, replacing the synthetic test tone the
+//! first version of this file used to prove the UI <-> bridge <-> engine
+//! loop end to end without also taking on live device (re)registration in
+//! the same pass. That pass is over: [`connect_audio`] wires a real
+//! output device as the clock master (spec 1.19 -- its bus is always A1)
+//! and, optionally, a real input device into strip 0, using exactly
+//! `loomix-app::device_wiring`'s functions and `loomix-soak`'s proven
+//! ordering (every non-master device attached first, the master attached
+//! last since it takes the driver by value and starts running
+//! immediately) -- no new device-I/O logic, only wiring already-tested
+//! pieces together for the first time from a live UI action instead of a
+//! manual soak run. See `docs/ARCHITECTURE.md` for what was verified on
+//! the host before this ever touched a real device, and why.
+//!
+//! There is no engine running at all until [`connect_audio`] succeeds --
+//! [`AppState::session`] is `None` until then, and every command below
+//! degrades to an inert default rather than panicking on a device that
+//! was never selected.
 
 use loomix_app::control::{
     self, BusSnapshot, CommandSink, ControlSnapshot, EngineCommand, LatestValueReader,
     MeterSnapshot, StripSnapshot,
 };
+use loomix_app::device_wiring::attach_capture_device;
+use loomix_app::engine_io::{select_clock_master, DropoutCounter, EngineIoDriver};
 use loomix_core::bus::BusMono;
 use loomix_core::bus_mode::BusMode;
-use loomix_core::{Engine, Frame, CHANNELS, NUM_BUSES, NUM_STRIPS};
-use std::sync::Mutex;
-use std::time::Duration;
+use loomix_core::{Engine, CHANNELS, NUM_BUSES};
+use loomix_hal::clock::{ClockSource, DeviceId};
+use loomix_hal::device::{
+    channel_count, device_name, device_uid, list_device_ids, nominal_sample_rate, Direction,
+    MasterTickCallback,
+};
+use loomix_hal::device_lifecycle::{CaptureIoProcHandle, MasterIoProcHandle};
+use loomix_hal::drift::{DriftCorrector, PiController};
+use loomix_hal::master_clock::MasterClock;
+use std::sync::{Arc, Mutex};
 use tauri::State;
 
 const RECONCILE_QUEUE_CAPACITY: usize = 8;
-const SAMPLE_RATE: f32 = 48_000.0;
-const BLOCK_LEN: usize = 128;
-const TEST_TONE_HZ: f32 = 440.0;
-const TEST_TONE_PEAK: f32 = 0.4;
-/// A constant-level test tone gives the meters nothing to show: a peak
-/// reached once and held forever looks identical to a stuck channel,
-/// which is exactly the bug the M8 log's meter-ballistics entry
-/// (`docs/ARCHITECTURE.md`) just fixed. A slow envelope makes the level
-/// actually move -- rising and falling over several seconds -- so both
-/// the live tracking and the 1s-hold/20dB-per-s decay are visible in
-/// motion, not just provable in a unit test.
-const ENVELOPE_PERIOD_S: f32 = 6.0;
+/// Matches `loomix-soak`'s already-proven values exactly, not retuned
+/// here: `RING_CAPACITY` comfortably absorbs scheduling jitter,
+/// `MAX_BLOCK_FRAMES` covers spec 1.11's full buffer-size range
+/// (128..2048 samples) so `EngineIoDriver`'s pre-allocated scratch
+/// buffers never need to grow inside a real callback.
+const RING_CAPACITY: usize = 1 << 16;
+const MAX_BLOCK_FRAMES: usize = 2048;
+/// The strip a connected input device's captured audio lands on. Strip 0
+/// (spec 1.1's "HW 1") was already the UI's implicit "the active strip"
+/// convention from the synthetic-tone version this replaces.
+const INPUT_STRIP: usize = 0;
+
+/// Everything a live audio connection owns: the two bridge halves the
+/// Tauri commands below talk to, and the device handles that keep the
+/// real I/O running -- dropping either handle stops and unregisters that
+/// device (`loomix-hal`'s own `Drop` impls), which is exactly what
+/// [`disconnect_audio`] relies on rather than any explicit teardown call.
+struct AudioSession {
+    sink: CommandSink,
+    control_reader: LatestValueReader<ControlSnapshot>,
+    meter_reader: LatestValueReader<MeterSnapshot>,
+    capture_underruns: Option<DropoutCounter>,
+    _capture: Option<CaptureIoProcHandle>,
+    _master: MasterIoProcHandle,
+}
 
 struct AppState {
-    sink: Mutex<CommandSink>,
-    control_reader: Mutex<LatestValueReader<ControlSnapshot>>,
-    meter_reader: Mutex<LatestValueReader<MeterSnapshot>>,
+    session: Mutex<Option<AudioSession>>,
 }
 
 fn bus_mono_to_str(mono: BusMono) -> &'static str {
@@ -169,24 +198,93 @@ impl From<MeterSnapshot> for MeterSnapshotDto {
     }
 }
 
+#[derive(serde::Serialize)]
+struct DeviceInfoDto {
+    uid: String,
+    name: String,
+    input_channels: usize,
+    output_channels: usize,
+}
+
+#[derive(serde::Serialize)]
+struct AudioStatusDto {
+    connected: bool,
+    /// `None` when connected with no input device attached, not just
+    /// "zero so far" -- the UI needs to tell "no input selected" apart
+    /// from "input selected, draining cleanly".
+    capture_underruns: Option<u64>,
+}
+
+#[tauri::command]
+fn list_audio_devices() -> Result<Vec<DeviceInfoDto>, String> {
+    let ids = list_device_ids().map_err(|e| format!("CoreAudio error {e}"))?;
+    let mut out = Vec::new();
+    for id in ids {
+        let uid = device_uid(id).unwrap_or_default();
+        if uid.is_empty() {
+            continue; // an object CoreAudio listed but won't identify -- nothing to select
+        }
+        let input_channels = channel_count(id, Direction::Input).unwrap_or(0);
+        let output_channels = channel_count(id, Direction::Output).unwrap_or(0);
+        if input_channels == 0 && output_channels == 0 {
+            continue;
+        }
+        out.push(DeviceInfoDto {
+            uid,
+            name: device_name(id).unwrap_or_default(),
+            input_channels,
+            output_channels,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn get_audio_status(state: State<AppState>) -> AudioStatusDto {
+    let session = state.session.lock().unwrap();
+    match session.as_ref() {
+        Some(s) => AudioStatusDto {
+            connected: true,
+            capture_underruns: s.capture_underruns.as_ref().map(DropoutCounter::get),
+        },
+        None => AudioStatusDto {
+            connected: false,
+            capture_underruns: None,
+        },
+    }
+}
+
 #[tauri::command]
 fn get_control_snapshot(state: State<AppState>) -> ControlSnapshotDto {
-    state.control_reader.lock().unwrap().read().into()
+    let mut session = state.session.lock().unwrap();
+    match session.as_mut() {
+        Some(s) => s.control_reader.read().into(),
+        None => ControlSnapshot::default().into(),
+    }
 }
 
 #[tauri::command]
 fn get_meters(state: State<AppState>) -> MeterSnapshotDto {
-    state.meter_reader.lock().unwrap().read().into()
+    let mut session = state.session.lock().unwrap();
+    match session.as_mut() {
+        Some(s) => s.meter_reader.read().into(),
+        None => MeterSnapshot::default().into(),
+    }
 }
 
 /// Enqueues and immediately flushes: a plain button/dropdown/slider
 /// commit is already a discrete, infrequent event, so there's no
 /// coalescing benefit to batching across a timer tick the way a
 /// continuous fader-drag UI eventually will (`docs/ARCHITECTURE.md`).
+/// A silent no-op when nothing is connected -- there's no engine for the
+/// command to reach yet, and refusing every control loudly before the
+/// user has picked a device would be noise, not useful feedback.
 fn send(state: &State<AppState>, command: EngineCommand) {
-    let mut sink = state.sink.lock().unwrap();
-    sink.enqueue(command);
-    sink.flush();
+    let mut session = state.session.lock().unwrap();
+    if let Some(s) = session.as_mut() {
+        s.sink.enqueue(command);
+        s.sink.flush();
+    }
 }
 
 #[tauri::command]
@@ -238,71 +336,118 @@ fn set_bus_gain(state: State<AppState>, bus: usize, db: f32) {
     send(&state, EngineCommand::SetBusGain(bus, db));
 }
 
-/// Simulates the real-time thread: never blocks on anything but its own
-/// pacing sleep, drains commands and calls `process_block` exactly the
-/// way a real IOProc callback would (`docs/ARCHITECTURE.md`'s M8 entries
-/// on why this isn't real device I/O yet). Owns `Engine` exclusively --
-/// nothing outside this thread ever touches it, only the two bridge
-/// channels.
-fn spawn_audio_thread(
-    mut drain: control::CommandDrain,
-    mut control_pub: control::LatestValuePublisher<ControlSnapshot>,
-    mut meter_pub: control::LatestValuePublisher<MeterSnapshot>,
-) {
-    std::thread::spawn(move || {
-        let mut engine = Engine::new();
-        engine.set_sample_rate(SAMPLE_RATE);
-        let block_duration = Duration::from_secs_f32(BLOCK_LEN as f32 / SAMPLE_RATE);
-        let mut phase = 0.0f32;
-        let mut envelope_phase = 0.0f32;
-
-        loop {
-            drain.drain_into(&mut engine, 64);
-
-            let mut inputs: Vec<Vec<Frame>> = (0..NUM_STRIPS)
-                .map(|_| vec![[0.0; CHANNELS]; BLOCK_LEN])
-                .collect();
-            for frame in inputs[0].iter_mut() {
-                // Raised cosine, 0 -> 1 -> 0 once per ENVELOPE_PERIOD_S:
-                // a smooth swell, not a hard on/off gate.
-                let envelope = 0.5 - 0.5 * (envelope_phase * std::f32::consts::TAU).cos();
-                let sample = (phase * std::f32::consts::TAU).sin() * TEST_TONE_PEAK * envelope;
-                frame[0] = sample;
-                frame[1] = sample;
-                phase = (phase + TEST_TONE_HZ / SAMPLE_RATE).fract();
-                envelope_phase = (envelope_phase + 1.0 / (ENVELOPE_PERIOD_S * SAMPLE_RATE)).fract();
-            }
-            let input_refs: Vec<&[Frame]> = inputs.iter().map(|v| v.as_slice()).collect();
-            let mut out_bufs: Vec<Vec<Frame>> = vec![vec![[0.0; CHANNELS]; BLOCK_LEN]; NUM_BUSES];
-            {
-                let mut out_refs: Vec<&mut [Frame]> =
-                    out_bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
-                engine.process_block(&input_refs, &mut out_refs);
-            }
-
-            control_pub.publish(ControlSnapshot::capture(&engine));
-            meter_pub.publish(MeterSnapshot::capture(&engine));
-
-            std::thread::sleep(block_duration);
+fn resolve_uid(uid: &str) -> Result<DeviceId, String> {
+    let ids = list_device_ids().map_err(|e| format!("CoreAudio error {e}"))?;
+    for id in ids {
+        if device_uid(id).map(|u| u == uid).unwrap_or(false) {
+            return Ok(id);
         }
+    }
+    Err(format!("no device with UID '{uid}' found (it may have been unplugged since the picker was last refreshed)"))
+}
+
+/// Tears down any existing connection and wires a fresh one: `output_uid`
+/// becomes the clock master (spec 1.19 -- its bus is always A1/bus 0),
+/// and, if given, `input_uid` is attached as a drift-corrected capture
+/// device feeding [`INPUT_STRIP`]. Mirrors `loomix-soak`'s exact,
+/// already-proven ordering: every non-master device is attached first,
+/// the master last, since `attach_master_device`'s underlying
+/// `MasterIoProcHandle::start` takes the driver by value and starts it
+/// running immediately (`docs/ARCHITECTURE.md`).
+#[tauri::command]
+fn connect_audio(
+    state: State<AppState>,
+    input_uid: Option<String>,
+    output_uid: String,
+) -> Result<(), String> {
+    // Drop the old session (if any) before building the new one -- its
+    // `Drop` impls stop and unregister the previous devices cleanly.
+    *state.session.lock().unwrap() = None;
+
+    let output_id = resolve_uid(&output_uid)?;
+    let output_channels =
+        channel_count(output_id, Direction::Output).map_err(|e| format!("CoreAudio error {e}"))?;
+    if output_channels == 0 {
+        return Err(format!("{output_uid} has no output channels"));
+    }
+    match select_clock_master(Some(output_id)).map_err(|e| format!("CoreAudio error {e}"))? {
+        ClockSource::Device(id) if id == output_id => {}
+        _ => return Err(format!("{output_uid} is not currently connected")),
+    }
+    let sample_rate = nominal_sample_rate(output_id).map_err(|e| format!("CoreAudio error {e}"))?;
+
+    let mut engine = Engine::new();
+    engine.set_sample_rate(sample_rate as f32);
+    let master_clock = Arc::new(MasterClock::default());
+    let mut driver = EngineIoDriver::new(engine, master_clock.clone(), None, MAX_BLOCK_FRAMES);
+
+    let (capture_handle, capture_underruns) = match input_uid {
+        Some(input_uid) => {
+            let input_id = resolve_uid(&input_uid)?;
+            let input_channels = channel_count(input_id, Direction::Input)
+                .map_err(|e| format!("CoreAudio error {e}"))?
+                .min(CHANNELS);
+            if input_channels == 0 {
+                return Err(format!("{input_uid} has no input channels"));
+            }
+            // Same PI gains and discontinuity threshold as loomix-soak's
+            // proven values -- not retuned here.
+            let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
+            let attached = attach_capture_device(
+                &mut driver,
+                INPUT_STRIP,
+                input_id,
+                input_channels,
+                master_clock.clone(),
+                corrector,
+                RING_CAPACITY,
+            )
+            .map_err(|e| format!("failed to start capture on {input_uid}: CoreAudio error {e}"))?;
+            (Some(attached.io), Some(attached.dropouts))
+        }
+        None => (None, None),
+    };
+
+    let (sink, mut drain) = control::control_channel();
+    let (mut control_pub, control_reader) = control::snapshot_channel(RECONCILE_QUEUE_CAPACITY);
+    let (mut meter_pub, meter_reader) =
+        control::latest_value_channel::<MeterSnapshot>(RECONCILE_QUEUE_CAPACITY);
+
+    let callback: MasterTickCallback = Box::new(move |frames, input, output| {
+        drain.drain_into(driver.engine_mut(), 64);
+        driver.on_master_tick(frames as usize, input, output);
+        control_pub.publish(ControlSnapshot::capture(driver.engine_mut()));
+        meter_pub.publish(MeterSnapshot::capture(driver.engine_mut()));
     });
+    let master = MasterIoProcHandle::start(output_id, callback)
+        .map_err(|e| format!("failed to start output on {output_uid}: CoreAudio error {e}"))?;
+
+    *state.session.lock().unwrap() = Some(AudioSession {
+        sink,
+        control_reader,
+        meter_reader,
+        capture_underruns,
+        _capture: capture_handle,
+        _master: master,
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn disconnect_audio(state: State<AppState>) {
+    *state.session.lock().unwrap() = None;
 }
 
 fn main() {
-    let (sink, drain) = control::control_channel();
-    let (control_publisher, control_reader) = control::snapshot_channel(RECONCILE_QUEUE_CAPACITY);
-    let (meter_publisher, meter_reader) =
-        control::latest_value_channel::<MeterSnapshot>(RECONCILE_QUEUE_CAPACITY);
-
-    spawn_audio_thread(drain, control_publisher, meter_publisher);
-
     tauri::Builder::default()
         .manage(AppState {
-            sink: Mutex::new(sink),
-            control_reader: Mutex::new(control_reader),
-            meter_reader: Mutex::new(meter_reader),
+            session: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
+            list_audio_devices,
+            get_audio_status,
+            connect_audio,
+            disconnect_audio,
             get_control_snapshot,
             get_meters,
             set_strip_mute,
