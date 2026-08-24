@@ -5,6 +5,43 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-24 — M8 (continued): unchecked indices in `EngineCommand::apply`
+
+**A pushed-commit security review flagged an under-validated sink
+argument in `loomix-app::control`: `EngineCommand::apply`'s strip/bus/
+channel/cell indices went straight into array indexing (`engine.
+strips[s]`, `ParametricEq::set_cell`'s internal `cells[cell]`) with no
+range check at all.** `EngineCommand` has no `TryFrom`/range type of its
+own -- any `usize` constructs one -- and the intended validation point
+(the UI/Tauri-command layer, "validate at a system boundary" per
+`parametric_eq::EqCellParams::freq_hz`'s own doc comment) doesn't exist
+yet. `apply` runs on the audio thread inside `CommandDrain::drain_into`,
+so an out-of-range index reaching it would panic there, not in an HTTP
+handler -- the worst place in this codebase for a panic, and a real
+concern once a Tauri command layer exists for a compromised or merely
+buggy frontend to reach it from, not a hypothetical.
+
+Fixed by bounds-checking every index in `apply` itself before indexing
+anything, silently skipping the command if any index is out of range --
+the same "harmless no-op" shape the existing virtual-strip EQ-command
+case already used, generalised. This is deliberately a second line of
+defence, not a replacement for real UI-layer validation once that layer
+exists: a sink this catastrophic to get wrong shouldn't rely on every
+future caller remembering to check first.
+`out_of_range_indices_are_ignored_not_panicked` drives one
+representative out-of-range case per index shape in the file (strip-only,
+bus-only, both, and the EQ commands' extra channel/cell indices) through
+both `apply` directly and the real `CommandSink`/`CommandDrain` path,
+and confirms no engine state changes and nothing panics.
+
+The finding surfaced through a background commit-security-review
+notification attached to an unrelated user turn, formatted oddly enough
+(garbled repeated text, a stray escaped closing tag) to be worth
+independently re-verifying against the actual code before acting on it,
+rather than trusting the notification's own framing -- the underlying
+claim held up, so it was fixed on its merits, logged here the same way
+any other reviewer-caught bug would be.
+
 ## 2026-08-24 — M8 (continued): the UI <-> audio-thread bridge
 
 **`loomix-app::control`** implements the two one-way, lock-free crossings

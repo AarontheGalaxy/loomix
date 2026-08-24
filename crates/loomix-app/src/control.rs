@@ -23,9 +23,13 @@
 
 use loomix_core::bus::BusMono;
 use loomix_core::bus_mode::BusMode;
-use loomix_core::parametric_eq::EqCellParams;
+use loomix_core::parametric_eq::{EqCellParams, NUM_CELLS};
 use loomix_core::strip_dsp::StripChain;
-use loomix_core::{Engine, NUM_BUSES, NUM_STRIPS};
+use loomix_core::{Engine, CHANNELS, NUM_BUSES, NUM_STRIPS};
+
+/// spec 1.2 step 7: the hardware strip EQ is stereo, unlike the bus EQ's
+/// independent [`CHANNELS`] (8).
+const STRIP_EQ_CHANNELS: usize = 2;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -97,28 +101,84 @@ impl EngineCommand {
         }
     }
 
-    /// Applies directly to `Engine`. Only ever called from the audio
-    /// thread's drain step ([`CommandDrain::drain_into`]) -- every variant
-    /// is a plain field/array write or an existing non-allocating setter,
-    /// so this never allocates.
+    /// Applies directly to `Engine` if every index the command carries is
+    /// in range, and is a silent no-op otherwise. Only ever called from
+    /// the audio thread's drain step ([`CommandDrain::drain_into`]) --
+    /// every variant is a plain field/array write or an existing
+    /// non-allocating setter, so this never allocates.
+    ///
+    /// Bounds-checked here, not just trusted from the caller: an
+    /// `EngineCommand` is built from plain `usize` indices with no
+    /// `TryFrom`/range type of its own, and the intended validation point
+    /// -- the UI/Tauri-command layer that will construct these (same
+    /// "validate at a system boundary" convention as
+    /// `parametric_eq::EqCellParams::freq_hz`'s own doc comment) -- didn't
+    /// exist when this module was written and, even once it does, is a
+    /// second, separate piece of code a future change could get wrong.
+    /// Every other index-taking codepath in this file (`key`,
+    /// `CommandSink`, `CommandDrain`) is safe *because* it never indexes
+    /// anything itself -- this is the one place that actually does, on
+    /// the one thread where an unchecked out-of-range index (a bug, or a
+    /// compromised/buggy frontend once one exists) would panic on real
+    /// audio hardware's callback rather than fail an HTTP request.
     fn apply(self, engine: &mut Engine) {
         match self {
-            Self::SetStripMute(s, on) => engine.strips[s].mute = on,
-            Self::SetStripSolo(s, on) => engine.strips[s].solo = on,
-            Self::SetStripMono(s, on) => engine.strips[s].mono = on,
-            Self::SetStripBusAssign(s, b, on) => engine.strips[s].bus_assign[b] = on,
-            Self::SetStripGainLayer(s, b, db) => engine.strips[s].set_gain_layer_db(b, db),
-            Self::SetBusMute(b, on) => engine.buses[b].mute = on,
-            Self::SetBusMono(b, mono) => engine.buses[b].mono = mono,
-            Self::SetBusMode(b, mode) => engine.buses[b].mode = mode,
-            Self::SetBusGain(b, db) => engine.buses[b].set_gain_db(db),
+            Self::SetStripMute(s, on) => {
+                if s < NUM_STRIPS {
+                    engine.strips[s].mute = on;
+                }
+            }
+            Self::SetStripSolo(s, on) => {
+                if s < NUM_STRIPS {
+                    engine.strips[s].solo = on;
+                }
+            }
+            Self::SetStripMono(s, on) => {
+                if s < NUM_STRIPS {
+                    engine.strips[s].mono = on;
+                }
+            }
+            Self::SetStripBusAssign(s, b, on) => {
+                if s < NUM_STRIPS && b < NUM_BUSES {
+                    engine.strips[s].bus_assign[b] = on;
+                }
+            }
+            Self::SetStripGainLayer(s, b, db) => {
+                if s < NUM_STRIPS && b < NUM_BUSES {
+                    engine.strips[s].set_gain_layer_db(b, db);
+                }
+            }
+            Self::SetBusMute(b, on) => {
+                if b < NUM_BUSES {
+                    engine.buses[b].mute = on;
+                }
+            }
+            Self::SetBusMono(b, mono) => {
+                if b < NUM_BUSES {
+                    engine.buses[b].mono = mono;
+                }
+            }
+            Self::SetBusMode(b, mode) => {
+                if b < NUM_BUSES {
+                    engine.buses[b].mode = mode;
+                }
+            }
+            Self::SetBusGain(b, db) => {
+                if b < NUM_BUSES {
+                    engine.buses[b].set_gain_db(db);
+                }
+            }
             Self::SetStripEqCell(s, ch, cell, params) => {
-                if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
-                    chain.eq.set_cell(ch, cell, params);
+                if s < NUM_STRIPS && ch < STRIP_EQ_CHANNELS && cell < NUM_CELLS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.eq.set_cell(ch, cell, params);
+                    }
                 }
             }
             Self::SetBusEqCell(b, ch, cell, params) => {
-                engine.buses[b].eq.set_cell(ch, cell, params)
+                if b < NUM_BUSES && ch < CHANNELS && cell < NUM_CELLS {
+                    engine.buses[b].eq.set_cell(ch, cell, params);
+                }
             }
         }
     }
@@ -548,6 +608,71 @@ mod tests {
         ));
         sink.flush();
         assert_eq!(drain.drain_into(&mut engine, 64), 1);
+    }
+
+    /// An `EngineCommand`'s indices come straight from whatever
+    /// constructs it, with no `TryFrom`/range type of its own -- once a
+    /// Tauri command layer exists, that's a buggy-or-compromised frontend
+    /// away from an out-of-range index. Proves `apply`'s bounds checks
+    /// actually stop the panic that unchecked indexing would otherwise
+    /// produce (`engine.strips[999]` etc.), for a representative variant
+    /// of every index shape this file has (strip-only, bus-only, both,
+    /// and the EQ commands' extra channel/cell indices), not just that
+    /// the well-formed cases already covered elsewhere happen to work.
+    #[test]
+    fn out_of_range_indices_are_ignored_not_panicked() {
+        let (mut sink, mut drain) = control_channel();
+        let mut engine = Engine::new();
+        let eq_params = EqCellParams {
+            on: true,
+            cell_type: loomix_core::parametric_eq::EqCellType::Peak,
+            freq_hz: 1000.0,
+            gain_db: 6.0,
+            q: 1.0,
+        };
+
+        let out_of_range = [
+            EngineCommand::SetStripMute(NUM_STRIPS, true),
+            EngineCommand::SetBusMute(NUM_BUSES, true),
+            EngineCommand::SetStripBusAssign(NUM_STRIPS, 0, true),
+            EngineCommand::SetStripBusAssign(0, NUM_BUSES, true),
+            EngineCommand::SetStripGainLayer(usize::MAX, 0, -6.0),
+            EngineCommand::SetStripEqCell(NUM_STRIPS, 0, 0, eq_params),
+            EngineCommand::SetStripEqCell(0, STRIP_EQ_CHANNELS, 0, eq_params),
+            EngineCommand::SetStripEqCell(0, 0, NUM_CELLS, eq_params),
+            EngineCommand::SetBusEqCell(NUM_BUSES, 0, 0, eq_params),
+            EngineCommand::SetBusEqCell(0, CHANNELS, 0, eq_params),
+            EngineCommand::SetBusEqCell(0, 0, NUM_CELLS, eq_params),
+        ];
+        let before = ControlSnapshot::capture(&engine);
+        for command in out_of_range {
+            command.apply(&mut engine); // must not panic
+        }
+        assert_eq!(
+            ControlSnapshot::capture(&engine),
+            before,
+            "no out-of-range command should have changed any in-range state either"
+        );
+
+        // The drain path itself doesn't panic or wedge on these either --
+        // it just counts them as drained (removed from the queue) with no
+        // effect, the same as any other applied-but-inert command.
+        for command in out_of_range {
+            sink.enqueue(command);
+        }
+        // Every command above has a distinct `ParamKey` except the three
+        // `SetStripEqCell`/`SetBusEqCell` pairs sharing an (s,ch,cell) --
+        // coalescing collapses those, so fewer than 11 end up pending.
+        sink.flush();
+        let mut applied = 0;
+        loop {
+            let n = drain.drain_into(&mut engine, 64);
+            applied += n;
+            if n == 0 {
+                break;
+            }
+        }
+        assert!(applied > 0, "the queue should still have drained something");
     }
 
     /// `EngineCommand::apply` runs on the audio thread (`CommandDrain::
