@@ -9,6 +9,7 @@
 
 pub mod biquad;
 pub mod bus;
+pub mod bus_mode;
 pub mod compressor;
 pub mod denoiser;
 pub mod engine;
@@ -22,6 +23,7 @@ pub mod limiter;
 pub mod meter;
 pub mod pan;
 pub mod parametric_eq;
+pub mod patch;
 pub mod render;
 pub mod rt_assert;
 pub mod strip;

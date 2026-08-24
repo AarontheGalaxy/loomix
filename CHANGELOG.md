@@ -7,6 +7,35 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Bus modes and patching (spec 3.4 M7): all 12 bus modes (`loomix-core::
+  bus_mode`), the composite bus patch, the insert patch, and both pre/post
+  switches.
+  - `BusMode` (Normal, Mix Down A/B, Stereo Repeat, Composite, Up Mix
+    TV/2.1/4.1/6.1, Center/LFE/Rear Only) is a pure transform on the bus's
+    summed 8-channel frame, applied before the bus EQ (spec 1.2 step 3,
+    proved with an order-inverting test the same way M6's EQ-before-mono
+    order was). Mix Down A/B implement the spec 1.6-corrected `FR`-based
+    right-channel formula, not the vendor manual's published (typo'd,
+    `RL`-based) one, with a dedicated test proving the two disagree.
+  - Composite mode fills a bus's 8 channels from a shared, engine-level
+    patch (`Patch::composite`), each slot either the bus's own ordinary
+    sum (`Default`) or a specific `(strip, channel)` source taken pre- or
+    post-fader (`Patch::composite_post_fader`) — addressed against this
+    engine's own strip/channel model rather than the vendor manual's
+    Windows-specific flat channel numbering.
+  - The insert patch (`Patch::insert`, 22 toggles) and its pre/post-FX
+    switch are config-only this milestone: no send/return path exists yet
+    (spec 2.3 defers that past M7), so they have no audio effect, proven
+    by a bit-exact-identical-output test.
+  - `Engine::process_block`'s loop is now sample-outer/strip-middle/
+    bus-inner (was strip-outer/bus-inner) so Composite mode can read any
+    strip's just-processed frame from any bus, without re-running a
+    strip's stateful chain a second time. A new bench
+    (`loomix-core::benches::engine`) measured the mute-handling tradeoff
+    this required directly: running every strip's chain unconditionally
+    regressed a mostly-muted mixer's per-block cost by 2.6x versus running
+    only strips that are unmuted, soloed-in, or actually referenced by an
+    active composite tap — see `docs/ARCHITECTURE.md`.
 - Strip processing (spec 3.4 M5): the per-strip effects chain, run once per
   input frame ahead of bus summing (`loomix-core::strip_dsp`).
   - Hardware strips (spec 1.2's order): denoiser (adaptive noise-floor

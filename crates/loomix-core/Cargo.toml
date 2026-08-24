@@ -31,3 +31,7 @@ serde_json = "1"
 [[bench]]
 name = "rt_assert"
 harness = false
+
+[[bench]]
+name = "engine"
+harness = false
