@@ -162,6 +162,31 @@ pub fn channel_count(id: DeviceId, direction: Direction) -> Result<usize, CoreAu
     Ok(total)
 }
 
+/// The device's current nominal sample rate
+/// (`kAudioDevicePropertyNominalSampleRate`) -- spec 1.11: "the main
+/// output device... defines the engine sample rate," so `loomix-app`
+/// needs the real value to call [`loomix_core::Engine::set_sample_rate`]
+/// correctly once a device is actually selected, not just assume 48kHz
+/// and let the DSP run at the wrong rate silently. Read-only: this
+/// project never sets a device's rate, only reads whatever the hardware
+/// (or the user, via Audio MIDI Setup) already has it configured to.
+pub fn nominal_sample_rate(id: DeviceId) -> Result<f64, CoreAudioError> {
+    let addr = address(kAudioDevicePropertyNominalSampleRate);
+    let mut rate: f64 = 0.0;
+    let mut size = std::mem::size_of::<f64>() as u32;
+    check(unsafe {
+        AudioObjectGetPropertyData(
+            id,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut rate as *mut _ as *mut _,
+        )
+    })?;
+    Ok(rate)
+}
+
 fn cfstring_property(
     object: AudioObjectID,
     selector: AudioObjectPropertySelector,
@@ -688,6 +713,16 @@ mod tests {
         let uid = device_uid(id).expect("uid query should succeed");
         assert!(!name.is_empty());
         assert!(!uid.is_empty());
+    }
+
+    #[test]
+    fn default_output_device_has_a_positive_nominal_sample_rate() {
+        let id = default_output_device().expect("a default output device should exist");
+        let rate = nominal_sample_rate(id).expect("sample rate query should succeed");
+        assert!(
+            rate > 0.0,
+            "every real device reports a positive sample rate, got {rate}"
+        );
     }
 
     #[test]

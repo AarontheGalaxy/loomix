@@ -25,14 +25,14 @@ use loomix_core::bus::BusMono;
 use loomix_core::bus_mode::BusMode;
 use loomix_core::parametric_eq::{EqCellParams, NUM_CELLS};
 use loomix_core::strip_dsp::StripChain;
-use loomix_core::{Engine, CHANNELS, NUM_BUSES, NUM_STRIPS};
+use loomix_core::{Engine, Meter, CHANNELS, NUM_BUSES, NUM_STRIPS};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// spec 1.2 step 7: the hardware strip EQ is stereo, unlike the bus EQ's
 /// independent [`CHANNELS`] (8).
 const STRIP_EQ_CHANNELS: usize = 2;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 /// Comfortably exceeds the mixer's total distinct addressable M8-scope
 /// parameters: summing every strip's mute/solo/mono, bus assigns, gain
@@ -328,7 +328,8 @@ pub struct ControlSnapshot {
 impl ControlSnapshot {
     /// Reads the live values straight off `Engine` -- called once per
     /// audio callback, alongside meter observation, to publish into the
-    /// `triple_buffer` the app-side reconciliation task polls.
+    /// channel ([`snapshot_channel`]) the app-side reconciliation task
+    /// polls.
     pub fn capture(engine: &Engine) -> Self {
         Self {
             strips: std::array::from_fn(|s| StripSnapshot {
@@ -354,63 +355,112 @@ impl Default for ControlSnapshot {
     }
 }
 
-/// A small "latest value wins" cross built on the same `rtrb` SPSC ring
-/// [`control_channel`] already uses, rather than a dedicated triple-buffer
-/// crate: the one candidate for that (`triple_buffer`) is MPL-2.0, a
-/// copyleft license outside this project's allow-list (`deny.toml`) for a
-/// product that ships a commercially-distributed installer (spec 4.5) --
-/// not a call to make unilaterally by widening the allow-list for one
-/// dependency's convenience. `rtrb` is already vetted, already a
-/// dependency here, and the same lock-free/no-allocation guarantee spec
-/// 3.3 asks for covers this just as well: the audio thread owns
-/// [`SnapshotPublisher`] and calls [`SnapshotPublisher::publish`] once per
-/// callback; the app-side reconciliation task owns [`SnapshotReader`] and
-/// calls [`SnapshotReader::read`] at a low, UI-appropriate rate, never per
-/// audio block.
-pub fn snapshot_channel(capacity: usize) -> (SnapshotPublisher, SnapshotReader) {
+/// Spec 1.3/1.5's input/output meters: the audio-thread-only side of the
+/// exact crossing `Meter`'s own doc comment named as owed once a UI
+/// thread existed ("no separate UI thread yet to hand it across... spec
+/// 3.3's crossing applies once one exists, from M4 on") -- published
+/// every callback over [`latest_value_channel`], same as
+/// [`ControlSnapshot`], polled at a UI-appropriate rate (this one closer
+/// to per-frame, since meters are meant to move visibly, unlike the
+/// reconciliation snapshot).
+#[derive(Debug, Clone, Copy)]
+pub struct MeterSnapshot {
+    pub strips: [Meter; NUM_STRIPS],
+    pub buses: [Meter; NUM_BUSES],
+}
+
+impl MeterSnapshot {
+    pub fn capture(engine: &Engine) -> Self {
+        Self {
+            strips: std::array::from_fn(|s| *engine.strip_meter(s)),
+            buses: std::array::from_fn(|b| *engine.bus_meter(b)),
+        }
+    }
+}
+
+impl Default for MeterSnapshot {
+    /// `Meter` is no longer `Default` itself (M8: hold/decay ballistics
+    /// are sample-rate dependent, same reasoning as every other
+    /// sample-rate-dependent block in `loomix-core`), so this goes
+    /// through a real `Engine` for its sample rate -- the same pattern
+    /// `ControlSnapshot::default` already uses, not a new one.
+    fn default() -> Self {
+        Self::capture(&Engine::new())
+    }
+}
+
+/// A small, generic "latest value wins" cross built on the same `rtrb`
+/// SPSC ring [`control_channel`] already uses, rather than a dedicated
+/// triple-buffer crate: the one candidate for that (`triple_buffer`) is
+/// MPL-2.0, a copyleft license outside this project's allow-list
+/// (`deny.toml`) for a product that ships a commercially-distributed
+/// installer (spec 4.5) -- not a call to make unilaterally by widening
+/// the allow-list for one dependency's convenience. `rtrb` is already
+/// vetted, already a dependency here, and the same lock-free/
+/// no-allocation guarantee spec 3.3 asks for covers this just as well:
+/// the audio thread owns [`LatestValuePublisher`] and calls
+/// [`LatestValuePublisher::publish`] once per callback; the app-side
+/// reader owns [`LatestValueReader`] and calls [`LatestValueReader::read`]
+/// at whatever rate it needs, never necessarily per audio block. Used for
+/// both [`ControlSnapshot`] (reconciliation, module doc) and
+/// `MeterSnapshot` (`bin/main.rs`, spec 1.3/1.5's meters) -- the same
+/// crossing shape either way, just a different `T`.
+pub fn latest_value_channel<T: Copy + Default>(
+    capacity: usize,
+) -> (LatestValuePublisher<T>, LatestValueReader<T>) {
     let (producer, consumer) = rtrb::RingBuffer::new(capacity);
     (
-        SnapshotPublisher { producer },
-        SnapshotReader {
+        LatestValuePublisher { producer },
+        LatestValueReader {
             consumer,
-            latest: ControlSnapshot::default(),
+            latest: T::default(),
         },
     )
 }
 
-pub struct SnapshotPublisher {
-    producer: rtrb::Producer<ControlSnapshot>,
+/// The M8 plan's reconciliation channel, specialised to [`ControlSnapshot`].
+pub fn snapshot_channel(
+    capacity: usize,
+) -> (
+    LatestValuePublisher<ControlSnapshot>,
+    LatestValueReader<ControlSnapshot>,
+) {
+    latest_value_channel(capacity)
 }
 
-impl SnapshotPublisher {
-    /// Publishes the latest snapshot. Never blocks and never allocates
-    /// (the ring is pre-allocated once, at [`snapshot_channel`]): if the
+pub struct LatestValuePublisher<T: Copy> {
+    producer: rtrb::Producer<T>,
+}
+
+impl<T: Copy> LatestValuePublisher<T> {
+    /// Publishes the latest value. Never blocks and never allocates (the
+    /// ring is pre-allocated once, at [`latest_value_channel`]): if the
     /// reader hasn't polled recently and the small backlog is momentarily
     /// full, this drops the value rather than waiting for room. That's
-    /// harmless here specifically because only the *most recent* snapshot
-    /// ever matters once the reader does poll (see [`SnapshotReader::read`]
-    /// draining the whole backlog and keeping only the last one) -- unlike
-    /// [`CommandSink::flush`], where a dropped value would be a lost user
-    /// action, a dropped intermediate snapshot is just a value nothing
-    /// ever needed to observe.
-    pub fn publish(&mut self, snapshot: ControlSnapshot) {
-        let _ = self.producer.push(snapshot);
+    /// harmless here specifically because only the *most recent* value
+    /// ever matters once the reader does poll (see
+    /// [`LatestValueReader::read`] draining the whole backlog and keeping
+    /// only the last one) -- unlike [`CommandSink::flush`], where a
+    /// dropped value would be a lost user action, a dropped intermediate
+    /// publish here is just a value nothing ever needed to observe.
+    pub fn publish(&mut self, value: T) {
+        let _ = self.producer.push(value);
     }
 }
 
-pub struct SnapshotReader {
-    consumer: rtrb::Consumer<ControlSnapshot>,
-    latest: ControlSnapshot,
+pub struct LatestValueReader<T: Copy> {
+    consumer: rtrb::Consumer<T>,
+    latest: T,
 }
 
-impl SnapshotReader {
-    /// Drains every snapshot published since the last read and returns
-    /// the most recent one, discarding any older backlog -- a "latest
-    /// value" cross, not a lossless history. Returns the previous value
+impl<T: Copy> LatestValueReader<T> {
+    /// Drains every value published since the last read and returns the
+    /// most recent one, discarding any older backlog -- a "latest value"
+    /// cross, not a lossless history. Returns the previous value
     /// unchanged if nothing new has been published.
-    pub fn read(&mut self) -> ControlSnapshot {
-        while let Ok(snapshot) = self.consumer.pop() {
-            self.latest = snapshot;
+    pub fn read(&mut self) -> T {
+        while let Ok(value) = self.consumer.pop() {
+            self.latest = value;
         }
         self.latest
     }

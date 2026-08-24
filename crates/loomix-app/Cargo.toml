@@ -6,7 +6,17 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "loomix"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
 [dependencies]
 loomix-core = { path = "../loomix-core", version = "0.0.0" }
 loomix-hal = { path = "../loomix-hal", version = "0.0.0" }
 rtrb = "0.4.0"
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

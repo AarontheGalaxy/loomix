@@ -6,6 +6,9 @@ node_modules/
 ui/dist/
 ui/coverage/
 
+# Tauri's own regenerated capability/ACL schemas (spec 3.4 M8)
+crates/loomix-app/gen/
+
 # Xcode
 DerivedData/
 driver/build/

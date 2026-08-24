@@ -5,6 +5,302 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-24 — M8 (continued): real device I/O, and a real TCC wall found, not assumed
+
+**The synthetic test tone is gone.** `main.rs`'s `connect_audio` wires a
+real output device as the clock master (spec 1.19 -- its bus is always
+A1/bus 0) and, optionally, a real input device into strip 0, using
+`loomix-app::device_wiring::attach_capture_device` and a hand-inlined
+equivalent of `attach_master_device` (inlined, not called directly,
+specifically so the command-drain step and the `ControlSnapshot`/
+`MeterSnapshot` publishes could sit inside the exact same real-time
+callback the master device drives -- `docs/ARCHITECTURE.md`'s earlier M8
+entries already established that pattern for the simulated thread this
+replaces). The ordering is `loomix-soak`'s own proven ordering, not a new
+invention: every non-master device attached first, the master attached
+last, since starting it takes the driver by value and runs it
+immediately. `loomix_hal::device::nominal_sample_rate` (new, small,
+read-only) lets `Engine::set_sample_rate` follow the real selected
+output device's actual rate instead of assuming 48kHz, per spec 1.11.
+
+**Host-testable work was done and verified on the host before a device
+was ever touched, per direct instruction:** the new `nominal_sample_rate`
+function has its own real-enumeration test (same pattern as
+`device.rs`'s existing ones, read-only, safe in CI), and the full
+`cargo fmt` / `clippy` / `cargo test --workspace` pass was green before
+`cargo tauri dev` ever ran. Only once that was clean did the running app
+become the final confirmation, not the debugging loop.
+
+**Verified live, with two distinct real outcomes, not one assumed
+success:**
+
+1. **Output-only: real, clean, verified.** Selected the machine's actual
+   `MacBook Pro Hoparlörü` (Speakers) via the picker (using the
+   Accessibility API again, as established in the earlier M8 entries --
+   `AXPress`/`click` on a WebKit `<select>` doesn't open its native menu
+   the same way a real event does, so this used a genuine synthetic
+   mouse click at the element's actual screen coordinates instead, the
+   same class of finding as the fader's `AXIncrement`-vs-`AXValue`
+   distinction earlier). Connected cleanly, stayed connected, `coreaudiod`
+   stayed healthy (CPU nominal, every other driver on the machine --
+   BlackHole, this project's own `LoomixAudioDriver.driver`, several
+   others -- still running normally) for the whole session. Disconnected
+   cleanly on request.
+
+2. **Input capture: wired correctly, blocked by a real TCC gate, exactly
+   as `loomix-soak`'s own log already predicted for this class of
+   process.** Selecting the real `MacBook Pro Mikrofonu` (built-in
+   microphone) and connecting produced a *stable, non-crashing* session
+   with the capture-underrun counter climbing without bound (tens of
+   thousands within 1.5s, over a million within 5s) -- 100% underrun, not
+   corrupted or partial audio. This is the identical finding
+   `loomix-soak`'s own module doc already recorded for capture devices:
+   "a first version defaulting to the system input device measured 100%
+   underrun... a TCC permission gate on this specific machine and
+   process, not a bug in the wiring." `cargo tauri dev` runs a bare
+   `target/debug/loomix` executable, not a signed `.app` bundle with an
+   `NSMicrophoneUsageDescription` Info.plist entry -- there is no bundle
+   identity for TCC to prompt on, so the request is silently denied
+   rather than surfaced. `TCC.db` itself is SIP-protected and couldn't be
+   read directly to confirm the denial by inspection; the sustained,
+   total underrun count is the evidence instead, and the graceful
+   handling of it (zero dropped frames misreported as real audio, no
+   crash, no wedge, an honestly climbing counter the UI actually shows)
+   is exactly what `ioproc.rs`'s underrun-fills-silence design was built
+   to do under real starvation, not just the synthetic gaps its own
+   tests construct.
+
+**Net effect: the output path is proven end to end against real
+hardware; the input path is proven correct in code but not yet
+demonstrated audibly, and that gap is a macOS permission fact, not an
+open bug.** Fixing it needs either a one-time manual grant (Terminal, or
+whatever process TCC ends up attributing this to, added under System
+Settings > Privacy & Security > Microphone) for local development, or --
+the real, durable fix -- a properly signed and bundled `.app` with a
+`NSMicrophoneUsageDescription`, which is M13's packaging milestone, not
+something to bolt onto a dev-mode `cargo tauri dev` binary now. Recorded
+here rather than papered over, the same discipline every TCC/permission
+finding in this log already gets.
+
+## 2026-08-24 — M8 (continued): the layout read as a settings panel, not a mixer
+
+**Found by the user looking at the running app, not by review of the
+source: horizontal faders over thin horizontal meter bars, stacked in a
+row of auto-height cards, read as a form -- Voicemeeter's actual idiom is
+a tall, narrow vertical channel strip (fader and meter side by side,
+running the full height of the strip), and most of the window sat empty
+above and below a cramped top band.** Direct instruction: rework the
+shape, not the polish, and change no controls -- same mute/solo/mono,
+bus-assign, fader, mode dropdown, meter, just arranged the way a mixer
+actually reads.
+
+**`.app` now claims the full window height (`100dvh`, `overflow: hidden`)
+instead of being a flex column of auto-height sections that left
+whatever the content didn't use empty.** `.mixer` splits the remaining
+height 3:2 between the strip rack and the bus rack (`flex: 3` /
+`flex: 2`) -- strips get more room since there are the same count of
+them but they're the side a musician spends more time on, not because
+buses matter less; both racks use the identical column module (label,
+controls, then a `.fader-meter-row` that eats whatever height is left)
+so the bus row reads as a matching set of columns, not a visually
+different afterthought, per the direct instruction.
+
+**Vertical faders use `-webkit-appearance: slider-vertical`, not the
+`orient="vertical"` HTML attribute or a CSS `writing-mode` transform
+trick.** Tauri's macOS webview is always WKWebView, so betting on a
+WebKit-specific CSS property is a safe, project-specific call here, not
+a general cross-browser risk; it also needed no new markup or a
+React-typing workaround the `orient` attribute would have (that
+attribute isn't in React's DOM typings and getting a plain object spread
+past strict JSX prop checking would have been the less honest fix). The
+vertical meter fill is a `position: absolute; bottom: 0` div inside a
+`position: relative` track, growing by `height`, mirroring the old
+horizontal version's `width` growth exactly.
+
+**The synthetic test tone gained a slow amplitude envelope (a raised
+cosine, 0 -> peak -> 0 over 6 seconds) because a constant-level tone
+gives a meter nothing to prove -- a peak reached once and held forever is
+visually identical to the stuck-channel bug the M8 log's peak-hold entry
+above just fixed.** The envelope doesn't need to be a hard gate to make
+hold-then-decay visible: `Meter::observe` only advances `peak_hold` on a
+*new* high, so the moment the envelope starts falling -- smoothly or not
+-- the meter's own 1s-hold/20dB-per-s decay takes over regardless of the
+source's own fall shape, which is exactly what makes a smooth swell
+enough to demonstrate it, not just an on/off burst. Confirmed by
+actually watching it, not assumed from the math: two screenshots of the
+running app, taken ~30 seconds apart, show the same channel's meter
+fill at visibly different heights.
+
+## 2026-08-24 — M8 (continued): meters were a permanent running max, not peak-hold-then-decay
+
+**Found by actually looking at the running app, not by inspecting the
+source: `A1`'s meter still showed a green fill after `HW 1` (its only
+source) had been muted.** `Meter::observe` (M3) only ever raised
+`peak_hold`, never lowered it except on an explicit `reset()`, which
+nothing in `main.rs`'s audio loop ever calls -- so the meter displayed
+"the loudest this channel has ever been since launch," identical in
+appearance to a channel that's still loud and one that's been silent or
+muted for the entire session since. A meter that can't distinguish those
+two cases is worse than no meter, on direct instruction, not merely
+imprecise.
+
+**Fixed to hold-then-decay, with the exact numbers in `docs/DSP.md`
+(1.0s hold, 20dB/s decay, -120dB/`1e-6` silence floor) rather than left
+implicit in the code.** `Meter` gained real-time state (`hold_remaining`
+per channel, a precomputed `decay_per_sample` factor) and, because that
+state is sample-rate dependent, lost its `Default` impl the same way
+`Strip`/`Bus`/`ParametricEq` already did for the identical reason (M5/M6
+logs above) -- `Meter::new(sample_rate)` replaces it, and
+`Engine::set_sample_rate` now propagates to every meter alongside every
+strip's chain and bus's EQ. `loomix-app::control::MeterSnapshot` lost its
+derived `Default` for the same reason and picked up the identical
+`Self::capture(&Engine::new())` pattern `ControlSnapshot::default` already
+established, rather than inventing a second one.
+
+**Tested against the actual numbers, not just "the meter eventually
+changes":** exact-sample-count checks that the peak doesn't move at all
+one sample before the hold window elapses, that it lands within 1% of
+the closed-form 20dB-drop answer after exactly one second of decay, that
+a channel silenced for 10 seconds reads *exact* `0.0` (the specific bug
+being fixed, not just "a smaller number"), and that a fresh higher peak
+arriving mid-decay restarts the hold window rather than inheriting an
+already-expired one. The hold-before-decay ordering was checked the same
+way every other order claim in this codebase is: decay was temporarily
+made to run unconditionally from the first sample, confirmed to actually
+fail the order-proof test (and three of the other six) before being
+reverted -- a real proof, not an assumption, that the implementation's
+order is what the test is actually checking. Full numbers and the test
+list are in `docs/DSP.md`'s new "Metering" section.
+
+## 2026-08-24 — M8 (continued): `tauri.conf.json`'s relative paths, and actually running it
+
+**`beforeDevCommand`/`beforeBuildCommand`/`frontendDist`'s relative paths
+in `tauri.conf.json` are resolved one directory above wherever
+`tauri.conf.json` itself lives, not from that directory** -- `../ui`, not
+`../../ui`, even though the config sits in `crates/loomix-app/` and `ui/`
+is two path segments up from there by plain filesystem navigation.
+`cargo tauri dev` prepended a directory somewhere in its own resolution
+(unconfirmed exactly where or why -- not worth guessing further once the
+fix was verified empirically) before applying the relative path. Found by
+actually running `cargo tauri dev` and reading the real error (`beforeDevCommand`
+failing with `ENOENT` on `/Users/.../Projelerim/ui/package.json`, one
+level above the repo root) rather than reasoning about the path in the
+abstract a second time -- the first version of this config was written
+and believed correct without ever being executed, which is exactly the
+unverified-verification pattern this project's CLAUDE.md exists to rule
+out, called out directly on this milestone.
+
+**Verified by actually launching the app and inspecting the live window,
+not by re-reading the source.** `screencapture` isn't available (no
+Screen Recording permission for this process), so verification went
+through macOS's Accessibility API (`osascript`/System Events) instead,
+which turned out to prove more than a screenshot would have: the live
+window's accessibility tree was dumped and checked against the actual
+React source rather than assumed from it -- exact strings ("Editing gain
+layers for bus", "HW 1"), the right button count (40: 8 strips x 3 +
+8 bus mutes + 8 bus-select labels, matching the component tree exactly),
+and a real interactive round trip -- `AXIncrement` on the first strip's
+fader moved its value from 0.0 to 0.1 and it *stayed* there across
+multiple 500ms reconciliation-poll cycles, meaning the chain UI ->
+`invoke()` -> Tauri command -> `EngineCommand::SetStripGainLayer` -> real
+`Engine` -> `ControlSnapshot` poll -> UI actually round-tripped through a
+running process, not just that the DOM accepted a value. (Setting the
+slider's `AXValue` directly first, as a natural first attempt, did
+nothing -- native `<input type=range>` inside a WKWebView doesn't
+dispatch real DOM events from an externally-set accessibility value, only
+from real input like `AXIncrement`/keyboard/pointer events; a limitation
+of the test method, not a finding about the app.)
+
+## 2026-08-24 — M8 (continued): Tauri scaffolding and the first React UI
+
+**`loomix-app` gets its `[[bin]]` (`loomix`) and the Tauri dependency
+itself, per the M0 log's own forecast ("the first milestone that needs a
+UI surface for the Tauri backend").** `tauri.conf.json`/`build.rs`/
+`capabilities/default.json` live directly in `crates/loomix-app/` (no
+separate `src-tauri/` directory -- spec 3.2 already designates this crate
+as the Tauri backend, so nesting a second Cargo-adjacent directory inside
+it would just be indirection). `capabilities/default.json` grants only
+`core:default` -- enough to invoke this app's own custom commands; no
+file system, shell or dialog plugin access, since nothing here needs it.
+`ui/` gains its Vite config, `index.html` and React entry point
+(`main.tsx`/`App.tsx`), replacing `index.ts`'s placeholder `ping()`
+function, whose own doc comment named this exact milestone as the one
+that would make it obsolete.
+
+**`main.rs` deliberately does not wire real CoreAudio device I/O yet,**
+despite spec 3.4 M8 listing device selection in scope. `spawn_audio_thread`
+simulates the real-time thread instead: a timer-paced loop calling the
+same `CommandDrain::drain_into` -> `Engine::process_block` sequence a real
+IOProc callback would, feeding strip 0 a synthetic 440Hz tone, publishing
+`ControlSnapshot`/`MeterSnapshot` exactly like the real thing would. This
+proves the entire UI <-> bridge <-> engine loop end to end -- every
+control in the M8 surface actually reaching a running `Engine`, meters
+actually moving -- without also taking on live device enumeration,
+selection and IOProc (re)registration in the same pass, which is a
+materially riskier piece of work (the M1/M2 log entries below record two
+`coreaudiod` crashes from exactly this class of live-device work) that
+deserves its own review rather than being bundled in. Explicitly the next
+step, not a silently dropped part of scope.
+
+**`loomix-app::control`'s `snapshot_channel`/`SnapshotPublisher`/
+`SnapshotReader` were generalised to `latest_value_channel`/
+`LatestValuePublisher<T>`/`LatestValueReader<T>`, so meters could reuse
+the exact same "latest value wins" crossing as the reconciliation
+snapshot instead of a second, copy-pasted implementation.** `MeterSnapshot`
+(new) wraps `[Meter; NUM_STRIPS]`/`[Meter; NUM_BUSES]`, captured and
+published alongside `ControlSnapshot` every callback -- the crossing
+`Meter`'s own doc comment named as owed "once a UI thread exists," which
+is now. Polled by the frontend much closer to per-frame than
+`ControlSnapshot`'s deliberately low reconciliation rate, since meters
+are meant to move visibly.
+
+**Tauri command arguments/return values are plain, JSON-friendly
+primitives and strings (`set_bus_mode(bus: usize, mode: String)`), not
+`EngineCommand`/`BusMode` serialised directly across the IPC boundary.**
+Neither `BusMode` nor `BusMono` derive `serde::Serialize`/`Deserialize`
+today (only `EqCellParams` does, for `loomix-config`'s existing EQ-file
+format), and adding those derives just to cross an IPC boundary would
+couple `loomix-core`'s public enums to a wire format they don't otherwise
+need. `main.rs`'s `bus_mode_to_str`/`bus_mode_from_str` (and the `BusMono`
+equivalents) are the one, explicit translation point instead -- an unknown
+string from the frontend is a clean `Result::Err` back across `invoke()`,
+not a deserialisation panic.
+
+**A placeholder icon (`icons/icon.png`, a flat mid-grey square, generated
+programmatically) stands in until real branding exists.** `tauri::
+generate_context!` reads an icon at compile time unconditionally, even
+with `bundle.active: false` (packaging itself is M13's job, spec 3.4) --
+without one, the binary doesn't compile at all, dev or not. `bundle.active:
+false` means `cargo tauri build`'s installer/signing path stays inert
+here the same way `release.yml`'s packaging gate already does (M0 log,
+below) until M13 actually needs it.
+
+**Diagnosed, not worked around: `npm run lint`/`typecheck` intermittently
+stalled for minutes during this milestone's `npm install`s, traced to real
+OS-level I/O contention, not a code or config bug.** Sampling the stuck
+`eslint` process (`sample <pid>`) showed its entire call stack inside
+`uv_run` -> `uv__io_poll` -> `AfterStat` -- the Node event loop genuinely
+blocked waiting on a kernel filesystem callback, not spinning in JS. A
+swarm of `mdworker_shared` processes (macOS Spotlight) had spawned in the
+same window as the `npm install`s and `cargo build`s that just created
+hundreds of thousands of small files across `node_modules/` and `target/`
+on a disk that was down to 15GB free at the time. On instruction, fixed at
+the source rather than by retrying or increasing timeouts: `touch
+target/.metadata_never_index ui/node_modules/.metadata_never_index`
+excludes both trees from Spotlight going forward (the marker stops future
+indexing of a directory; it doesn't retroactively cancel an already
+in-flight scan, so the already-queued backlog still had to drain once).
+Confirmed by re-running lint to a genuinely fresh pass afterward, not by
+accepting the clean run from before the contention started -- accepting a
+verification that predates the change it's meant to verify is exactly the
+failure class this project's CLAUDE.md already calls out by name, and
+doing it here anyway would have been the same mistake in a new disguise.
+`eslint-plugin-react-hooks` was also pinned to `^5` instead of the latest
+`^7`: v7 bundles the new React Compiler analysis rule (a ~55K-line
+generated file), which this project doesn't use and which measurably
+worsened the same contention while diagnosing it -- a real, if secondary,
+fix, not the actual root cause.
+
 ## 2026-08-24 — M8 (continued): unchecked indices in `EngineCommand::apply`
 
 **A pushed-commit security review flagged an under-validated sink

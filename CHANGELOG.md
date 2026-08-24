@@ -7,6 +7,38 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- App shell and first UI (spec 3.4 M8, in progress): Tauri v2 scaffolding
+  and a React frontend running in-process against the real engine.
+  - `loomix-app::control`: the lock-free UI-to-audio-thread bridge --
+    `EngineCommand`s coalesced per parameter and pushed through an `rtrb`
+    SPSC queue, applied on the audio thread before `process_block`; a
+    `ControlSnapshot`/`MeterSnapshot` published back out over a small
+    "latest value wins" channel for UI reconciliation and live metering.
+    A failed push under load is retried, never dropped; every command's
+    indices are bounds-checked before touching `Engine`, since this runs
+    on the real-time thread.
+  - `loomix-app` gains its `[[bin]]` (`loomix`): Tauri commands for
+    mute/solo/mono, bus assignment, gain layers, bus mute/mono/mode/gain,
+    and both meter/state polling endpoints.
+  - `ui/`: React + Vite, a typed `bridge.ts` command layer, and vertical
+    channel-strip UI -- tall faders beside tall meters, strips filling
+    the window's height, a matching bus row below, plus a device picker
+    in the header.
+  - Meters gained real peak-hold-then-decay ballistics (1.0s hold,
+    20dB/s decay, `docs/DSP.md`) in place of the original plain running
+    max, which read identically whether a channel was loud or had been
+    muted for the whole session.
+  - Real CoreAudio device I/O, replacing the synthetic test tone: a
+    selected output device becomes the clock master (spec 1.19, its bus
+    is always A1) and an optional input device attaches into strip 0,
+    reusing `loomix-app::device_wiring` and `loomix-soak`'s
+    already-proven device-ordering. Verified against real hardware: a
+    real output device connects and stays stable; real microphone
+    capture is wired correctly but currently blocked by a TCC
+    permission gate specific to running an unbundled dev binary (not a
+    bug -- see `docs/ARCHITECTURE.md`), the same finding `loomix-soak`'s
+    own history already recorded for capture devices.
+  - Not yet wired: the EQ graph.
 - Bus modes and patching (spec 3.4 M7): all 12 bus modes (`loomix-core::
   bus_mode`), the composite bus patch, the insert patch, and both pre/post
   switches.
