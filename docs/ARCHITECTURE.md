@@ -5,6 +5,164 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-24 — M8 (continued): unchecked indices in `EngineCommand::apply`
+
+**A pushed-commit security review flagged an under-validated sink
+argument in `loomix-app::control`: `EngineCommand::apply`'s strip/bus/
+channel/cell indices went straight into array indexing (`engine.
+strips[s]`, `ParametricEq::set_cell`'s internal `cells[cell]`) with no
+range check at all.** `EngineCommand` has no `TryFrom`/range type of its
+own -- any `usize` constructs one -- and the intended validation point
+(the UI/Tauri-command layer, "validate at a system boundary" per
+`parametric_eq::EqCellParams::freq_hz`'s own doc comment) doesn't exist
+yet. `apply` runs on the audio thread inside `CommandDrain::drain_into`,
+so an out-of-range index reaching it would panic there, not in an HTTP
+handler -- the worst place in this codebase for a panic, and a real
+concern once a Tauri command layer exists for a compromised or merely
+buggy frontend to reach it from, not a hypothetical.
+
+Fixed by bounds-checking every index in `apply` itself before indexing
+anything, silently skipping the command if any index is out of range --
+the same "harmless no-op" shape the existing virtual-strip EQ-command
+case already used, generalised. This is deliberately a second line of
+defence, not a replacement for real UI-layer validation once that layer
+exists: a sink this catastrophic to get wrong shouldn't rely on every
+future caller remembering to check first.
+`out_of_range_indices_are_ignored_not_panicked` drives one
+representative out-of-range case per index shape in the file (strip-only,
+bus-only, both, and the EQ commands' extra channel/cell indices) through
+both `apply` directly and the real `CommandSink`/`CommandDrain` path,
+and confirms no engine state changes and nothing panics.
+
+The finding surfaced through a background commit-security-review
+notification attached to an unrelated user turn, formatted oddly enough
+(garbled repeated text, a stray escaped closing tag) to be worth
+independently re-verifying against the actual code before acting on it,
+rather than trusting the notification's own framing -- the underlying
+claim held up, so it was fixed on its merits, logged here the same way
+any other reviewer-caught bug would be.
+
+## 2026-08-24 — M8 (continued): the UI <-> audio-thread bridge
+
+**`loomix-app::control`** implements the two one-way, lock-free crossings
+spec 3.3 requires between Tauri's command handlers and the real-time
+thread (`EngineCommand`s in via an `rtrb` SPSC queue, a `ControlSnapshot`
+out), plus the app-side optimistic control-state mirror described in the
+M8 plan. Three properties were tightened on direct instruction before this
+was accepted as done, each with its own proof rather than an argument:
+
+**Command-queue overflow is neither silently dropped nor treated as
+acceptable at any volume — it's designed to be unreachable in ordinary
+use, and counted (not silently absorbed) if it's ever actually reached.**
+`CommandSink` coalesces per parameter (`ParamKey`, last-value-wins) before
+ever touching the SPSC queue, so `pending`'s size is bounded by the number
+of *distinct* controls changed since the last flush, not by how many
+events arrived. `COMMAND_QUEUE_CAPACITY` (1024) is sized against the
+mixer's total distinct addressable M8-scope parameters — every strip's
+mute/solo/mono (24), bus assigns (64), gain layers (64) and EQ cells (up
+to 96, hardware strips only), plus every bus's mute/mono/mode/gain (32)
+and EQ cells (384) — under 700 total, so "every control in the mixer
+changed at once" still fits with headroom; reaching capacity in practice
+means the audio thread has stopped draining (a stalled device, not
+ordinary use). `CommandSink::flush` pushes every pending command and, on
+a failed push, leaves that entry in `pending` for the next flush rather
+than discarding it — a coalesced key can only ever converge toward the
+last value actually sent, never toward a stale one, so retrying is always
+safe — while `OverflowCounter` (the same lock-free, `Arc<AtomicU64>`
+shape as `engine_io::DropoutCounter`) counts every failed push so a stuck
+queue is observable, not silent. `CommandDrain::drain_into`'s separate
+per-callback cap (64) bounds one callback's *work*, not correctness: an
+undrained remainder just waits for the next callback a few milliseconds
+later, it is never discarded.
+
+Two tests prove this rather than assert it: `a_flood_past_capacity_
+still_converges_to_the_last_value_sent` deliberately floods 8x past
+capacity and confirms the engine ends up at exactly the last value sent
+per parameter, not a stale or corrupted one — the retry-with-coalescing
+guarantee actually holds under real overload, not just in argument. A
+first version of the concurrent stress test below (see that entry)
+instead had an *unthrottled* producer thread and drove the overflow
+counter into the tens of millions in a few hundred milliseconds — not a
+bug in the design, a bug in the test: an unthrottled spin loop calling
+`flush()` as fast as the CPU allows issues push attempts many orders of
+magnitude faster than any real UI event source (a mouse drag, a 120Hz
+display) ever could, so it wasn't modelling "sustained hammering" at all,
+just proving a physically-impossible input can still overflow a finite
+queue, which was never the claim. Paced to ~10kHz — still far above any
+real UI framework's event rate — the same design produces zero overflow
+under the same total volume of work.
+
+**A low-rate reconciliation snapshot (`ControlSnapshot`) closes the loop
+the optimistic UI mirror opens: without it, a dropped or misapplied
+command is invisible — the fader shows one thing, the engine does
+another, and nothing anywhere notices.** Scoped deliberately to
+`EngineCommand`'s own scalar surface (mute/solo/mono, bus assigns, gain
+layers, bus mute/mono/mode/gain) and not the EQ cells — "just enough that
+drift is detectable" on direct instruction, not an exhaustive mirror; EQ
+cells get their own, larger snapshot later if drift there is ever found
+to matter in practice, the same "logged, not silently incomplete"
+pattern as every other scope cut in this file. `ControlSnapshot::capture`
+reads straight off live `Engine` state (called once per callback,
+alongside meter observation); the crossing itself
+(`snapshot_channel`/`SnapshotPublisher`/`SnapshotReader`) is a small
+"latest value wins" cross over the same `rtrb` primitive `control_channel`
+already uses (see the `triple_buffer` entry below for why not a dedicated
+triple-buffer crate) — the publisher's `push` is fire-and-forget (a
+dropped intermediate snapshot costs nothing, only the *latest* one is
+ever read), and the reader drains the whole small backlog on every poll
+and keeps only the last value popped. `reconciliation_snapshot_matches_
+the_uis_optimistic_mirror_after_a_burst_of_changes` drives a burst of
+varied commands through the real command path, publishes and reads back
+through the actual channel (not just the pure `capture` function), and
+asserts it equals an independently-built mirror of what the UI would
+already believe from applying the same commands optimistically — proving
+the crossing itself, not just the snapshot-building logic in isolation.
+
+**`triple_buffer` (the crate) was tried first for the snapshot crossing
+and rejected by `cargo deny check`, not by inspection: it's MPL-2.0, a
+copyleft license outside `deny.toml`'s allow-list, which this project's
+license policy (spec 4.5's notarised, commercially-distributed installer)
+deliberately keeps to permissive-only licenses.** Widening the allow-list
+for one dependency's convenience is a real project-policy change, not an
+implementation detail to decide unilaterally mid-milestone — so instead
+of asking for that, the crossing was rebuilt on `rtrb`, which is already
+a vetted, permissively-licensed dependency of this exact crate, doing the
+same "latest value wins, never blocks, never allocates" job spec 3.3
+actually asks for (a genuine triple buffer's extra property — the reader
+never blocking the writer mid-write on a torn read — isn't needed here
+either, since `Copy` types never observe a torn write through an
+independent ring slot the way a larger, in-place-mutated buffer could).
+Caught by running `cargo deny check` itself, per this project's own
+verification discipline, not assumed compatible because `rtrb` already
+was.
+
+**The concurrent stress test (`realtime_concurrent_hammering_produces_
+zero_overflow_and_no_allocation`) runs two real OS threads racing for
+real, not a simulated sequence.** A "UI" thread paced to ~10kHz
+continuously enqueues varied commands (gain layers, mute, bus mode, *and*
+EQ cells) and flushes; an "audio" thread spins unthrottled, draining and
+calling `Engine::process_block` back to back, the whole closure wrapped
+in `assert_realtime` per iteration — proving no allocation under actual
+thread contention, not just the single-threaded call-order the other
+tests above assume. This is also what surfaced that `EngineCommand::apply`
+needed its own dedicated real-time proof
+(`realtime_command_apply_does_not_allocate`, covering every variant
+individually): the EQ-cell variants route into `ParametricEq::set_cell`,
+which recomputes biquad coefficients and a delay line's cursors — real
+work that had no real-time obligation before this milestone, since
+nothing called it from the audio thread until `CommandDrain` existed.
+Both tests are run under the real trapping allocator
+(`cargo test -p loomix-app --features loomix-core/rt-assert`, the exact
+mechanism the M4 log below established), not the flag-only guard —
+verified directly, the same discipline that mechanism's own introduction
+required. The stress test's name deliberately contains `realtime` (matching
+`ci.yml`'s `rt_safety` job filter, `-- realtime`) after a first version
+without that naming convention was found to not actually run under that
+CI leg at all, only under the general `test` job, which never enables
+`rt-assert` — the same class of decorative-test gap the M4 log below
+records twice already (the rt-safety CI leg not covering `loomix-hal`/
+`loomix-app` at all; the `driver` job never installing what it built).
+
 ## 2026-08-23 — new M8 inserted: app shell and first UI
 
 **A new milestone, "App shell and first UI" (React + Tauri scaffolding,
