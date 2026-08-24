@@ -5,6 +5,47 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-24 — M8 (continued): meters were a permanent running max, not peak-hold-then-decay
+
+**Found by actually looking at the running app, not by inspecting the
+source: `A1`'s meter still showed a green fill after `HW 1` (its only
+source) had been muted.** `Meter::observe` (M3) only ever raised
+`peak_hold`, never lowered it except on an explicit `reset()`, which
+nothing in `main.rs`'s audio loop ever calls -- so the meter displayed
+"the loudest this channel has ever been since launch," identical in
+appearance to a channel that's still loud and one that's been silent or
+muted for the entire session since. A meter that can't distinguish those
+two cases is worse than no meter, on direct instruction, not merely
+imprecise.
+
+**Fixed to hold-then-decay, with the exact numbers in `docs/DSP.md`
+(1.0s hold, 20dB/s decay, -120dB/`1e-6` silence floor) rather than left
+implicit in the code.** `Meter` gained real-time state (`hold_remaining`
+per channel, a precomputed `decay_per_sample` factor) and, because that
+state is sample-rate dependent, lost its `Default` impl the same way
+`Strip`/`Bus`/`ParametricEq` already did for the identical reason (M5/M6
+logs above) -- `Meter::new(sample_rate)` replaces it, and
+`Engine::set_sample_rate` now propagates to every meter alongside every
+strip's chain and bus's EQ. `loomix-app::control::MeterSnapshot` lost its
+derived `Default` for the same reason and picked up the identical
+`Self::capture(&Engine::new())` pattern `ControlSnapshot::default` already
+established, rather than inventing a second one.
+
+**Tested against the actual numbers, not just "the meter eventually
+changes":** exact-sample-count checks that the peak doesn't move at all
+one sample before the hold window elapses, that it lands within 1% of
+the closed-form 20dB-drop answer after exactly one second of decay, that
+a channel silenced for 10 seconds reads *exact* `0.0` (the specific bug
+being fixed, not just "a smaller number"), and that a fresh higher peak
+arriving mid-decay restarts the hold window rather than inheriting an
+already-expired one. The hold-before-decay ordering was checked the same
+way every other order claim in this codebase is: decay was temporarily
+made to run unconditionally from the first sample, confirmed to actually
+fail the order-proof test (and three of the other six) before being
+reverted -- a real proof, not an assumption, that the implementation's
+order is what the test is actually checking. Full numbers and the test
+list are in `docs/DSP.md`'s new "Metering" section.
+
 ## 2026-08-24 — M8 (continued): `tauri.conf.json`'s relative paths, and actually running it
 
 **`beforeDevCommand`/`beforeBuildCommand`/`frontendDist`'s relative paths

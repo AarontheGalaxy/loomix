@@ -363,7 +363,7 @@ impl Default for ControlSnapshot {
 /// [`ControlSnapshot`], polled at a UI-appropriate rate (this one closer
 /// to per-frame, since meters are meant to move visibly, unlike the
 /// reconciliation snapshot).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct MeterSnapshot {
     pub strips: [Meter; NUM_STRIPS],
     pub buses: [Meter; NUM_BUSES],
@@ -375,6 +375,17 @@ impl MeterSnapshot {
             strips: std::array::from_fn(|s| *engine.strip_meter(s)),
             buses: std::array::from_fn(|b| *engine.bus_meter(b)),
         }
+    }
+}
+
+impl Default for MeterSnapshot {
+    /// `Meter` is no longer `Default` itself (M8: hold/decay ballistics
+    /// are sample-rate dependent, same reasoning as every other
+    /// sample-rate-dependent block in `loomix-core`), so this goes
+    /// through a real `Engine` for its sample rate -- the same pattern
+    /// `ControlSnapshot::default` already uses, not a new one.
+    fn default() -> Self {
+        Self::capture(&Engine::new())
     }
 }
 
