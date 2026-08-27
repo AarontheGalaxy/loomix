@@ -54,6 +54,57 @@ const MAX_BLOCK_FRAMES: usize = 2048;
 /// convention from the synthetic-tone version this replaces.
 const INPUT_STRIP: usize = 0;
 
+// TEMPORARY diagnostic for the M8 interleaved-output bug fix: captures the
+// raw buffer CoreAudio actually receives (post `unpack_channels`) to a WAV
+// file when `LOOMIX_RECORD_WAV` is set, for direct waveform inspection.
+// The push into the rtrb producer is the only work done in the real-time
+// callback (no allocation, no lock, matches the existing
+// meter_pub/control_pub pattern); the WAV write happens on a plain thread.
+// To be removed once the fix is confirmed against a real recording.
+const RECORD_SECONDS: usize = 6;
+
+fn start_wav_capture(sample_rate: f64, channels: usize) -> Option<rtrb::Producer<f32>> {
+    let path = std::env::var("LOOMIX_RECORD_WAV").ok()?;
+    let target = (sample_rate as usize) * channels * RECORD_SECONDS;
+    let (producer, mut consumer) = rtrb::RingBuffer::<f32>::new(target + sample_rate as usize);
+    std::thread::spawn(move || {
+        let mut samples = Vec::with_capacity(target);
+        while samples.len() < target {
+            match consumer.pop() {
+                Ok(s) => samples.push(s),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        write_wav(&path, sample_rate as u32, channels as u16, &samples);
+        eprintln!("[loomix] wrote {} samples to {path}", samples.len());
+    });
+    Some(producer)
+}
+
+fn write_wav(path: &str, sample_rate: u32, channels: u16, samples: &[f32]) {
+    let data_len = (samples.len() * 2) as u32;
+    let byte_rate = sample_rate * channels as u32 * 2;
+    let block_align = channels * 2;
+    let mut buf = Vec::with_capacity(44 + samples.len() * 2);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&(36 + data_len).to_le_bytes());
+    buf.extend_from_slice(b"WAVEfmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&channels.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    buf.extend_from_slice(&block_align.to_le_bytes());
+    buf.extend_from_slice(&16u16.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_len.to_le_bytes());
+    for &s in samples {
+        let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    let _ = std::fs::write(path, buf);
+}
+
 /// Everything a live audio connection owns: the two bridge halves the
 /// Tauri commands below talk to, and the device handles that keep the
 /// real I/O running -- dropping either handle stops and unregisters that
@@ -412,12 +463,18 @@ fn connect_audio(
     let (mut control_pub, control_reader) = control::snapshot_channel(RECONCILE_QUEUE_CAPACITY);
     let (mut meter_pub, meter_reader) =
         control::latest_value_channel::<MeterSnapshot>(RECONCILE_QUEUE_CAPACITY);
+    let mut wav_producer = start_wav_capture(sample_rate, output_channels);
 
     let callback: MasterTickCallback = Box::new(move |frames, input, output| {
         drain.drain_into(driver.engine_mut(), 64);
         driver.on_master_tick(frames as usize, input, output);
         control_pub.publish(ControlSnapshot::capture(driver.engine_mut()));
         meter_pub.publish(MeterSnapshot::capture(driver.engine_mut()));
+        if let Some(producer) = wav_producer.as_mut() {
+            for &sample in output.iter().flat_map(|ch| ch.iter()) {
+                let _ = producer.push(sample);
+            }
+        }
     });
     let master = MasterIoProcHandle::start(output_id, callback)
         .map_err(|e| format!("failed to start output on {output_uid}: CoreAudio error {e}"))?;

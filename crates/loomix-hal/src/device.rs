@@ -468,12 +468,20 @@ unsafe fn read_input_channels_planar(
 /// The simple, non-interleaving-aware reader/writer pair
 /// [`read_input_channels_planar`] replaced for capture/render: still used
 /// by [`master_ioproc_trampoline`], which has no per-device channel count
-/// or deinterleave scratch to work with (it hands raw buffers straight to
-/// a caller-supplied callback). This is therefore a known, documented gap
-/// for a master device that happens to deliver interleaved audio -- see
-/// `read_input_channels_planar`'s doc comment for the failure mode this
-/// would hit, and `docs/ARCHITECTURE.md` for why it's deferred rather than
-/// fixed here.
+/// or deinterleave scratch of its own to adapt the buffer shape here (it
+/// hands raw buffers straight to a caller-supplied callback). That used to
+/// be a real, hit-in-production gap for a master device that delivers
+/// interleaved audio (`docs/ARCHITECTURE.md`'s M8 entry: real stereo
+/// speaker output came out scrambled -- half the buffer never written,
+/// the other half compressed two channels into one). Fixed on the
+/// consumer side instead of here: `loomix-app::engine_io`'s
+/// `pack_channels`/`unpack_channels` already know the exact frame count
+/// they're packing (the caller's own buffer length), so they can detect
+/// and correctly handle a single combined interleaved buffer without
+/// needing a pre-known channel count or any scratch allocation at all --
+/// simpler than this file's capture/render fix, not a re-implementation
+/// of it. This function itself is unchanged and still just hands over
+/// whatever CoreAudio delivered, raw.
 ///
 /// # Safety
 /// Same contract as [`read_input_channels_planar`], without the

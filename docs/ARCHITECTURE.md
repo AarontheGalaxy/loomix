@@ -5,6 +5,79 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-08-28 — M8 (continued): reviewing the capture/sample-rate path while a real recording is pending
+
+Triggered by the user reporting the live mixer sounds "crackling, robotic,
+distorted" after real device I/O landed. Fixing `unpack_channels`'s
+interleaved-output bug (below, the earlier same-day-numbered entry) was
+already done and host-tested by the time this review started; the user
+asked for the two remaining named suspects -- the capture-side
+interleaving gap and input/output/engine sample-rate handling -- to be
+reviewed and host-tested next, explicitly **without** concluding anything
+about the reported distortion's actual cause until a real recording
+exists to inspect (mic in use, deferred by the user to a later session).
+Nothing in this entry claims to explain what the user heard; it records
+what was found reviewing code adjacent to it.
+
+**The capture-side interleaving gap: real, proven, but currently
+unreachable in the live app.** `pack_channels`'s size-based fix (same
+entry as `unpack_channels`, below) handles `master_in` -- the clock-master
+device's own captured channels -- correctly now, proven by
+`on_master_tick_deinterleaves_stereo_input_correctly_from_a_single_combined_buffer`.
+But `EngineIoDriver::on_master_tick` only ever calls `pack_channels` on
+`master_in` when `Some(strip) == self.master_strip`, and
+`main.rs::connect_audio` always constructs its driver with
+`master_strip: None` -- real input capture is wired entirely through the
+separate `attach_capture_device` / `capture_ioproc_trampoline` path
+instead, which was already fixed for interleaving back in M1/M2
+(`read_input_channels_planar`, unchanged by this review). So the mono mic
+path the user actually exercised was never at risk from this specific
+gap; the fix is real and needed for the day a master device is also used
+full-duplex as a strip source, not for anything reachable today.
+
+**A second, distinct, real gap: no correction for a genuine input/output
+nominal sample-rate mismatch, only for small clock drift between devices
+already at the same rate.** `connect_audio` queries `nominal_sample_rate`
+for the output device only (feeding `Engine::set_sample_rate`, spec
+1.11) -- grepping the whole workspace confirms nothing ever queries the
+input device's nominal rate or compares the two. Every capture stage's
+resampler (`DriftCorrectedIoStage`) starts blind at ratio 1.0 and is
+`attach_capture_device`'s `DriftCorrector::new(PiController::new(2e-5,
+5e-7, 0.01), 500.0)` bounds it to `max_correction = 0.01` (1% per block)
+with a 500-sample discontinuity threshold -- tuned for spec 2.3's actual
+target (two devices at the *same* nominal rate, one running a few hundred
+ppm fast or slow), not for a genuine rate difference. A common real pairing
+(44.1 kHz input against a 48 kHz output, 8.125%) needs a steady-state
+ratio near 0.919, ~92x past `max_correction`'s reach; worse, the
+cumulative error crosses the 500-sample discontinuity threshold after
+only ~45 blocks at that mismatch and gets treated as the one-off
+device-reconfiguration jump the threshold exists to catch, resetting the
+integral and snapping the ratio back to exactly 1.0 every time -- so the
+loop never even approaches the ratio it needs, rather than converging
+slowly.
+
+Proven, not assumed: `loomix-hal::ioproc`'s new
+`a_genuine_nominal_rate_mismatch_is_not_corrected_within_production_bounds`
+test reuses the exact same `FakeDevice` harness and the exact
+`main.rs::connect_audio` PI/discontinuity constants as the already-passing
+500 ppm drift test right above it, substituting a real 44.1kHz-vs-48kHz
+ppm-equivalent offset, and shows the passing test's `<300` frame-drift
+bound does not hold (asserts `>5,000`) while the final ratio stays within
+0.02 of 1.0 rather than moving toward ~0.919. A temporary sanity variant
+(same harness, `max_correction = 0.15`, discontinuity threshold widened to
+50,000 samples, deleted after this run rather than committed) confirmed
+the harness itself converges cleanly given room to (frame drift 127,
+ratio settling at ~1.088 = 1 / 0.91875, exactly the steady-state this
+pairing needs) -- so the production-bound test is a genuine finding about
+`main.rs`'s configured constants, not an artifact of the harness.
+
+**Not yet done, and deliberately not concluded here:** whether either gap
+above (both real, both host-tested, neither yet observed live) explains
+what the user actually heard is still open. `docs/DSP.md`/this log's next
+entry gets the answer once the WAV-capture diagnostic added to `main.rs`
+(`LOOMIX_RECORD_WAV`, temporary, to be removed once the fix is confirmed)
+has a real recording to inspect.
+
 ## 2026-08-24 — M8 (continued): real device I/O, and a real TCC wall found, not assumed
 
 **The synthetic test tone is gone.** `main.rs`'s `connect_audio` wires a

@@ -252,9 +252,42 @@ impl EngineIoDriver {
     }
 }
 
+/// `src` is either one `&[f32]` per channel (the planar case, handled by
+/// the loop at the bottom) or, on real hardware, a single combined buffer
+/// carrying every channel interleaved (`L0,R0,L1,R1,...`) --
+/// `master_ioproc_trampoline` (`loomix-hal`) hands over whatever shape
+/// CoreAudio actually delivered, with no deinterleaving of its own (see
+/// its doc comment). Distinguished here by size alone, with no separate
+/// "expected channel count" input needed: `dst.len()` is already the
+/// frame count this callback asked for, so `src[0].len() > dst.len()`
+/// means `src[0]` packs more than one frame's worth of samples into one
+/// buffer, which only happens when it's actually interleaved multi-channel
+/// data, never a genuine one-channel (mono) buffer -- a mono buffer's
+/// length is always exactly the frame count, so this never misfires on
+/// the mono case that already worked correctly before this fix existed.
+///
+/// Found by two deterministic tests
+/// (`on_master_tick_deinterleaves_stereo_input_correctly_from_a_single_combined_buffer`
+/// and its output-side sibling below) proving this function silently
+/// scrambled real (non-silent) stereo content, not assumed from reading
+/// the code -- see `docs/ARCHITECTURE.md`.
 fn pack_channels(src: &[&[f32]], dst: &mut [Frame]) {
     for frame in dst.iter_mut() {
         *frame = [0.0; CHANNELS];
+    }
+    let frames = dst.len();
+    if frames == 0 {
+        return;
+    }
+    if src.len() == 1 && src[0].len() > frames {
+        let raw = src[0];
+        let channel_count = (raw.len() / frames).min(CHANNELS);
+        for (f, frame) in dst.iter_mut().enumerate() {
+            for c in 0..channel_count {
+                frame[c] = raw[f * channel_count + c];
+            }
+        }
+        return;
     }
     for (channel, data) in src.iter().enumerate().take(CHANNELS) {
         for (frame, &sample) in dst.iter_mut().zip(data.iter()) {
@@ -263,7 +296,26 @@ fn pack_channels(src: &[&[f32]], dst: &mut [Frame]) {
     }
 }
 
+/// The output-side mirror of [`pack_channels`]'s interleaving fix -- same
+/// reasoning, same size-based distinction, same "a mono buffer's length
+/// is always exactly the frame count so this never misfires on the case
+/// that already worked" argument, just interleaving into `dst[0]` instead
+/// of deinterleaving out of `src[0]`.
 fn unpack_channels(src: &[Frame], dst: &mut [&mut [f32]]) {
+    let frames = src.len();
+    if frames == 0 {
+        return;
+    }
+    if dst.len() == 1 && dst[0].len() > frames {
+        let channel_count = (dst[0].len() / frames).min(CHANNELS);
+        let raw = &mut dst[0];
+        for (f, frame) in src.iter().enumerate() {
+            for c in 0..channel_count {
+                raw[f * channel_count + c] = frame[c];
+            }
+        }
+        return;
+    }
     for (channel, out_channel) in dst.iter_mut().enumerate().take(CHANNELS) {
         for (frame, out_sample) in src.iter().zip(out_channel.iter_mut()) {
             *out_sample = frame[channel];
@@ -418,6 +470,105 @@ mod tests {
         assert!(
             out_buf.iter().all(|&s| (s - 0.5).abs() < 1e-6),
             "strip 0's master-fed input at unity gain should reach bus 0 unchanged, got {out_buf:?}"
+        );
+    }
+
+    /// Real output hardware delivers ONE interleaved `AudioBuffer` for a
+    /// stereo stream, not one buffer per channel (the M1/M2 log's own
+    /// finding, `docs/ARCHITECTURE.md`: "every real output device tried
+    /// on this machine -- the built-in speaker, an external monitor's
+    /// speakers, BlackHole -- delivers one interleaved buffer instead").
+    /// `master_ioproc_trampoline` hands `master_out` through exactly as
+    /// CoreAudio gave it, with no deinterleaving -- a known, documented
+    /// gap that was left unfixed because the M4 soak harness's own
+    /// content was silence, and a scrambled arrangement of zeros is still
+    /// all zeros, so that gap was never actually exercised end to end
+    /// until real (non-silent) audio did. This test is the host-testable
+    /// proof `unpack_channels` mishandles exactly that shape -- distinct,
+    /// non-zero L/R values per frame, so a swapped, compressed, or
+    /// stale-tail interleaving is visibly wrong, not coincidentally right.
+    #[test]
+    fn on_master_tick_interleaves_stereo_output_correctly_into_a_single_combined_buffer() {
+        let block_frames = 4;
+        let mut driver = new_driver(Some(0));
+        // Default routing: strip 0 -> bus 0 (MASTER_BUS) at unity, so
+        // whatever master_in carries reaches master_out unprocessed.
+        // Realistic audio amplitudes, deliberately: an earlier version of
+        // this test used values like 101.0 to make L and R easy to tell
+        // apart, which instead exercised the strip's limiter (+12dB
+        // default ceiling, ~3.981 linear) and muddied the numbers with
+        // real DSP behaviour unrelated to the bug under test.
+        let master_in_l = [0.1_f32, 0.2, 0.3, 0.4];
+        let master_in_r = [0.5_f32, 0.6, 0.7, 0.8];
+        let master_in: [&[f32]; 2] = [&master_in_l, &master_in_r];
+
+        // ONE combined interleaved buffer -- what real hardware actually
+        // hands over, not two separate per-channel buffers like the test
+        // above uses for its (mono, so interleaving-proof) case.
+        let mut interleaved_out = vec![-999.0_f32; block_frames * 2]; // poisoned sentinel
+        {
+            let mut out_channel = interleaved_out.as_mut_slice();
+            driver.on_master_tick(
+                block_frames,
+                &master_in,
+                std::slice::from_mut(&mut out_channel),
+            );
+        }
+
+        let expected = [0.1, 0.5, 0.2, 0.6, 0.3, 0.7, 0.4, 0.8];
+        assert_eq!(
+            interleaved_out, expected,
+            "expected standard L,R,L,R,... interleaving, got {interleaved_out:?}"
+        );
+    }
+
+    /// The input-side mirror of the test above: a real multi-channel
+    /// capture device can equally deliver one combined interleaved
+    /// buffer rather than one per channel, and `pack_channels` has the
+    /// identical structural gap as `unpack_channels` for that shape (both
+    /// assume `src`/`dst`'s length *is* the channel count). The mono mic
+    /// this milestone actually tested against never exercises this --
+    /// one channel has nothing to interleave -- so this is proven the
+    /// same host-testable way, not assumed safe by extension.
+    #[test]
+    fn on_master_tick_deinterleaves_stereo_input_correctly_from_a_single_combined_buffer() {
+        let block_frames = 4;
+        let mut driver = new_driver(Some(0));
+        driver.engine_mut().strips[0].bus_assign = [false; NUM_BUSES];
+        driver.engine_mut().strips[0].bus_assign[1] = true; // bus 1, not MASTER_BUS
+
+        // ONE combined interleaved buffer: L0,R0,L1,R1,... Realistic
+        // amplitudes (see the output-side test above for why: large
+        // values here would exercise the strip's limiter instead of
+        // isolating the deinterleaving bug).
+        let interleaved_in = [0.1_f32, 0.5, 0.2, 0.6, 0.3, 0.7, 0.4, 0.8];
+        let master_in: [&[f32]; 1] = [&interleaved_in];
+        let mut master_out_buf = [0.0_f32; 4]; // MASTER_BUS (0) should stay silent
+
+        let (bus_l_tx, mut bus_l_rx) = rtrb::RingBuffer::<f32>::new(64);
+        let (bus_r_tx, mut bus_r_rx) = rtrb::RingBuffer::<f32>::new(64);
+        driver.set_bus_sink(1, BusSink::new(vec![bus_l_tx, bus_r_tx]));
+
+        {
+            let mut out_channel = master_out_buf.as_mut_slice();
+            driver.on_master_tick(
+                block_frames,
+                &master_in,
+                std::slice::from_mut(&mut out_channel),
+            );
+        }
+
+        let received_l: Vec<f32> = std::iter::from_fn(|| bus_l_rx.pop().ok()).collect();
+        let received_r: Vec<f32> = std::iter::from_fn(|| bus_r_rx.pop().ok()).collect();
+        assert_eq!(
+            received_l,
+            vec![0.1, 0.2, 0.3, 0.4],
+            "left channel should be correctly deinterleaved, got {received_l:?}"
+        );
+        assert_eq!(
+            received_r,
+            vec![0.5, 0.6, 0.7, 0.8],
+            "right channel should be correctly deinterleaved, got {received_r:?}"
         );
     }
 }

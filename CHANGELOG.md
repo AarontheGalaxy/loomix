@@ -119,6 +119,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     renderer, cross-checked against a fixture generated from the real
     Rust engine rather than trusted independently by either side.
 
+### Fixed
+
+- `master_ioproc_trampoline`'s output buffer was scrambled on real
+  hardware: `EngineIoDriver::unpack_channels` assumed one buffer per
+  channel, but a real output device delivers one combined interleaved
+  buffer, so only the first channel's worth of samples was written and
+  the rest of the buffer kept whatever stale/poisoned data was already
+  there. Found live (reported as "crackling, robotic, distorted" real
+  audio, not from inspection) and proven with a deterministic test before
+  the fix, per `docs/ARCHITECTURE.md`. `pack_channels` (the input-side
+  mirror, for a master device also used as a strip source) got the same
+  fix and its own test, though that path is not reachable in the current
+  app's wiring yet.
+
 ### Known limitations
 
 - Intellipan's Color pad tonal-shaping ships without its "small reverb on
@@ -139,6 +153,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   click-to-type-a-value and right-click-to-change-the-dB-scale (spec 1.7)
   are real UI work for that milestone; the renderer already takes a dB
   range as a parameter so that control has something to drive.
+- Real device I/O has no correction for a genuine input/output nominal
+  sample-rate mismatch (e.g. a 44.1kHz input device against a 48kHz
+  output), only for small clock drift between devices already at the
+  same rate: `connect_audio` never queries or compares the input
+  device's nominal rate, and the capture resampler's drift corrector is
+  bounded (`max_correction = 0.01`) and reset-on-discontinuity in a way
+  that a real mismatch defeats rather than converges against. Proven by
+  a host-side test (`loomix-hal::ioproc`), not yet fixed — see
+  `docs/ARCHITECTURE.md`'s 2026-08-28 entry.
 
 ## [0.1.0] - 2026-08-23
 

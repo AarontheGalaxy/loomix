@@ -356,6 +356,89 @@ mod tests {
         );
     }
 
+    /// Spec 2.3's PI controller is explicitly "slow" and, in
+    /// `main.rs::connect_audio`'s actual constants (reused here
+    /// verbatim), bounded to `max_correction = 0.01` with a
+    /// `discontinuity_threshold` of 500 samples of *cumulative* error --
+    /// tuned for the small, genuinely-drifting-clock scenario the test
+    /// above covers (two devices at the *same* nominal rate, one running
+    /// a few hundred ppm fast or slow). Nothing in `connect_audio` or
+    /// `attach_capture_device` queries the capture device's own nominal
+    /// sample rate (only the output device's, via `nominal_sample_rate`,
+    /// feeds `engine.set_sample_rate`) or seeds the resampler's ratio
+    /// with it -- every capture stage starts blind at ratio 1.0 and is
+    /// only ever nudged a fraction of a percent per block from there.
+    ///
+    /// A *genuine* nominal-rate pairing most real setups will hit sooner
+    /// or later -- a 44.1 kHz input device against a 48 kHz output, an
+    /// 8.125% difference -- needs a steady-state ratio of about 0.919 to
+    /// track the master, ~92x past `max_correction`'s reach. Worse: the
+    /// cumulative error crosses `discontinuity_threshold` (500 samples)
+    /// after only ~45 blocks at this mismatch, and every crossing is
+    /// mistaken for the one-off device-reconfiguration jump the threshold
+    /// exists to catch (`drift.rs`'s `DriftCorrector::update` doc
+    /// comment): the integral resets and the ratio snaps back to exactly
+    /// 1.0, over and over, so the loop never settles anywhere near the
+    /// ratio it actually needs. This is a real, distinct gap from the
+    /// interleaved-buffer bug fixed elsewhere in this milestone -- proven
+    /// here, not assumed, by running the exact same harness and
+    /// production constants as the passing 500 ppm test above and
+    /// showing the frame-drift bound that test relies on does not hold.
+    #[test]
+    fn a_genuine_nominal_rate_mismatch_is_not_corrected_within_production_bounds() {
+        let sample_rate = 48_000.0;
+        let block_frames = 128;
+        let num_callbacks = 2000;
+        let input_frames = sine_tone(block_frames * num_callbacks * 2, sample_rate, 1_000.0, 0);
+        let input: Vec<f32> = input_frames.iter().map(|f| f[0]).collect();
+
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(input.len());
+        let master = MasterClock::default();
+        // Same constants `main.rs::connect_audio` actually configures,
+        // not a hypothetical worst case.
+        let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
+        let mut stage = DriftCorrectedIoStage::new(1, corrector);
+        let ratio_handle = stage.ratio_handle();
+
+        // 44100 Hz capture against a 48000 Hz master: (44100 / 48000 - 1)
+        // * 1e6 ppm -- a real device pairing, not a stress-test extreme.
+        let device = FakeDevice {
+            block_frames,
+            ppm_offset: (44_100.0 / 48_000.0 - 1.0) * 1e6,
+        };
+        device.run_capture(
+            &mut stage,
+            &master,
+            &input,
+            std::slice::from_mut(&mut producer),
+            num_callbacks,
+        );
+
+        let mut received = Vec::new();
+        while let Ok(sample) = consumer.pop() {
+            received.push(sample);
+        }
+
+        let master_frames = master.frames() as usize;
+        let frame_drift = received.len().abs_diff(master_frames);
+        assert!(
+            frame_drift > 5_000,
+            "expected a genuine nominal-rate mismatch to drift far past \
+             the 500 ppm test's <300 frame bound (nothing here seeds or \
+             widens the correction for it), got only {frame_drift} \
+             frames of drift (master = {master_frames}, received = {})",
+            received.len()
+        );
+
+        let final_ratio = ratio_handle.get();
+        assert!(
+            (final_ratio - 1.0).abs() < 0.02,
+            "expected the discontinuity guard to keep snapping the ratio \
+             back to ~1.0 rather than settling near the ~0.919 this \
+             pairing actually needs, got {final_ratio}"
+        );
+    }
+
     #[test]
     fn render_underrun_fills_silence_instead_of_blocking_or_stale_data() {
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
