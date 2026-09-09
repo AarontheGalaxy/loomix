@@ -310,3 +310,308 @@ body {
   background: var(--meter);
   transition: height 60ms linear;
 }
+
+/* M10: one compact row per macro control (gate/comp/denoiser knobs,
+   limiter threshold, the 3-band EQ's bands) -- same idiom as .pan-row,
+   deliberately thin so eleven new controls stack without turning the
+   strip into a wall of sliders (docs/ARCHITECTURE.md's M10 entry). */
+.mini-slider-row {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mini-slider-label {
+  flex: 0 0 auto;
+  /* Wide enough for "Denoiser"/"Limiter" -- the spec's own control names
+     (docs/ARCHITECTURE.md's M10 entry), not invented two-letter codes. */
+  width: 46px;
+  font-size: 9px;
+  color: var(--text-dim);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mini-slider {
+  flex: 1;
+  min-width: 0;
+  height: 12px;
+  cursor: pointer;
+}
+
+/* The Intellipan pad (hardware strips) and the 5.1 position pad (virtual
+   strips): a bounded square drag surface, sized to the column's own
+   width rather than a fixed pixel size, so it stays proportionate at any
+   window width. */
+/* A real 2D drag surface still needs both axes usable, but a literal
+   square (matching the column's own width) dwarfed the fader below it in
+   the first render of this layout -- the strip's most-used control ended
+   up squeezed under an oversized, mostly-empty box. Wide-rather-than-tall
+   keeps every position reachable while giving the fader back its room. */
+.xy-pad {
+  flex: 0 0 auto;
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2.2 / 1;
+  background: #26272f;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+/* Faint centre axes: a bare bounded rectangle with no other content
+   didn't read as interactive at all in the first pass of this layout --
+   these are pure orientation cues (this is a 2D surface, drag anywhere
+   in it), not tied to any particular value. */
+.xy-pad-axis-x,
+.xy-pad-axis-y {
+  position: absolute;
+  background: var(--border);
+  pointer-events: none;
+}
+
+.xy-pad-axis-x {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+}
+
+.xy-pad-axis-y {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+}
+
+.xy-pad-dot {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  margin-left: -6px;
+  margin-bottom: -6px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #1a1b22;
+  box-shadow: 0 0 0 1px var(--accent);
+  pointer-events: none;
+}
+
+.xy-pad-label {
+  position: absolute;
+  top: 2px;
+  left: 3px;
+  font-size: 8px;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+
+/* The EQ trigger button: spec 1.5's colour-coded glance state, extended
+   to strip EQ (M10) -- never requires opening the dialog to see whether a
+   strip/bus is filtered. */
+.eq-button {
+  /* flex: 0 0 auto by default (a standalone row on a hardware strip, not
+     inside .channel-buttons) -- overridden below when it *is* nested in
+     one (a bus column's Mute+EQ row), so it shares that row's width the
+     same way every .toggle there already does. */
+  flex: 0 0 auto;
+  width: 100%;
+  padding: 3px 0;
+  background: #26272f;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.channel-buttons .eq-button {
+  flex: 1;
+  width: auto;
+}
+
+.eq-button-eq {
+  background: var(--meter);
+  border-color: var(--meter);
+  color: #1a1a1a;
+}
+
+.eq-button-delay {
+  background: var(--mute);
+  border-color: var(--mute);
+  color: #1a1a1a;
+}
+
+.eq-button-both {
+  background: var(--solo);
+  border-color: var(--solo);
+  color: #1a1a1a;
+}
+
+.eq-button-neutral {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+/* The parametric EQ panel: the first place in this app that hides state
+   behind a dialog (docs/ARCHITECTURE.md's M10 entry) -- the EQ buttons
+   above exist specifically so a user never has to open this to find out
+   which strip/bus is filtered. */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+.eq-panel {
+  width: min(560px, 92vw);
+  max-height: 86vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.eq-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.eq-panel-header h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.eq-panel-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+
+.eq-panel-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.eq-panel-memory,
+.eq-panel-channels {
+  display: flex;
+  gap: 3px;
+}
+
+.eq-graph-wrap {
+  background: #26272f;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px;
+  align-self: center;
+}
+
+.eq-graph-background {
+  fill: #1a1b22;
+}
+
+.eq-graph-gridline {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.eq-graph-curve {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+}
+
+/* spec 1.7's trim/delay/FLAT/CH COPY -- one row above the cell table,
+   scoped to whichever channel is currently selected. */
+.eq-panel-channel-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.eq-panel-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.eq-panel-field input[type="number"] {
+  width: 56px;
+  background: #26272f;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 11px;
+  padding: 2px 4px;
+}
+
+.eq-panel-copy {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.eq-panel-copy select {
+  background: #26272f;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 11px;
+  padding: 2px 4px;
+}
+
+.eq-cell-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.eq-cell-table th {
+  text-align: left;
+  color: var(--text-dim);
+  font-weight: 500;
+  padding: 2px 6px;
+}
+
+.eq-cell-table td {
+  padding: 2px 6px;
+}
+
+.eq-cell-table select,
+.eq-cell-table input[type="number"] {
+  width: 100%;
+  background: #26272f;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 11px;
+  padding: 2px 3px;
+}
+
+.eq-panel-loading {
+  color: var(--text-dim);
+  font-size: 11px;
+}

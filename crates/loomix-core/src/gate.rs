@@ -79,6 +79,14 @@ impl Gate {
     /// The macro knob (spec 1.3): `knob <= 0.0` bypasses the gate entirely
     /// (spec 4.1's required true-neutral setting). Loomix's own curve,
     /// documented in `docs/DSP.md`, table "Gate".
+    /// The macro knob's last-set value, for a UI reconciliation snapshot
+    /// (`loomix-app::control`) to mirror -- not derivable from `bypass`
+    /// alone, since any `knob <= 0.0` bypasses identically regardless of
+    /// which non-positive value was actually sent.
+    pub fn knob(&self) -> f32 {
+        self.knob
+    }
+
     pub fn set_knob(&mut self, knob: f32) {
         self.knob = knob;
         self.bypass = knob <= 0.0;
