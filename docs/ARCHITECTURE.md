@@ -5,6 +5,54 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-09-09 — coverage audit against the three vendor manuals
+
+The pan pot gap logged in the entry below (engine-complete since M5,
+unreachable from any UI until today) was exactly the failure mode this
+audit was asked to hunt for deliberately, rather than wait for the next
+one to surface by accident. An initial attempt read all three manuals in
+one pass and classified while reading; rejected as sampling and redone
+properly: each manual (Standard 99 pages, Banana 99 pages, Potato 112
+pages) was read in exact, non-overlapping 15-page chunks, extraction
+only, into 22 page-cited files under `docs/audit/`, and only once every
+chunk file existed was the classification pass run as a separate step
+against those files, `docs/SPEC.md`, and the actual code (`loomix-core`'s
+public structs for what the engine has, `main.rs`'s `#[tauri::command]`
+surface and `ui/src/bridge.ts`/`App.tsx` for what the UI actually
+reaches — not assumed from `SPEC.md`'s own text).
+
+Findings, full detail in `docs/COVERAGE-AUDIT-2026-09-09.md`: roughly 14
+control groups are implemented and reachable, 14 are implemented in the
+engine but not reachable from any UI (parametric EQ, gate, compressor,
+denoiser, the limiter's threshold, all three Intellipan pad modes, the
+virtual strip's 3-band EQ and 5.1 position pad, M.C., and Karaoke — the
+pan pot above was one of these 14, now fixed), roughly 30 are specified
+but not yet implemented with a milestone already assigned, and 4 were
+missing from `SPEC.md` entirely. `SPEC.md` turned out to already be
+unusually thorough, having been written directly from the same Remote
+API parameter tables this audit independently re-extracted — detail this
+audit expected to find missing (Voice Modeler/Pitch, the extended
+-36..+18dB strip EQ range, per-app `AppGain`/`AppMute`) was already
+present. The four state-4 gaps — a bus-level output-limiter/peak-remover
+system toggle, the `AutoUpMixMode` auto-detection refinement, DMX-512
+lighting control under macro buttons, and the System Settings dialog's
+own Absolute/Relative slider-linking mode (distinct from Streamer View's
+own, already-documented one) — are added to `SPEC.md` now, each tagged
+to an existing milestone (M7 or M8 or M11) by scope; none needed a new
+milestone number inserted, though the bus output limiter's milestone tag
+(M8) is a judgement call flagged explicitly in the report rather than a
+clean fit, since no milestone's own description names bus-level limiting.
+No disagreements were found between the three manuals on any control's
+actual behaviour — what full-text reading did turn up instead: two
+places where a manual's own Specifications-table summary undersells its
+own, more detailed dialog documented a few pages earlier (not a
+cross-manual conflict), a literal vendor-table row duplication, and a
+now-resolved ambiguity over whether the Remote API's `Pan_x`/`Pan_y` pair
+implied a hidden second pan control on virtual strips (it doesn't --
+confirmed to be the same 5.1 position-pad coordinate `SPEC.md` 1.2 step 9
+already names, once Banana's own parameter table's remark column was read
+directly rather than inferred from Standard's terser one).
+
 ## 2026-09-09 — M8 (continued): the hardware strip pan pot, wired to the UI
 
 Found sitting unused since M5: `loomix-core::strip_dsp::HardwareChain` has

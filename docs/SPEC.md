@@ -75,8 +75,9 @@ Same chain, except: no Comp / Gate / Denoiser knobs, no strip parametric EQ, no 
 5. **Mono button**: first press sums to mono, second press swaps channels 1 and 2 (stereo reverse), third press returns to off.
 6. **Mute**.
 7. **Bus gain fader**.
-8. **Global per bus output delay** from system settings, 0 to 500 ms.
-9. Output to hardware device or virtual capture device.
+8. **Output limiter**: a system-wide toggle (`Out Limiter`, section 1.11) switches every bus between a brickwall limiter (0 dBFS ceiling) and a simple peak remover. On by default. Found missing from this document by the 2026-09-09 coverage audit against all three vendor manuals (`docs/COVERAGE-AUDIT-2026-09-09.md`) — hardware strips already had a limiter step (section 1.3) but buses had none anywhere in this document. Milestone: M8.
+9. **Global per bus output delay** from system settings, 0 to 500 ms.
+10. Output to hardware device or virtual capture device.
 
 ## 1.3 Hardware input strip: every control
 
@@ -159,6 +160,7 @@ Same chain, except: no Comp / Gate / Denoiser knobs, no strip parametric EQ, no 
 | Delay return | rotary | 0..10 | |
 | FX1 return, FX2 return | rotary | 0..10 | |
 | Monitor select | toggle | exclusive selection | Chooses which bus is heard on the monitoring bus |
+| Output limiter | implicit, per bus | brickwall (0 dBFS) or peak remover | Not a per-bus button in the reference product — controlled by the single system-wide `Out Limiter` toggle (section 1.11). Missing from this document until the 2026-09-09 coverage audit; see section 1.2 step 8. Milestone: M8 |
 | Output meter | display | per channel with peak hold | |
 
 ## 1.6 The 12 bus modes
@@ -181,6 +183,8 @@ Given the 8 channel layout `FL FR FC SW RL RR SL SR`:
 | Rear Only | `L=RL`, `R=RR` |
 
 Note that the published Mix Down formulas literally use `RL` on the right hand side of the RIGHT channel, which looks like a typo for `FR` in the vendor documentation. Implement `RIGHT = FR + 0.7*FC + SW ∓ RR ± SR` and cover it with a unit test, then leave a code comment about the discrepancy.
+
+**Optional refinement, found by the 2026-09-09 coverage audit (`docs/COVERAGE-AUDIT-2026-09-09.md`), confirmed identically in all three vendor manuals' registry documentation, not a blocking requirement:** the reference product can auto-detect whether the incoming signal on an Up Mix bus is genuinely stereo or already multichannel, by checking for material above -80 dBFS on channels 3, 4 and 5, and skip the Up Mix transform when it is (registry key `AutoUpMixMode`, off by default, not exposed as a mixer UI control in the reference product either). Add as a per-bus toggle alongside the Up Mix modes. Milestone: M7 (already shipped Up Mix itself — this is a completeness addition to that milestone, not a new one).
 
 ## 1.7 Parametric EQ engine
 
@@ -266,6 +270,8 @@ Two true aux paths with send and return knobs, routed to physical hardware chann
 * Insert patch: an on/off toggle for each of the 22 input channels, sending it out to an external processor and back.
 * Insert point pre FX or post FX switch.
 * Engine mode and internal clock behaviour, including running with no output device at all on an internal clock.
+* **Out Limiter**: global on/off, default on. Switches every bus between a brickwall limiter and a simple peak remover (section 1.2 step 8, 1.5). Found missing from this document by the 2026-09-09 coverage audit, worded near-identically in all three vendor manuals (`docs/COVERAGE-AUDIT-2026-09-09.md`). Milestone: M8.
+* **Slider Mode**: Absolute (default) or Relative, governing whether a strip's per-bus gain-layer values jump together or preserve their relative offsets when one is dragged. Distinct from the Streamer View companion tool's own, separately configured slider-link mode (section 1.17, already documented). Found missing from this document by the same audit. Milestone: M8.
 
 ## 1.12 MIDI mapping
 
@@ -304,6 +310,7 @@ The protocol is public and free to implement, and interoperating with it is the 
 * Audio level trigger: choose an input strip, set an IN threshold that presses the button when the level rises above it, an OUT threshold that releases it when the level falls below it, and a HOLD time that keeps it engaged for a minimum period. This is how auto ducking and push to talk are built.
 * React to mixer events, in particular the recorder transport events.
 * System actions: execute a program with a command line, send keyboard events to the OS, send MIDI messages to up to 2 devices, send network text or MIDI requests to remote instances.
+* **DMX-512 lighting control**: set a value on a given DMX address/channel (optionally several channels at once) and commit the frame to a DMX serial interface. Found missing from this document by the 2026-09-09 coverage audit, confirmed identically in all three vendor manuals (`docs/COVERAGE-AUDIT-2026-09-09.md`); niche and hardware-dependent (needs a USB DMX interface), but a genuine reference-product capability, not one of this document's deliberate exclusions. Milestone: M11.
 
 ## 1.15 Remote control API and request script
 
