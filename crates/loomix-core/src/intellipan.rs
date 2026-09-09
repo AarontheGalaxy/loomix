@@ -58,6 +58,16 @@ impl ColorPad {
         self.recompute();
     }
 
+    /// Returns to the just-constructed state, in place -- no allocation,
+    /// unlike constructing a fresh `ColorPad` and moving it in. Used by
+    /// [`IntellipanPads::set_mode`] so switching pad modes on the audio
+    /// thread (spec 3.3) never leaks a previous session's position.
+    pub fn reset(&mut self) {
+        self.x = 0.0;
+        self.y = 0.0;
+        self.recompute();
+    }
+
     fn recompute(&mut self) {
         let tilt_db = (self.x / 0.5) * MAX_TILT_DB;
         if tilt_db == 0.0 {
@@ -117,6 +127,18 @@ impl PositionPad {
     pub fn set_position(&mut self, x: f32, y: f32) {
         self.x = x.clamp(-0.5, 0.5);
         self.y = y.clamp(0.0, 1.0);
+    }
+
+    /// Returns to the just-constructed state, in place -- see
+    /// [`ColorPad::reset`]. `.fill()` on the existing arrays rather than
+    /// assigning a fresh `[0.0; BUF_LEN]` literal, so this never
+    /// materialises a second BUF_LEN-sized array on the stack.
+    pub fn reset(&mut self) {
+        self.x = 0.0;
+        self.y = 0.0;
+        self.buf_l.fill(0.0);
+        self.buf_r.fill(0.0);
+        self.write_idx = 0;
     }
 
     pub fn process(&mut self, frame: &mut Frame) {
@@ -202,6 +224,17 @@ impl ModulationPad {
         self.y = y.clamp(0.0, 1.0);
     }
 
+    /// Returns to the just-constructed state, in place -- see
+    /// [`ColorPad::reset`] / [`PositionPad::reset`].
+    pub fn reset(&mut self) {
+        self.x = 0.0;
+        self.y = 0.0;
+        self.buf_l.fill(0.0);
+        self.buf_r.fill(0.0);
+        self.write_idx = 0;
+        self.phase = 0.0;
+    }
+
     pub fn process(&mut self, frame: &mut Frame) {
         if self.y <= 0.0 {
             return;
@@ -245,41 +278,101 @@ impl ModulationPad {
     }
 }
 
-/// All three variants are boxed: an unboxed enum is sized for its
-/// *largest* variant regardless of which mode is active. `Position`/
-/// `Modulation` were boxed first, for their delay-line buffers (2048 and
-/// 8192 `f32` samples respectively, sized for high sample rates) — every
-/// `Strip` would otherwise pay Modulation's ~64KB whether or not it's ever
-/// selected, and constructing all 8 blew the test thread's stack before
-/// that fix. `Color` was boxed later (M6): its four `Biquad`s each grew by
-/// a coefficient-ramp field (`biquad.rs`'s click-avoidance smoothing,
-/// spec 4.1), pushing `ColorPad` past clippy's `large_enum_variant`
-/// threshold against the other two variants' now-pointer size — the same
-/// fix, applied for the same reason, on a different variant. Boxing only
-/// happens on mode construction/switching (a configuration-time
-/// operation, not inside `process()`), never on the audio thread.
-pub enum Intellipan {
-    Color(Box<ColorPad>),
-    Position(Box<PositionPad>),
-    Modulation(Box<ModulationPad>),
+/// Spec 1.18: "right click the 2D pad, cycle Color, Position, Modulation" —
+/// a live UI control (M10), not just a construction-time choice, so mode
+/// switching has to happen on the audio thread (spec 3.3) without
+/// allocating. `IntellipanPads` (below) is the RT-safe answer: all three
+/// pads are allocated once and kept alive permanently, `mode` just picks
+/// which one `process`/`set_position` dispatch to — switching never boxes
+/// a new pad the way an enum-of-boxes swap would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IntellipanMode {
+    #[default]
+    Color,
+    Position,
+    Modulation,
 }
 
-impl Intellipan {
-    pub fn color(sample_rate: f32) -> Self {
-        Self::Color(Box::new(ColorPad::new(sample_rate)))
+/// All three pads are boxed individually and held permanently (not an
+/// enum of boxes any more — see [`IntellipanMode`]'s doc comment for why):
+/// `Position`/`Modulation`'s delay-line buffers (2048 and 8192 `f32`
+/// samples respectively, sized for high sample rates) and `Color`'s
+/// coefficient-ramping biquads are each big enough on their own that an
+/// *unboxed* struct field would blow the parent `HardwareChain`'s stack
+/// footprint across 8 strips — the same reasoning the old boxed-enum
+/// design used, just three permanent boxes instead of one swapped box.
+/// Constructing all three costs one extra allocation per hardware strip
+/// (5 strips, done once at startup, spec 3.3 only forbids allocating on
+/// the audio thread) in exchange for mode switching being a pure
+/// discriminant write plus an in-place [`ColorPad::reset`]-family call —
+/// zero allocation, provable the same way every other real-time claim in
+/// this crate is (`tests::switching_mode_does_not_allocate`).
+pub struct IntellipanPads {
+    mode: IntellipanMode,
+    color: Box<ColorPad>,
+    position: Box<PositionPad>,
+    modulation: Box<ModulationPad>,
+}
+
+impl IntellipanPads {
+    pub fn new(sample_rate: f32) -> Self {
+        Self {
+            mode: IntellipanMode::default(),
+            color: Box::new(ColorPad::new(sample_rate)),
+            position: Box::new(PositionPad::new(sample_rate)),
+            modulation: Box::new(ModulationPad::new(sample_rate)),
+        }
     }
-    pub fn position(sample_rate: f32) -> Self {
-        Self::Position(Box::new(PositionPad::new(sample_rate)))
+
+    pub fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.color.set_sample_rate(sample_rate);
+        self.position.set_sample_rate(sample_rate);
+        self.modulation.set_sample_rate(sample_rate);
     }
-    pub fn modulation(sample_rate: f32) -> Self {
-        Self::Modulation(Box::new(ModulationPad::new(sample_rate)))
+
+    pub fn mode(&self) -> IntellipanMode {
+        self.mode
+    }
+
+    /// The pad currently selected by [`Self::mode`]'s own `x`/`y`, for
+    /// mirroring into a UI reconciliation snapshot.
+    pub fn position(&self) -> (f32, f32) {
+        match self.mode {
+            IntellipanMode::Color => (self.color.x, self.color.y),
+            IntellipanMode::Position => (self.position.x, self.position.y),
+            IntellipanMode::Modulation => (self.modulation.x, self.modulation.y),
+        }
+    }
+
+    /// Switches the active pad. Resets whichever pad becomes newly active
+    /// to its just-constructed state (module doc, spec 1.18's "cycle"
+    /// gesture implies re-entering a mode starts clean, matching the old
+    /// enum-of-boxes design's actual behaviour of reconstructing it) --
+    /// never the pad being switched *away* from, which keeps running
+    /// silently in the background exactly as before (it simply isn't
+    /// `process`ed while inactive).
+    pub fn set_mode(&mut self, mode: IntellipanMode) {
+        self.mode = mode;
+        match mode {
+            IntellipanMode::Color => self.color.reset(),
+            IntellipanMode::Position => self.position.reset(),
+            IntellipanMode::Modulation => self.modulation.reset(),
+        }
+    }
+
+    pub fn set_position(&mut self, x: f32, y: f32) {
+        match self.mode {
+            IntellipanMode::Color => self.color.set_position(x, y),
+            IntellipanMode::Position => self.position.set_position(x, y),
+            IntellipanMode::Modulation => self.modulation.set_position(x, y),
+        }
     }
 
     pub fn process(&mut self, frame: &mut Frame) {
-        match self {
-            Self::Color(p) => p.process(frame),
-            Self::Position(p) => p.process(frame),
-            Self::Modulation(p) => p.process(frame),
+        match self.mode {
+            IntellipanMode::Color => self.color.process(frame),
+            IntellipanMode::Position => self.position.process(frame),
+            IntellipanMode::Modulation => self.modulation.process(frame),
         }
     }
 }
@@ -359,10 +452,9 @@ mod tests {
 
     #[test]
     fn mode_switching_does_not_leak_state_between_modes() {
-        let mut pad = Intellipan::modulation(SR);
-        if let Intellipan::Modulation(m) = &mut pad {
-            m.set_position(-0.5, 1.0); // feedback + depth engaged
-        }
+        let mut pad = IntellipanPads::new(SR);
+        pad.set_mode(IntellipanMode::Modulation);
+        pad.set_position(-0.5, 1.0); // feedback + depth engaged
         let mut driven: Frame = [0.0; CHANNELS];
         driven[0] = 1.0;
         driven[1] = 1.0;
@@ -370,12 +462,13 @@ mod tests {
             pad.process(&mut driven);
         }
 
-        // Switching the same `Intellipan` to Color must behave exactly
-        // like a never-touched Color pad: each mode owns its own struct
-        // entirely, so replacing the enum variant can't leak Modulation's
-        // delay-line state into it.
-        pad = Intellipan::color(SR);
-        let mut fresh = Intellipan::color(SR);
+        // Switching to Color must behave exactly like a never-touched
+        // Color pad: `set_mode` resets whichever pad becomes newly active
+        // (module doc), so Modulation's delay-line state can't leak into
+        // it even though, unlike the old enum-of-boxes design, the same
+        // `ColorPad` allocation is reused rather than rebuilt.
+        pad.set_mode(IntellipanMode::Color);
+        let mut fresh = IntellipanPads::new(SR);
         let mut probe_a: Frame = [0.0; CHANNELS];
         probe_a[0] = 0.3;
         probe_a[1] = -0.4;
@@ -383,6 +476,67 @@ mod tests {
         pad.process(&mut probe_a);
         fresh.process(&mut probe_b);
         assert_eq!(probe_a, probe_b);
+    }
+
+    /// The same proof as above, in the other direction: switching *back*
+    /// to Modulation after driving it hard must also read as fresh, not
+    /// resume wherever its buffer/phase were left. The old enum-of-boxes
+    /// design got this for free (every switch rebuilt the pad); the new
+    /// permanent-allocation design only gets it if `set_mode` actually
+    /// resets the pad it switches *into*, which is the one behaviour this
+    /// test exists to pin down that the leak test above doesn't (that one
+    /// never switches back).
+    #[test]
+    fn switching_back_into_a_previously_driven_mode_is_also_reset() {
+        let mut pad = IntellipanPads::new(SR);
+        pad.set_mode(IntellipanMode::Modulation);
+        pad.set_position(-0.5, 1.0);
+        let mut driven: Frame = [1.0; CHANNELS];
+        for _ in 0..500 {
+            pad.process(&mut driven);
+        }
+        pad.set_mode(IntellipanMode::Color); // away...
+        pad.set_mode(IntellipanMode::Modulation); // ...and back
+
+        let mut fresh = IntellipanPads::new(SR);
+        fresh.set_mode(IntellipanMode::Modulation);
+        pad.set_position(-0.5, 1.0);
+        fresh.set_position(-0.5, 1.0);
+
+        let mut probe_a: Frame = [0.0; CHANNELS];
+        probe_a[0] = 0.3;
+        probe_a[1] = -0.4;
+        let mut probe_b = probe_a;
+        pad.process(&mut probe_a);
+        fresh.process(&mut probe_b);
+        assert_eq!(
+            probe_a, probe_b,
+            "re-entering Modulation should read as fresh, not resume its old buffer/phase"
+        );
+    }
+
+    /// Spec 1.18's "right click cycles pad mode" gesture is now a live UI
+    /// action (M10), reachable from the audio thread's own command drain
+    /// (`loomix-app::control::EngineCommand::apply`) -- proves the module
+    /// doc's actual RT-safety claim rather than just asserting it: mode
+    /// switching and repositioning must never allocate, which the old
+    /// enum-of-boxes design (reconstructing a fresh `Box` per switch)
+    /// would have failed outright.
+    #[test]
+    fn switching_mode_and_repositioning_does_not_allocate() {
+        use crate::rt_assert::assert_realtime;
+
+        let mut pad = IntellipanPads::new(SR);
+        assert_realtime(|| {
+            pad.set_mode(IntellipanMode::Modulation);
+            pad.set_position(-0.3, 0.7);
+            pad.set_mode(IntellipanMode::Position);
+            pad.set_position(0.2, 0.4);
+            pad.set_mode(IntellipanMode::Color);
+            pad.set_position(0.1, 0.0);
+            let mut frame: Frame = [0.1; CHANNELS];
+            pad.process(&mut frame);
+        });
     }
 
     #[test]

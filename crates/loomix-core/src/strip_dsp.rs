@@ -9,7 +9,7 @@ use crate::compressor::Compressor;
 use crate::denoiser::Denoiser;
 use crate::eq3::ThreeBandEq;
 use crate::gate::Gate;
-use crate::intellipan::Intellipan;
+use crate::intellipan::IntellipanPads;
 use crate::karaoke::Karaoke;
 use crate::limiter::Limiter;
 use crate::pan::{PositionPad5_1, StereoBalance};
@@ -24,7 +24,7 @@ pub struct HardwareChain {
     pub gate: Gate,
     pub compressor: Compressor,
     pub eq: ParametricEq<2>,
-    pub pad: Intellipan,
+    pub pad: IntellipanPads,
     pub pan: StereoBalance,
     pub limiter: Limiter,
 }
@@ -36,7 +36,7 @@ impl HardwareChain {
             gate: Gate::new(sample_rate),
             compressor: Compressor::new(sample_rate),
             eq: ParametricEq::new(sample_rate),
-            pad: Intellipan::color(sample_rate), // spec names no default pad mode; Color is as good as any, and (0,0) is neutral regardless
+            pad: IntellipanPads::new(sample_rate), // spec names no default pad mode; Color is as good as any, and (0,0) is neutral regardless
             pan: StereoBalance::default(),
             limiter: Limiter::default(),
         }
@@ -47,11 +47,7 @@ impl HardwareChain {
         self.gate.set_sample_rate(sample_rate);
         self.compressor.set_sample_rate(sample_rate);
         self.eq.set_sample_rate(sample_rate);
-        match &mut self.pad {
-            Intellipan::Color(p) => p.set_sample_rate(sample_rate),
-            Intellipan::Position(p) => p.set_sample_rate(sample_rate),
-            Intellipan::Modulation(p) => p.set_sample_rate(sample_rate),
-        }
+        self.pad.set_sample_rate(sample_rate);
     }
 
     pub fn process(&mut self, frame: &mut Frame) {
@@ -117,8 +113,8 @@ impl VirtualChain {
 }
 
 pub enum StripChain {
-    // Boxed for the same reason `Intellipan`'s Position/Modulation
-    // variants are (see `docs/ARCHITECTURE.md`'s M5 entry): M6's strip EQ
+    // Boxed for the same reason `IntellipanPads`'s own fields are (see
+    // `docs/ARCHITECTURE.md`'s M5 entry): M6's strip EQ
     // added two `EqChannel`s (each 6 biquads plus a delay line) to
     // `HardwareChain`, and an unboxed enum is sized for its *largest*
     // variant regardless of which is active -- every `Strip`, hardware or
@@ -152,6 +148,16 @@ impl StripChain {
         match self {
             Self::Hardware(c) => c.process(frame),
             Self::Virtual(c) => c.process(frame),
+        }
+    }
+
+    /// Both chain kinds have their own `Limiter` (spec 1.3/1.4) -- this
+    /// lets a caller (`loomix-app::control::EngineCommand::apply`) set its
+    /// threshold without matching on which kind it is.
+    pub fn limiter_mut(&mut self) -> &mut Limiter {
+        match self {
+            Self::Hardware(c) => &mut c.limiter,
+            Self::Virtual(c) => &mut c.limiter,
         }
     }
 }
