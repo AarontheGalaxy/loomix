@@ -1,8 +1,30 @@
 [graph]
 all-features = true
+# Loomix is macOS-only (spec 4.5's non-goals: "No Windows or Linux
+# support"), and CI only ever runs on macos-15 -- without this, cargo-deny
+# checks the union of every platform's dependency tree by default, which
+# pulls in Tauri's Linux-only webkit2gtk/gtk/glib chain (and the crates it
+# in turn drags in) purely because they're *listed* in Cargo.lock, not
+# because they'd ever actually build or ship here.
+targets = [
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+]
 
 [advisories]
 yanked = "deny"
+# All three are transitive, no-safe-upgrade-available dependencies of
+# tauri-utils's urlpattern (via unic-ucd-ident/unic-ucd-version/
+# unic-common), not something this project chose or can drop without
+# dropping Tauri itself -- see cargo-deny check's failure log for the
+# exact chain if this ever needs re-verifying.
+ignore = [
+    "RUSTSEC-2025-0075", # unic-char-range unmaintained
+    "RUSTSEC-2025-0080", # unic-common unmaintained
+    "RUSTSEC-2025-0081", # unic-char-property unmaintained
+    "RUSTSEC-2025-0098", # unic-ucd-version unmaintained
+    "RUSTSEC-2025-0100", # unic-ucd-ident unmaintained
+]
 
 [licenses]
 allow = [
@@ -16,6 +38,35 @@ allow = [
     "Zlib",
     "CC0-1.0",
 ]
+
+# MPL-2.0 is deliberately not in the general allow-list above (the same
+# reasoning that rejected `triple_buffer` for M4's drift correction, where
+# a permissively-licensed alternative existed and was built instead). The
+# five crates below carry no code of ours and no alternative: they are
+# tauri-utils's own CSS/selector parsing (dom_query's dependency, used
+# internally for Tauri's asset/CSP handling) and wry's platform-directory
+# lookup (via dirs-sys) -- unavoidable while using Tauri at all, which is
+# an already-locked architecture decision (spec 3.1), not a choice being
+# made here.
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+name = "cssparser"
+
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+name = "cssparser-macros"
+
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+name = "dtoa-short"
+
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+name = "selectors"
+
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+name = "option-ext"
 
 [bans]
 multiple-versions = "warn"

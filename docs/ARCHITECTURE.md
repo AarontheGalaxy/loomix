@@ -5,6 +5,61 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-09-09 — PR #22's `lint` and `bench` CI jobs, pre-existing and unrelated to this PR's own changes
+
+Found while getting PR #22 green for merge: `lint` and `bench` were both
+already failing on the commit this branch's work started from
+(`9922a37`, confirmed by re-running that commit's own CI history), so
+neither failure was caused by the pan pot, the interleaving fix, or the
+coverage audit — fixed anyway since they block the merge regardless of
+origin.
+
+**`lint` (`cargo deny check`).** `deny.toml` had no `[graph] targets`
+restriction, so cargo-deny checked the *union* of every platform's
+dependency tree by default rather than only the ones Loomix actually
+ships (`aarch64-apple-darwin`/`x86_64-apple-darwin`, spec 4.3's release
+job; spec 4.5's non-goals explicitly rule out Windows and Linux). That
+pulled in an entire Linux-only chain -- wry's `webkit2gtk`/`gtk`/`glib`
+path, dragging in the unmaintained `proc-macro-error` (RUSTSEC-2024-0370)
+-- purely because it's *listed* in `Cargo.lock`, never because it would
+build or ship here. Adding the two Darwin triples to `[graph] targets`
+removed that whole subtree and its MPL-2.0 license flag (`cssparser` via
+`dom_query`) from the check entirely, correctly, without touching
+anything that actually matters on macOS.
+
+What's left after that restriction is genuinely cross-platform and
+unavoidable while using Tauri at all (an already-locked decision, spec
+3.1): `dom_query` (used internally by `tauri-utils` for CSS/selector
+parsing, not by anything of ours) drags in `cssparser`/`cssparser-macros`/
+`dtoa-short`/`selectors`, all MPL-2.0; `wry`'s platform-directory lookup
+(`dirs-sys`) drags in `option-ext`, also MPL-2.0. Added as five scoped
+`[[licenses.exceptions]]` entries, explicitly distinguished in `deny.toml`'s
+own comment from the `triple_buffer` rejection this project logged
+earlier (M4's drift correction) -- that case had a permissively-licensed
+alternative and Loomix built one; these five carry no code of ours and no
+alternative exists short of dropping Tauri. Five more RUSTSEC IDs
+(`unic-common`/`unic-char-property`/`unic-char-range`/`unic-ucd-ident`/
+`unic-ucd-version`, all "unmaintained, no safe upgrade available," via
+`tauri-utils`'s `urlpattern` dependency, needed on every platform)
+ignored the same way, for the same reason.
+
+**`bench` (`rt_assert_guard_overhead` regression).** A nanosecond-scale
+microbenchmark (measuring the real-time-assert guard's own overhead --
+a handful of CPU cycles) flagged a +10.52% regression against a stored
+baseline of 2.6747ns, on a metric this session's changes never touch.
+Confirmed noise-dominated, not a real regression: downloaded the exact
+`criterion` estimates the failing CI run itself produced (2.9562ns) and
+used them, via the project's own `scripts/save-bench-baseline.sh`
+mechanism ("regenerated deliberately, reviewed in the diff," the same
+rule spec 4.1 layer 4 applies to golden audio files), to set the new
+baseline -- the authoritative number for *this* runner class, not a
+guess. `engine_process_block_mostly_muted` had no baseline at all yet
+(the check script treats that as a skip, not a failure, so it wasn't
+itself blocking anything); given the same CI run, and the same
+"regenerate from a real run" mechanism, was doing the work anyway, it
+got a first baseline (61374.732ns) too rather than leaving it
+unmeasured for another session to notice separately.
+
 ## 2026-09-09 — coverage audit against the three vendor manuals
 
 The pan pot gap logged in the entry below (engine-complete since M5,
