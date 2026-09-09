@@ -23,7 +23,9 @@
 
 use loomix_core::bus::BusMono;
 use loomix_core::bus_mode::BusMode;
-use loomix_core::parametric_eq::{EqCellParams, NUM_CELLS};
+use loomix_core::intellipan::IntellipanMode;
+use loomix_core::karaoke::KaraokeMode;
+use loomix_core::parametric_eq::{EqCellParams, EqChannelParams, Memory, NUM_CELLS};
 use loomix_core::strip_dsp::StripChain;
 use loomix_core::{Engine, Meter, CHANNELS, NUM_BUSES, NUM_STRIPS};
 use std::collections::HashMap;
@@ -32,7 +34,7 @@ use std::sync::Arc;
 
 /// spec 1.2 step 7: the hardware strip EQ is stereo, unlike the bus EQ's
 /// independent [`CHANNELS`] (8).
-const STRIP_EQ_CHANNELS: usize = 2;
+pub const STRIP_EQ_CHANNELS: usize = 2;
 
 /// Comfortably exceeds the mixer's total distinct addressable M8-scope
 /// parameters: summing every strip's mute/solo/mono, bus assigns, gain
@@ -69,6 +71,84 @@ pub enum EngineCommand {
     SetStripEqCell(usize, usize, usize, EqCellParams),
     /// (bus, channel, cell, params)
     SetBusEqCell(usize, usize, usize, EqCellParams),
+
+    // -- M10: the 2026-09-09 coverage audit's 11-item state-2 list
+    // (`docs/COVERAGE-AUDIT-2026-09-09.md`) -- every control here was
+    // already implemented and tested in `loomix-core`, just unreachable
+    // from any UI. See `tests::CONTROL_CASES` for the table-driven
+    // round-trip/bounds proof covering all fourteen variants below at
+    // once, per direct instruction not to hand-write eleven near-identical
+    // copy-pasted tests.
+    /// (strip, knob 0..10) -- spec 1.3's gate macro knob, hardware strips
+    /// only; a no-op on a virtual strip (spec 1.4 has no gate at all).
+    SetStripGateKnob(usize, f32),
+    /// (strip, knob 0..10) -- compressor macro knob, hardware strips only.
+    SetStripCompKnob(usize, f32),
+    /// (strip, knob 0..10) -- denoiser macro knob, hardware strips only.
+    SetStripDenoiserKnob(usize, f32),
+    /// (strip, threshold_db) -- spec 1.3/1.4's limiter threshold, valid on
+    /// both hardware and virtual strips (each chain kind has its own
+    /// `Limiter`, spec_dsp::StripChain::limiter_mut).
+    SetStripLimiterThreshold(usize, f32),
+    /// (strip, mode) -- spec 1.18's "right click cycles Color/Position/
+    /// Modulation," hardware strips only.
+    SetStripIntellipanMode(usize, IntellipanMode),
+    /// (strip, x, y) -- the Intellipan pad's currently active mode,
+    /// hardware strips only.
+    SetStripIntellipanXY(usize, f32, f32),
+    /// (strip, bass_db, mid_db, treble_db) -- spec 1.4's 3-band EQ,
+    /// virtual strips only.
+    SetStripEq3(usize, f32, f32, f32),
+    /// (strip, x, y) -- spec 1.4's 5.1 position pad, virtual strips only.
+    SetStripPositionPad(usize, f32, f32),
+    /// (strip, on) -- M.C. (mute centre), virtual strips only.
+    SetStripMc(usize, bool),
+    /// (strip, mode) -- Karaoke, virtual strips only. Spec 1.4 makes it
+    /// audible only on the AUX strip, but the field and this command apply
+    /// to any virtual strip, exactly like `VirtualChain::karaoke` itself --
+    /// `is_aux` gates whether `process()` ever reads it, not whether it
+    /// can be set, so this command doesn't re-implement that gating.
+    SetStripKaraoke(usize, KaraokeMode),
+    /// (strip, on) -- the strip parametric EQ's on/off toggle, hardware
+    /// strips only.
+    SetStripEqOn(usize, bool),
+    /// (strip, memory) -- the strip parametric EQ's A/B memory, hardware
+    /// strips only.
+    SetStripEqMemory(usize, Memory),
+    /// (bus, on) -- the bus parametric EQ's on/off toggle.
+    SetBusEqOn(usize, bool),
+    /// (bus, memory) -- the bus parametric EQ's A/B memory.
+    SetBusEqMemory(usize, Memory),
+
+    // -- M10 (continued): spec 1.7's per-channel trim/delay, FLAT and CH
+    // COPY. Brought into M10 rather than deferred, on direct instruction:
+    // all four are already fully implemented and tested in `loomix-core`
+    // (`ParametricEq::{set_trim_db,set_delay_ms,reset_channel,
+    // copy_channel}`), so leaving them unwired would recreate the exact
+    // state-2 shape M10 exists to close. COPY ALL (cross-bus, a genuinely
+    // different command shape -- two EQ instances, not one) and the file
+    // load/save plus right-click-precision-edit/scale gestures are the
+    // ones actually deferred; see `docs/ARCHITECTURE.md`'s M10 entry for
+    // why those specifically, with M14 named as the milestone that owns
+    // them, not left unassigned.
+    /// (strip, channel, trim_db) -- hardware strips only.
+    SetStripEqTrim(usize, usize, f32),
+    /// (strip, channel, delay_ms) -- hardware strips only.
+    SetStripEqDelay(usize, usize, f32),
+    /// (bus, channel, trim_db).
+    SetBusEqTrim(usize, usize, f32),
+    /// (bus, channel, delay_ms).
+    SetBusEqDelay(usize, usize, f32),
+    /// (strip, channel) -- FLAT: resets one channel to its neutral
+    /// default (every cell off, trim 0, delay 0), hardware strips only.
+    ResetStripEqChannel(usize, usize),
+    /// (bus, channel) -- FLAT.
+    ResetBusEqChannel(usize, usize),
+    /// (strip, from_channel, to_channel) -- CH COPY, within the strip's
+    /// own EQ, hardware strips only.
+    CopyStripEqChannel(usize, usize, usize),
+    /// (bus, from_channel, to_channel) -- CH COPY, within the bus's own EQ.
+    CopyBusEqChannel(usize, usize, usize),
 }
 
 /// The coalescing key: two pending commands with the same key are the
@@ -88,6 +168,28 @@ enum ParamKey {
     BusGain(usize),
     StripEqCell(usize, usize, usize),
     BusEqCell(usize, usize, usize),
+    StripGateKnob(usize),
+    StripCompKnob(usize),
+    StripDenoiserKnob(usize),
+    StripLimiterThreshold(usize),
+    StripIntellipanMode(usize),
+    StripIntellipanXY(usize),
+    StripEq3(usize),
+    StripPositionPad(usize),
+    StripMc(usize),
+    StripKaraoke(usize),
+    StripEqOn(usize),
+    StripEqMemory(usize),
+    BusEqOn(usize),
+    BusEqMemory(usize),
+    StripEqTrim(usize, usize),
+    StripEqDelay(usize, usize),
+    BusEqTrim(usize, usize),
+    BusEqDelay(usize, usize),
+    ResetStripEqChannel(usize, usize),
+    ResetBusEqChannel(usize, usize),
+    CopyStripEqChannel(usize, usize),
+    CopyBusEqChannel(usize, usize),
 }
 
 impl EngineCommand {
@@ -105,6 +207,32 @@ impl EngineCommand {
             Self::SetBusGain(b, _) => ParamKey::BusGain(b),
             Self::SetStripEqCell(s, ch, cell, _) => ParamKey::StripEqCell(s, ch, cell),
             Self::SetBusEqCell(b, ch, cell, _) => ParamKey::BusEqCell(b, ch, cell),
+            Self::SetStripGateKnob(s, _) => ParamKey::StripGateKnob(s),
+            Self::SetStripCompKnob(s, _) => ParamKey::StripCompKnob(s),
+            Self::SetStripDenoiserKnob(s, _) => ParamKey::StripDenoiserKnob(s),
+            Self::SetStripLimiterThreshold(s, _) => ParamKey::StripLimiterThreshold(s),
+            Self::SetStripIntellipanMode(s, _) => ParamKey::StripIntellipanMode(s),
+            Self::SetStripIntellipanXY(s, _, _) => ParamKey::StripIntellipanXY(s),
+            Self::SetStripEq3(s, _, _, _) => ParamKey::StripEq3(s),
+            Self::SetStripPositionPad(s, _, _) => ParamKey::StripPositionPad(s),
+            Self::SetStripMc(s, _) => ParamKey::StripMc(s),
+            Self::SetStripKaraoke(s, _) => ParamKey::StripKaraoke(s),
+            Self::SetStripEqOn(s, _) => ParamKey::StripEqOn(s),
+            Self::SetStripEqMemory(s, _) => ParamKey::StripEqMemory(s),
+            Self::SetBusEqOn(b, _) => ParamKey::BusEqOn(b),
+            Self::SetBusEqMemory(b, _) => ParamKey::BusEqMemory(b),
+            Self::SetStripEqTrim(s, ch, _) => ParamKey::StripEqTrim(s, ch),
+            Self::SetStripEqDelay(s, ch, _) => ParamKey::StripEqDelay(s, ch),
+            Self::SetBusEqTrim(b, ch, _) => ParamKey::BusEqTrim(b, ch),
+            Self::SetBusEqDelay(b, ch, _) => ParamKey::BusEqDelay(b, ch),
+            Self::ResetStripEqChannel(s, ch) => ParamKey::ResetStripEqChannel(s, ch),
+            Self::ResetBusEqChannel(b, ch) => ParamKey::ResetBusEqChannel(b, ch),
+            // Keyed on the mutated (destination) channel, not the source
+            // -- two copies landing on the same channel should still
+            // coalesce to the last one requested, same as any other
+            // parameter; the source channel is just this command's payload.
+            Self::CopyStripEqChannel(s, _, to) => ParamKey::CopyStripEqChannel(s, to),
+            Self::CopyBusEqChannel(b, _, to) => ParamKey::CopyBusEqChannel(b, to),
         }
     }
 
@@ -192,6 +320,147 @@ impl EngineCommand {
             Self::SetBusEqCell(b, ch, cell, params) => {
                 if b < NUM_BUSES && ch < CHANNELS && cell < NUM_CELLS {
                     engine.buses[b].eq.set_cell(ch, cell, params);
+                }
+            }
+            Self::SetStripGateKnob(s, knob) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.gate.set_knob(knob);
+                    }
+                }
+            }
+            Self::SetStripCompKnob(s, knob) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.compressor.set_knob(knob);
+                    }
+                }
+            }
+            Self::SetStripDenoiserKnob(s, knob) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.denoiser.set_knob(knob);
+                    }
+                }
+            }
+            Self::SetStripLimiterThreshold(s, db) => {
+                if s < NUM_STRIPS {
+                    engine.strips[s].chain.limiter_mut().threshold_db = db;
+                }
+            }
+            Self::SetStripIntellipanMode(s, mode) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.pad.set_mode(mode);
+                    }
+                }
+            }
+            Self::SetStripIntellipanXY(s, x, y) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.pad.set_position(x, y);
+                    }
+                }
+            }
+            Self::SetStripEq3(s, bass, mid, treble) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Virtual(chain) = &mut engine.strips[s].chain {
+                        chain.eq.set_gains(bass, mid, treble);
+                    }
+                }
+            }
+            Self::SetStripPositionPad(s, x, y) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Virtual(chain) = &mut engine.strips[s].chain {
+                        chain.pan_pad.x = x;
+                        chain.pan_pad.y = y;
+                    }
+                }
+            }
+            Self::SetStripMc(s, on) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Virtual(chain) = &mut engine.strips[s].chain {
+                        chain.mc = on;
+                    }
+                }
+            }
+            Self::SetStripKaraoke(s, mode) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Virtual(chain) = &mut engine.strips[s].chain {
+                        chain.karaoke.mode = mode;
+                    }
+                }
+            }
+            Self::SetStripEqOn(s, on) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.eq.on = on;
+                    }
+                }
+            }
+            Self::SetStripEqMemory(s, memory) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.eq.set_active_memory(memory);
+                    }
+                }
+            }
+            Self::SetBusEqOn(b, on) => {
+                if b < NUM_BUSES {
+                    engine.buses[b].eq.on = on;
+                }
+            }
+            Self::SetBusEqMemory(b, memory) => {
+                if b < NUM_BUSES {
+                    engine.buses[b].eq.set_active_memory(memory);
+                }
+            }
+            Self::SetStripEqTrim(s, ch, trim_db) => {
+                if s < NUM_STRIPS && ch < STRIP_EQ_CHANNELS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.eq.set_trim_db(ch, trim_db);
+                    }
+                }
+            }
+            Self::SetStripEqDelay(s, ch, delay_ms) => {
+                if s < NUM_STRIPS && ch < STRIP_EQ_CHANNELS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.eq.set_delay_ms(ch, delay_ms);
+                    }
+                }
+            }
+            Self::SetBusEqTrim(b, ch, trim_db) => {
+                if b < NUM_BUSES && ch < CHANNELS {
+                    engine.buses[b].eq.set_trim_db(ch, trim_db);
+                }
+            }
+            Self::SetBusEqDelay(b, ch, delay_ms) => {
+                if b < NUM_BUSES && ch < CHANNELS {
+                    engine.buses[b].eq.set_delay_ms(ch, delay_ms);
+                }
+            }
+            Self::ResetStripEqChannel(s, ch) => {
+                if s < NUM_STRIPS && ch < STRIP_EQ_CHANNELS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.eq.reset_channel(ch);
+                    }
+                }
+            }
+            Self::ResetBusEqChannel(b, ch) => {
+                if b < NUM_BUSES && ch < CHANNELS {
+                    engine.buses[b].eq.reset_channel(ch);
+                }
+            }
+            Self::CopyStripEqChannel(s, from, to) => {
+                if s < NUM_STRIPS && from < STRIP_EQ_CHANNELS && to < STRIP_EQ_CHANNELS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.eq.copy_channel(from, to);
+                    }
+                }
+            }
+            Self::CopyBusEqChannel(b, from, to) => {
+                if b < NUM_BUSES && from < CHANNELS && to < CHANNELS {
+                    engine.buses[b].eq.copy_channel(from, to);
                 }
             }
         }
@@ -309,6 +578,15 @@ impl CommandDrain {
 }
 
 /// spec 1.5's SEL/gain-layer surface, mirrored per strip.
+///
+/// M10 extends this with every new scalar `EngineCommand` from the
+/// coverage audit's state-2 list -- the doc comment on [`ControlSnapshot`]
+/// already establishes the rule this follows ("`EngineCommand`'s own
+/// scalar surface", EQ cells excluded): every field below is exactly that,
+/// not a new exception to it. A field that doesn't apply to a given
+/// strip's actual chain kind (a hardware-only field on a virtual strip, or
+/// vice versa) reads as that control's own neutral/default value, the
+/// same convention `pan` already established.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StripSnapshot {
     pub mute: bool,
@@ -319,14 +597,47 @@ pub struct StripSnapshot {
     /// `0.0` (center) on a virtual strip: it has no pan pot (spec 1.4 has
     /// a 5.1 position pad instead), so there's nothing live to mirror.
     pub pan: f32,
+    /// Hardware-only; `0.0` (bypassed) on a virtual strip.
+    pub gate_knob: f32,
+    /// Hardware-only; `0.0` (bypassed) on a virtual strip.
+    pub comp_knob: f32,
+    /// Hardware-only; `0.0` (bypassed) on a virtual strip.
+    pub denoiser_knob: f32,
+    /// Both chain kinds have a limiter (spec 1.3/1.4), so this is always
+    /// live, never a stand-in default.
+    pub limiter_threshold_db: f32,
+    /// Hardware-only; `IntellipanMode::Color` (the construction-time
+    /// default, spec names no default mode) on a virtual strip.
+    pub intellipan_mode: IntellipanMode,
+    /// Hardware-only; `(0.0, 0.0)` on a virtual strip.
+    pub intellipan_xy: (f32, f32),
+    /// Hardware-only; `false` on a virtual strip.
+    pub strip_eq_on: bool,
+    /// Hardware-only; `Memory::A` on a virtual strip.
+    pub strip_eq_memory: Memory,
+    /// Virtual-only; `(0.0, 0.0, 0.0)` on a hardware strip.
+    pub eq3_db: (f32, f32, f32),
+    /// Virtual-only; `(0.0, 0.0)` on a hardware strip.
+    pub position_pad: (f32, f32),
+    /// Virtual-only; `false` on a hardware strip.
+    pub mc: bool,
+    /// Virtual-only; `KaraokeMode::Off` on a hardware strip. Live on every
+    /// virtual strip regardless of `is_aux`, same as the field it mirrors
+    /// (`SetStripKaraoke`'s own doc comment).
+    pub karaoke: KaraokeMode,
 }
 
+/// M10 extends this with the bus parametric EQ's on/off and A/B memory --
+/// the cells themselves stay out of scope, same rule as the strip side
+/// (`StripSnapshot`'s doc comment).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BusSnapshot {
     pub mute: bool,
     pub mono: BusMono,
     pub mode: BusMode,
     pub gain_db: f32,
+    pub eq_on: bool,
+    pub eq_memory: Memory,
 }
 
 /// The low-rate reconciliation snapshot (module doc): scoped to
@@ -349,22 +660,75 @@ impl ControlSnapshot {
     /// polls.
     pub fn capture(engine: &Engine) -> Self {
         Self {
-            strips: std::array::from_fn(|s| StripSnapshot {
-                mute: engine.strips[s].mute,
-                solo: engine.strips[s].solo,
-                mono: engine.strips[s].mono,
-                bus_assign: engine.strips[s].bus_assign,
-                gain_layer_db: std::array::from_fn(|b| engine.strips[s].gain_layer_db(b)),
-                pan: match &engine.strips[s].chain {
-                    StripChain::Hardware(chain) => chain.pan.pan,
-                    StripChain::Virtual(_) => 0.0,
-                },
+            strips: std::array::from_fn(|s| {
+                let chain = &engine.strips[s].chain;
+                StripSnapshot {
+                    mute: engine.strips[s].mute,
+                    solo: engine.strips[s].solo,
+                    mono: engine.strips[s].mono,
+                    bus_assign: engine.strips[s].bus_assign,
+                    gain_layer_db: std::array::from_fn(|b| engine.strips[s].gain_layer_db(b)),
+                    pan: match chain {
+                        StripChain::Hardware(c) => c.pan.pan,
+                        StripChain::Virtual(_) => 0.0,
+                    },
+                    gate_knob: match chain {
+                        StripChain::Hardware(c) => c.gate.knob(),
+                        StripChain::Virtual(_) => 0.0,
+                    },
+                    comp_knob: match chain {
+                        StripChain::Hardware(c) => c.compressor.knob(),
+                        StripChain::Virtual(_) => 0.0,
+                    },
+                    denoiser_knob: match chain {
+                        StripChain::Hardware(c) => c.denoiser.knob(),
+                        StripChain::Virtual(_) => 0.0,
+                    },
+                    limiter_threshold_db: match chain {
+                        StripChain::Hardware(c) => c.limiter.threshold_db,
+                        StripChain::Virtual(c) => c.limiter.threshold_db,
+                    },
+                    intellipan_mode: match chain {
+                        StripChain::Hardware(c) => c.pad.mode(),
+                        StripChain::Virtual(_) => IntellipanMode::default(),
+                    },
+                    intellipan_xy: match chain {
+                        StripChain::Hardware(c) => c.pad.position(),
+                        StripChain::Virtual(_) => (0.0, 0.0),
+                    },
+                    strip_eq_on: match chain {
+                        StripChain::Hardware(c) => c.eq.on,
+                        StripChain::Virtual(_) => false,
+                    },
+                    strip_eq_memory: match chain {
+                        StripChain::Hardware(c) => c.eq.active_memory(),
+                        StripChain::Virtual(_) => Memory::A,
+                    },
+                    eq3_db: match chain {
+                        StripChain::Hardware(_) => (0.0, 0.0, 0.0),
+                        StripChain::Virtual(c) => (c.eq.bass_db, c.eq.mid_db, c.eq.treble_db),
+                    },
+                    position_pad: match chain {
+                        StripChain::Hardware(_) => (0.0, 0.0),
+                        StripChain::Virtual(c) => (c.pan_pad.x, c.pan_pad.y),
+                    },
+                    mc: match chain {
+                        StripChain::Hardware(_) => false,
+                        StripChain::Virtual(c) => c.mc,
+                    },
+                    karaoke: match chain {
+                        StripChain::Hardware(_) => KaraokeMode::Off,
+                        StripChain::Virtual(c) => c.karaoke.mode,
+                    },
+                }
             }),
             buses: std::array::from_fn(|b| BusSnapshot {
                 mute: engine.buses[b].mute,
                 mono: engine.buses[b].mono,
                 mode: engine.buses[b].mode,
                 gain_db: engine.buses[b].gain_db(),
+                eq_on: engine.buses[b].eq.on,
+                eq_memory: engine.buses[b].eq.active_memory(),
             }),
         }
     }
@@ -410,6 +774,46 @@ impl Default for MeterSnapshot {
     }
 }
 
+/// M10's parametric EQ panel needs to *display* a strip's or bus's actual
+/// 6-cell state, not just fire-and-forget edits into it -- opening the
+/// panel on a strip someone already configured (from an earlier session,
+/// or from a preset once M13 exists) has to show what's really there.
+/// `ControlSnapshot`'s own doc comment predicted exactly this ("EQ cells
+/// get their own, larger snapshot later if drift there is ever found to
+/// matter in practice") -- this is that snapshot, kept separate from
+/// `ControlSnapshot` rather than folded into it, since it's polled only
+/// while a panel is actually open, not every reconciliation tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EqSnapshot {
+    /// Hardware strips only (spec 1.2 step 7, stereo); a virtual strip has
+    /// no parametric EQ at all (spec 1.4's 3-band EQ instead) and reads as
+    /// `EqChannelParams::default()` for both channels, same "neutral
+    /// default on the strip kind it doesn't apply to" convention
+    /// `StripSnapshot` already uses.
+    pub strips: [[EqChannelParams; STRIP_EQ_CHANNELS]; NUM_STRIPS],
+    pub buses: [[EqChannelParams; CHANNELS]; NUM_BUSES],
+}
+
+impl EqSnapshot {
+    pub fn capture(engine: &Engine) -> Self {
+        Self {
+            strips: std::array::from_fn(|s| match &engine.strips[s].chain {
+                StripChain::Hardware(c) => std::array::from_fn(|ch| *c.eq.channel_params(ch)),
+                StripChain::Virtual(_) => [EqChannelParams::default(); STRIP_EQ_CHANNELS],
+            }),
+            buses: std::array::from_fn(|b| {
+                std::array::from_fn(|ch| *engine.buses[b].eq.channel_params(ch))
+            }),
+        }
+    }
+}
+
+impl Default for EqSnapshot {
+    fn default() -> Self {
+        Self::capture(&Engine::new())
+    }
+}
+
 /// A small, generic "latest value wins" cross built on the same `rtrb`
 /// SPSC ring [`control_channel`] already uses, rather than a dedicated
 /// triple-buffer crate: the one candidate for that (`triple_buffer`) is
@@ -445,6 +849,16 @@ pub fn snapshot_channel(
 ) -> (
     LatestValuePublisher<ControlSnapshot>,
     LatestValueReader<ControlSnapshot>,
+) {
+    latest_value_channel(capacity)
+}
+
+/// M10's EQ panel channel, specialised to [`EqSnapshot`].
+pub fn eq_snapshot_channel(
+    capacity: usize,
+) -> (
+    LatestValuePublisher<EqSnapshot>,
+    LatestValueReader<EqSnapshot>,
 ) {
     latest_value_channel(capacity)
 }
@@ -654,11 +1068,564 @@ mod tests {
             EngineCommand::SetBusMono(b, mono) => snapshot.buses[b].mono = mono,
             EngineCommand::SetBusMode(b, mode) => snapshot.buses[b].mode = mode,
             EngineCommand::SetBusGain(b, db) => snapshot.buses[b].gain_db = db,
-            EngineCommand::SetStripEqCell(..) | EngineCommand::SetBusEqCell(..) => {
+            EngineCommand::SetStripEqCell(..)
+            | EngineCommand::SetBusEqCell(..)
+            | EngineCommand::SetStripEqTrim(..)
+            | EngineCommand::SetStripEqDelay(..)
+            | EngineCommand::SetBusEqTrim(..)
+            | EngineCommand::SetBusEqDelay(..)
+            | EngineCommand::ResetStripEqChannel(..)
+            | EngineCommand::ResetBusEqChannel(..)
+            | EngineCommand::CopyStripEqChannel(..)
+            | EngineCommand::CopyBusEqChannel(..) => {
                 // Not part of ControlSnapshot's scope (module doc on
-                // ControlSnapshot) -- nothing to mirror.
+                // ControlSnapshot) -- nothing to mirror; `EqSnapshot`
+                // covers all of these instead (trim/delay are already
+                // fields on `EqChannelParams`, which it already carries).
+            }
+            EngineCommand::SetStripGateKnob(s, knob) => snapshot.strips[s].gate_knob = knob,
+            EngineCommand::SetStripCompKnob(s, knob) => snapshot.strips[s].comp_knob = knob,
+            EngineCommand::SetStripDenoiserKnob(s, knob) => snapshot.strips[s].denoiser_knob = knob,
+            EngineCommand::SetStripLimiterThreshold(s, db) => {
+                snapshot.strips[s].limiter_threshold_db = db
+            }
+            EngineCommand::SetStripIntellipanMode(s, mode) => {
+                snapshot.strips[s].intellipan_mode = mode
+            }
+            EngineCommand::SetStripIntellipanXY(s, x, y) => {
+                snapshot.strips[s].intellipan_xy = (x, y)
+            }
+            EngineCommand::SetStripEq3(s, bass, mid, treble) => {
+                snapshot.strips[s].eq3_db = (bass, mid, treble)
+            }
+            EngineCommand::SetStripPositionPad(s, x, y) => snapshot.strips[s].position_pad = (x, y),
+            EngineCommand::SetStripMc(s, on) => snapshot.strips[s].mc = on,
+            EngineCommand::SetStripKaraoke(s, mode) => snapshot.strips[s].karaoke = mode,
+            EngineCommand::SetStripEqOn(s, on) => snapshot.strips[s].strip_eq_on = on,
+            EngineCommand::SetStripEqMemory(s, memory) => {
+                snapshot.strips[s].strip_eq_memory = memory
+            }
+            EngineCommand::SetBusEqOn(b, on) => snapshot.buses[b].eq_on = on,
+            EngineCommand::SetBusEqMemory(b, memory) => snapshot.buses[b].eq_memory = memory,
+        }
+    }
+
+    // -- M10's table-driven control tests --------------------------------
+    //
+    // Fourteen new `EngineCommand` variants landed in one milestone, each
+    // needing the same shape of proof (round-trips to the engine; ignores
+    // an out-of-range index; is a no-op on the wrong strip kind). Eleven
+    // hand-copied tests for that would make a missing or mis-wired
+    // fifteenth entry invisible -- the entry would just never get written,
+    // and nothing would fail, since there'd be no eleventh test *expecting*
+    // it to exist. A table makes that failure mode visible instead: every
+    // control is one row, one loop below applies every row's proof, and a
+    // control nobody added a row for is a `CONTROL_CASES` array that is
+    // conspicuously one shorter than the enum it's supposed to cover (the
+    // length-matches-the-command-count assertion at the bottom of this
+    // section is exactly that check, made automatic rather than left to a
+    // reviewer noticing by eye). Direct instruction; see
+    // `docs/ARCHITECTURE.md`'s M10 entry for the reasoning.
+
+    use loomix_core::strip_dsp::{HardwareChain, VirtualChain};
+
+    /// Strip 0 (hardware) and strip 5 (plain virtual, non-AUX) per spec
+    /// 1.1's fixed topology (`loomix_core::strip::topology_is_aux`) --
+    /// Karaoke's round trip deliberately does *not* use the AUX strip
+    /// (index 6): `SetStripKaraoke`'s own doc comment is that the command
+    /// sets the field on any virtual strip regardless of `is_aux`, and
+    /// `strip_dsp::tests::virtual_chain_karaoke_only_applies_to_the_aux_strip`
+    /// already separately proves the AUX-only *audible* gating -- mixing
+    /// both proofs into one test would leave it unclear which claim a
+    /// future failure was actually about.
+    const HW: usize = 0;
+    const VIRTUAL: usize = 5;
+    const BUS: usize = 0;
+
+    fn hw_chain(engine: &Engine, idx: usize) -> &HardwareChain {
+        match &engine.strips[idx].chain {
+            StripChain::Hardware(c) => c,
+            StripChain::Virtual(_) => panic!("test index {idx} expected a hardware strip"),
+        }
+    }
+
+    fn virt_chain(engine: &Engine, idx: usize) -> &VirtualChain {
+        match &engine.strips[idx].chain {
+            StripChain::Virtual(c) => c,
+            StripChain::Hardware(_) => panic!("test index {idx} expected a virtual strip"),
+        }
+    }
+
+    /// One row: a control from M10's state-2 list, its own well-formed
+    /// command applied and checked at a representative index, and every
+    /// instance of that command that must be a harmless no-op (an
+    /// out-of-range index, and -- for a strip control -- the same command
+    /// aimed at the wrong strip kind).
+    struct ControlCase {
+        name: &'static str,
+        round_trips: fn(&mut Engine) -> bool,
+        noop_variants: fn() -> Vec<EngineCommand>,
+    }
+
+    const CONTROL_CASES: &[ControlCase] = &[
+        ControlCase {
+            name: "gate knob",
+            round_trips: |e| {
+                EngineCommand::SetStripGateKnob(HW, 6.5).apply(e);
+                hw_chain(e, HW).gate.knob() == 6.5
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripGateKnob(NUM_STRIPS, 6.5),
+                    EngineCommand::SetStripGateKnob(VIRTUAL, 6.5), // wrong kind: no gate on a virtual strip
+                ]
+            },
+        },
+        ControlCase {
+            name: "compressor knob",
+            round_trips: |e| {
+                EngineCommand::SetStripCompKnob(HW, 4.5).apply(e);
+                hw_chain(e, HW).compressor.knob() == 4.5
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripCompKnob(NUM_STRIPS, 4.5),
+                    EngineCommand::SetStripCompKnob(VIRTUAL, 4.5),
+                ]
+            },
+        },
+        ControlCase {
+            name: "denoiser knob",
+            round_trips: |e| {
+                EngineCommand::SetStripDenoiserKnob(HW, 7.0).apply(e);
+                hw_chain(e, HW).denoiser.knob() == 7.0
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripDenoiserKnob(NUM_STRIPS, 7.0),
+                    EngineCommand::SetStripDenoiserKnob(VIRTUAL, 7.0),
+                ]
+            },
+        },
+        ControlCase {
+            name: "limiter threshold (hardware strip)",
+            round_trips: |e| {
+                EngineCommand::SetStripLimiterThreshold(HW, -6.0).apply(e);
+                hw_chain(e, HW).limiter.threshold_db == -6.0
+            },
+            noop_variants: || vec![EngineCommand::SetStripLimiterThreshold(NUM_STRIPS, -6.0)],
+        },
+        ControlCase {
+            name: "limiter threshold (virtual strip)",
+            // No wrong-kind case: both chain kinds have their own
+            // limiter (spec 1.3/1.4), so there is no wrong strip kind for
+            // this one control -- only the out-of-range index applies.
+            round_trips: |e| {
+                EngineCommand::SetStripLimiterThreshold(VIRTUAL, -8.0).apply(e);
+                virt_chain(e, VIRTUAL).limiter.threshold_db == -8.0
+            },
+            noop_variants: || vec![EngineCommand::SetStripLimiterThreshold(NUM_STRIPS, -8.0)],
+        },
+        ControlCase {
+            name: "Intellipan mode",
+            round_trips: |e| {
+                EngineCommand::SetStripIntellipanMode(HW, IntellipanMode::Position).apply(e);
+                hw_chain(e, HW).pad.mode() == IntellipanMode::Position
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripIntellipanMode(NUM_STRIPS, IntellipanMode::Position),
+                    EngineCommand::SetStripIntellipanMode(VIRTUAL, IntellipanMode::Position),
+                ]
+            },
+        },
+        ControlCase {
+            name: "Intellipan x/y",
+            round_trips: |e| {
+                EngineCommand::SetStripIntellipanXY(HW, 0.3, 0.6).apply(e);
+                hw_chain(e, HW).pad.position() == (0.3, 0.6)
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripIntellipanXY(NUM_STRIPS, 0.3, 0.6),
+                    EngineCommand::SetStripIntellipanXY(VIRTUAL, 0.3, 0.6),
+                ]
+            },
+        },
+        ControlCase {
+            name: "virtual strip 3-band EQ",
+            round_trips: |e| {
+                EngineCommand::SetStripEq3(VIRTUAL, 3.0, -2.0, 5.0).apply(e);
+                let c = virt_chain(e, VIRTUAL);
+                (c.eq.bass_db, c.eq.mid_db, c.eq.treble_db) == (3.0, -2.0, 5.0)
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripEq3(NUM_STRIPS, 3.0, -2.0, 5.0),
+                    EngineCommand::SetStripEq3(HW, 3.0, -2.0, 5.0), // wrong kind: no 3-band EQ on hardware
+                ]
+            },
+        },
+        ControlCase {
+            name: "5.1 position pad",
+            round_trips: |e| {
+                EngineCommand::SetStripPositionPad(VIRTUAL, 0.2, 0.7).apply(e);
+                let c = virt_chain(e, VIRTUAL);
+                (c.pan_pad.x, c.pan_pad.y) == (0.2, 0.7)
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripPositionPad(NUM_STRIPS, 0.2, 0.7),
+                    EngineCommand::SetStripPositionPad(HW, 0.2, 0.7),
+                ]
+            },
+        },
+        ControlCase {
+            name: "M.C.",
+            round_trips: |e| {
+                EngineCommand::SetStripMc(VIRTUAL, true).apply(e);
+                virt_chain(e, VIRTUAL).mc
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripMc(NUM_STRIPS, true),
+                    EngineCommand::SetStripMc(HW, true),
+                ]
+            },
+        },
+        ControlCase {
+            name: "Karaoke",
+            round_trips: |e| {
+                EngineCommand::SetStripKaraoke(VIRTUAL, KaraokeMode::K1).apply(e);
+                virt_chain(e, VIRTUAL).karaoke.mode == KaraokeMode::K1
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripKaraoke(NUM_STRIPS, KaraokeMode::K1),
+                    EngineCommand::SetStripKaraoke(HW, KaraokeMode::K1),
+                ]
+            },
+        },
+        ControlCase {
+            name: "strip EQ on/off",
+            round_trips: |e| {
+                EngineCommand::SetStripEqOn(HW, true).apply(e);
+                hw_chain(e, HW).eq.on
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripEqOn(NUM_STRIPS, true),
+                    EngineCommand::SetStripEqOn(VIRTUAL, true),
+                ]
+            },
+        },
+        ControlCase {
+            name: "strip EQ A/B memory",
+            round_trips: |e| {
+                EngineCommand::SetStripEqMemory(HW, Memory::B).apply(e);
+                hw_chain(e, HW).eq.active_memory() == Memory::B
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripEqMemory(NUM_STRIPS, Memory::B),
+                    EngineCommand::SetStripEqMemory(VIRTUAL, Memory::B),
+                ]
+            },
+        },
+        ControlCase {
+            name: "bus EQ on/off",
+            round_trips: |e| {
+                EngineCommand::SetBusEqOn(BUS, true).apply(e);
+                e.buses[BUS].eq.on
+            },
+            noop_variants: || vec![EngineCommand::SetBusEqOn(NUM_BUSES, true)],
+        },
+        ControlCase {
+            name: "bus EQ A/B memory",
+            round_trips: |e| {
+                EngineCommand::SetBusEqMemory(BUS, Memory::B).apply(e);
+                e.buses[BUS].eq.active_memory() == Memory::B
+            },
+            noop_variants: || vec![EngineCommand::SetBusEqMemory(NUM_BUSES, Memory::B)],
+        },
+        // -- spec 1.7's trim/delay/FLAT/CH COPY, brought into M10 rather
+        // than deferred (this file's own EngineCommand doc comment).
+        ControlCase {
+            name: "strip EQ trim",
+            round_trips: |e| {
+                EngineCommand::SetStripEqTrim(HW, 1, 6.0).apply(e);
+                hw_chain(e, HW).eq.channel_params(1).trim_db == 6.0
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripEqTrim(NUM_STRIPS, 0, 6.0),
+                    EngineCommand::SetStripEqTrim(HW, STRIP_EQ_CHANNELS, 6.0),
+                    EngineCommand::SetStripEqTrim(VIRTUAL, 0, 6.0),
+                ]
+            },
+        },
+        ControlCase {
+            name: "strip EQ delay",
+            round_trips: |e| {
+                EngineCommand::SetStripEqDelay(HW, 1, 120.0).apply(e);
+                hw_chain(e, HW).eq.channel_params(1).delay_ms == 120.0
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetStripEqDelay(NUM_STRIPS, 0, 120.0),
+                    EngineCommand::SetStripEqDelay(HW, STRIP_EQ_CHANNELS, 120.0),
+                    EngineCommand::SetStripEqDelay(VIRTUAL, 0, 120.0),
+                ]
+            },
+        },
+        ControlCase {
+            name: "bus EQ trim",
+            round_trips: |e| {
+                EngineCommand::SetBusEqTrim(BUS, 3, -4.0).apply(e);
+                e.buses[BUS].eq.channel_params(3).trim_db == -4.0
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetBusEqTrim(NUM_BUSES, 0, -4.0),
+                    EngineCommand::SetBusEqTrim(BUS, CHANNELS, -4.0),
+                ]
+            },
+        },
+        ControlCase {
+            name: "bus EQ delay",
+            round_trips: |e| {
+                EngineCommand::SetBusEqDelay(BUS, 3, 80.0).apply(e);
+                e.buses[BUS].eq.channel_params(3).delay_ms == 80.0
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::SetBusEqDelay(NUM_BUSES, 0, 80.0),
+                    EngineCommand::SetBusEqDelay(BUS, CHANNELS, 80.0),
+                ]
+            },
+        },
+        ControlCase {
+            name: "strip EQ FLAT (reset one channel)",
+            round_trips: |e| {
+                EngineCommand::SetStripEqTrim(HW, 0, 9.0).apply(e);
+                EngineCommand::ResetStripEqChannel(HW, 0).apply(e);
+                hw_chain(e, HW).eq.channel_params(0).trim_db == 0.0
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::ResetStripEqChannel(NUM_STRIPS, 0),
+                    EngineCommand::ResetStripEqChannel(HW, STRIP_EQ_CHANNELS),
+                    EngineCommand::ResetStripEqChannel(VIRTUAL, 0),
+                ]
+            },
+        },
+        ControlCase {
+            name: "bus EQ FLAT (reset one channel)",
+            round_trips: |e| {
+                EngineCommand::SetBusEqTrim(BUS, 2, 9.0).apply(e);
+                EngineCommand::ResetBusEqChannel(BUS, 2).apply(e);
+                e.buses[BUS].eq.channel_params(2).trim_db == 0.0
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::ResetBusEqChannel(NUM_BUSES, 0),
+                    EngineCommand::ResetBusEqChannel(BUS, CHANNELS),
+                ]
+            },
+        },
+        ControlCase {
+            name: "strip EQ CH COPY",
+            round_trips: |e| {
+                EngineCommand::SetStripEqTrim(HW, 0, 7.5).apply(e);
+                EngineCommand::CopyStripEqChannel(HW, 0, 1).apply(e);
+                hw_chain(e, HW).eq.channel_params(1).trim_db == 7.5
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::CopyStripEqChannel(NUM_STRIPS, 0, 1),
+                    EngineCommand::CopyStripEqChannel(HW, STRIP_EQ_CHANNELS, 1),
+                    EngineCommand::CopyStripEqChannel(HW, 0, STRIP_EQ_CHANNELS),
+                    EngineCommand::CopyStripEqChannel(VIRTUAL, 0, 1),
+                ]
+            },
+        },
+        ControlCase {
+            name: "bus EQ CH COPY",
+            round_trips: |e| {
+                EngineCommand::SetBusEqTrim(BUS, 0, 7.5).apply(e);
+                EngineCommand::CopyBusEqChannel(BUS, 0, 1).apply(e);
+                e.buses[BUS].eq.channel_params(1).trim_db == 7.5
+            },
+            noop_variants: || {
+                vec![
+                    EngineCommand::CopyBusEqChannel(NUM_BUSES, 0, 1),
+                    EngineCommand::CopyBusEqChannel(BUS, CHANNELS, 1),
+                    EngineCommand::CopyBusEqChannel(BUS, 0, CHANNELS),
+                ]
+            },
+        },
+    ];
+
+    /// The completeness check named in this section's own header comment:
+    /// fails loudly (a wrong number, not a silent gap) if `EngineCommand`
+    /// grows an M10-era variant that nobody added a `CONTROL_CASES` row
+    /// for. `EngineCommand::VARIANT_COUNT` doesn't exist (Rust has no enum
+    /// reflection), so this pins the *known* total instead -- deliberately
+    /// brittle: adding a fifteenth M10 variant without updating this
+    /// number is exactly the "invisible missing entry" this table exists
+    /// to prevent, so the constant itself has to be touched too.
+    const EXPECTED_M10_CONTROL_COUNT: usize = 23;
+
+    #[test]
+    fn control_case_table_covers_every_m10_control_exactly_once() {
+        assert_eq!(
+            CONTROL_CASES.len(),
+            EXPECTED_M10_CONTROL_COUNT,
+            "a control was added to or removed from CONTROL_CASES without updating the expected count"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for case in CONTROL_CASES {
+            assert!(seen.insert(case.name), "duplicate case name: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn every_m10_control_round_trips_to_the_engine() {
+        for case in CONTROL_CASES {
+            let mut engine = Engine::new();
+            assert!(
+                (case.round_trips)(&mut engine),
+                "{} did not round-trip to the engine",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_m10_control_ignores_out_of_range_and_wrong_strip_kind_commands() {
+        for case in CONTROL_CASES {
+            let mut engine = Engine::new();
+            let before = ControlSnapshot::capture(&engine);
+            for command in (case.noop_variants)() {
+                command.apply(&mut engine); // must not panic
+            }
+            assert_eq!(
+                ControlSnapshot::capture(&engine),
+                before,
+                "{}: an out-of-range or wrong-strip-kind command mutated engine state",
+                case.name
+            );
+        }
+    }
+
+    /// Same proof as `out_of_range_indices_are_ignored_not_panicked`
+    /// above, run through the real `CommandSink`/`CommandDrain` path
+    /// (coalescing, the SPSC queue, `drain_into`) rather than calling
+    /// `apply` directly -- every M10 noop variant drains cleanly with no
+    /// panic and no engine mutation.
+    #[test]
+    fn every_m10_control_noop_variant_drains_cleanly_through_the_real_channel() {
+        for case in CONTROL_CASES {
+            let (mut sink, mut drain) = control_channel();
+            let mut engine = Engine::new();
+            let before = ControlSnapshot::capture(&engine);
+            for command in (case.noop_variants)() {
+                sink.enqueue(command);
+            }
+            sink.flush();
+            while drain.drain_into(&mut engine, 64) > 0 {}
+            assert_eq!(
+                ControlSnapshot::capture(&engine),
+                before,
+                "{}: noop variants mutated state after draining through the real channel",
+                case.name
+            );
+        }
+    }
+
+    /// M10's spec text (`docs/SPEC.md`) commits to this explicitly: a
+    /// pointer drag across the Intellipan/5.1 XY pad fires a coordinate
+    /// update every frame, and those updates must coalesce per parameter
+    /// (last-value-wins) through the exact same `CommandSink` path the
+    /// fader already uses -- never one queued command per pointer move.
+    /// Same technique as `a_flood_past_capacity_still_converges_to_the_
+    /// last_value_sent` above (a real fader/mute pair, not a pad): flood
+    /// the pad coordinate itself, far past `COMMAND_QUEUE_CAPACITY`, and
+    /// confirm both that `pending` never grows past one entry per pad
+    /// (coalescing keeps the queue small regardless of flood size) and
+    /// that the engine ends up at exactly the last position sent.
+    #[test]
+    fn a_flood_of_xy_pad_drag_updates_coalesces_and_converges_to_the_last_position() {
+        let (mut sink, mut drain) = control_channel();
+        let mut engine = Engine::new();
+
+        let flood = COMMAND_QUEUE_CAPACITY * 8;
+        let mut expected_intellipan = (0.0f32, 0.0f32);
+        let mut expected_position_pad = (0.0f32, 0.0f32);
+        for i in 0..flood {
+            // Values sweep within each pad's real clamp range (Intellipan
+            // x: -0.5..0.5, y: 0..1; the 5.1 pad shares the same range) so
+            // every intermediate value would be a genuine, unclamped
+            // position if it were ever actually applied -- this is
+            // proving coalescing collapses the flood, not relying on
+            // clamping to hide a bug that would apply every one of them.
+            let x = -0.5 + (i % 100) as f32 * 0.01;
+            let y = (i % 100) as f32 * 0.01;
+            expected_intellipan = (x, y);
+            expected_position_pad = (x, y);
+            sink.enqueue(EngineCommand::SetStripIntellipanXY(HW, x, y));
+            sink.enqueue(EngineCommand::SetStripPositionPad(VIRTUAL, x, y));
+            // A pointer-move handler would call this every frame, exactly
+            // like a fader drag -- coalescing has to hold up under the
+            // same "many updates, one parameter" shape either way.
+            assert!(
+                sink.pending_len() <= 2,
+                "a drag across two pads should never grow pending past one entry each"
+            );
+            if i % 3 == 0 {
+                sink.flush();
+                drain.drain_into(&mut engine, 64);
             }
         }
+        sink.flush();
+        while drain.drain_into(&mut engine, 64) > 0 {}
+
+        assert_eq!(hw_chain(&engine, HW).pad.position(), expected_intellipan);
+        let virtual_pad = virt_chain(&engine, VIRTUAL).pan_pad;
+        assert_eq!(
+            (virtual_pad.x, virtual_pad.y),
+            expected_position_pad,
+            "the 5.1 pad should converge to the last position sent, not an intermediate one"
+        );
+    }
+
+    /// `EqSnapshot` exists so the EQ panel can display real state, not
+    /// just accept edits into a black box -- proves the capture actually
+    /// reflects a real edit made through the real command path (not just
+    /// that a freshly-constructed snapshot matches a freshly-constructed
+    /// engine), and that a virtual strip's slot stays the documented
+    /// default regardless of what the hardware strips carry.
+    #[test]
+    fn eq_snapshot_reflects_real_cell_edits_and_defaults_a_virtual_strip() {
+        let mut engine = Engine::new();
+        let cell = EqCellParams {
+            on: true,
+            cell_type: loomix_core::parametric_eq::EqCellType::LowShelf,
+            freq_hz: 250.0,
+            gain_db: 4.0,
+            q: 2.0,
+        };
+        EngineCommand::SetStripEqCell(HW, 1, 3, cell).apply(&mut engine);
+        EngineCommand::SetBusEqCell(BUS, 5, 2, cell).apply(&mut engine);
+
+        let snapshot = EqSnapshot::capture(&engine);
+        assert_eq!(snapshot.strips[HW][1].cells[3], cell);
+        assert_eq!(snapshot.buses[BUS][5].cells[2], cell);
+        assert_eq!(
+            snapshot.strips[VIRTUAL],
+            [EqChannelParams::default(); STRIP_EQ_CHANNELS],
+            "a virtual strip has no parametric EQ; its slot should read as the documented default"
+        );
     }
 
     #[test]
@@ -808,6 +1775,33 @@ mod tests {
             EngineCommand::SetBusGain(0, -3.0),
             EngineCommand::SetStripEqCell(0, 0, 0, eq_params),
             EngineCommand::SetBusEqCell(0, 0, 0, eq_params),
+            // M10: every new variant, hardware-strip-only commands against
+            // strip 0, virtual-strip-only against strip 5, bus EQ toggles
+            // against bus 0 -- the same "one representative per shape"
+            // coverage this test's own doc comment already commits to.
+            EngineCommand::SetStripGateKnob(0, 5.0),
+            EngineCommand::SetStripCompKnob(0, 5.0),
+            EngineCommand::SetStripDenoiserKnob(0, 5.0),
+            EngineCommand::SetStripLimiterThreshold(0, -6.0),
+            EngineCommand::SetStripLimiterThreshold(5, -6.0),
+            EngineCommand::SetStripIntellipanMode(0, IntellipanMode::Modulation),
+            EngineCommand::SetStripIntellipanXY(0, 0.2, 0.5),
+            EngineCommand::SetStripEq3(5, 1.0, -1.0, 2.0),
+            EngineCommand::SetStripPositionPad(5, 0.1, 0.4),
+            EngineCommand::SetStripMc(5, true),
+            EngineCommand::SetStripKaraoke(5, KaraokeMode::K2),
+            EngineCommand::SetStripEqOn(0, true),
+            EngineCommand::SetStripEqMemory(0, Memory::B),
+            EngineCommand::SetBusEqOn(0, true),
+            EngineCommand::SetBusEqMemory(0, Memory::B),
+            EngineCommand::SetStripEqTrim(0, 0, 3.0),
+            EngineCommand::SetStripEqDelay(0, 0, 50.0),
+            EngineCommand::SetBusEqTrim(0, 0, 3.0),
+            EngineCommand::SetBusEqDelay(0, 0, 50.0),
+            EngineCommand::ResetStripEqChannel(0, 0),
+            EngineCommand::ResetBusEqChannel(0, 0),
+            EngineCommand::CopyStripEqChannel(0, 0, 1),
+            EngineCommand::CopyBusEqChannel(0, 0, 1),
         ];
 
         assert_realtime(|| {
@@ -884,6 +1878,16 @@ mod tests {
                             gain_db: (i % 12) as f32 - 6.0,
                             q: 1.0 + (i % 10) as f32,
                         },
+                    ));
+                    // M10's XY pads are the highest-*rate* new surface
+                    // (a pointer drag, not a discrete click) -- covering
+                    // one here exercises it under the same real
+                    // concurrent contention as everything else, not just
+                    // the sequential flood test above.
+                    sink.enqueue(EngineCommand::SetStripIntellipanXY(
+                        strip % 5, // strip 0..4 are hardware (spec 1.1)
+                        -0.5 + (i % 100) as f32 * 0.01,
+                        (i % 100) as f32 * 0.01,
                     ));
                     sink.flush();
                     std::thread::sleep(Duration::from_micros(100));

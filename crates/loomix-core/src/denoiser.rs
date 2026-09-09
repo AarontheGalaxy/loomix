@@ -70,6 +70,13 @@ impl Denoiser {
     /// The macro knob (spec 1.3): `knob <= 0.0` bypasses entirely (spec
     /// 4.1's true-neutral requirement) and, per spec's "non-zero adds
     /// latency" note, is the only state that adds none.
+    /// The macro knob's last-set value, for a UI reconciliation snapshot
+    /// (`loomix-app::control`) to mirror -- see `Gate::knob`'s doc comment
+    /// for why this can't be derived from bypass state alone.
+    pub fn knob(&self) -> f32 {
+        self.knob
+    }
+
     pub fn set_knob(&mut self, knob: f32) {
         self.knob = knob;
     }

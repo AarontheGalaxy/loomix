@@ -22,13 +22,16 @@
 //! was never selected.
 
 use loomix_app::control::{
-    self, BusSnapshot, CommandSink, ControlSnapshot, EngineCommand, LatestValueReader,
-    MeterSnapshot, StripSnapshot,
+    self, BusSnapshot, CommandSink, ControlSnapshot, EngineCommand, EqSnapshot, LatestValueReader,
+    MeterSnapshot, StripSnapshot, STRIP_EQ_CHANNELS,
 };
 use loomix_app::device_wiring::attach_capture_device;
 use loomix_app::engine_io::{select_clock_master, DropoutCounter, EngineIoDriver};
 use loomix_core::bus::BusMono;
 use loomix_core::bus_mode::BusMode;
+use loomix_core::intellipan::IntellipanMode;
+use loomix_core::karaoke::KaraokeMode;
+use loomix_core::parametric_eq::{EqCellParams, EqChannelParams, Memory};
 use loomix_core::{Engine, CHANNELS, NUM_BUSES};
 use loomix_hal::clock::{ClockSource, DeviceId};
 use loomix_hal::device::{
@@ -63,6 +66,7 @@ struct AudioSession {
     sink: CommandSink,
     control_reader: LatestValueReader<ControlSnapshot>,
     meter_reader: LatestValueReader<MeterSnapshot>,
+    eq_reader: LatestValueReader<EqSnapshot>,
     capture_underruns: Option<DropoutCounter>,
     _capture: Option<CaptureIoProcHandle>,
     _master: MasterIoProcHandle,
@@ -125,6 +129,62 @@ fn bus_mode_from_str(s: &str) -> Option<BusMode> {
     })
 }
 
+/// spec 1.18's "cycle Color, Position, Modulation."
+fn intellipan_mode_to_str(mode: IntellipanMode) -> &'static str {
+    match mode {
+        IntellipanMode::Color => "color",
+        IntellipanMode::Position => "position",
+        IntellipanMode::Modulation => "modulation",
+    }
+}
+
+fn intellipan_mode_from_str(s: &str) -> Option<IntellipanMode> {
+    Some(match s {
+        "color" => IntellipanMode::Color,
+        "position" => IntellipanMode::Position,
+        "modulation" => IntellipanMode::Modulation,
+        _ => return None,
+    })
+}
+
+/// spec 1.4's Karaoke button: off, K-m, K-1, K-2, K-v.
+fn karaoke_mode_to_str(mode: KaraokeMode) -> &'static str {
+    match mode {
+        KaraokeMode::Off => "off",
+        KaraokeMode::KM => "km",
+        KaraokeMode::K1 => "k1",
+        KaraokeMode::K2 => "k2",
+        KaraokeMode::KV => "kv",
+    }
+}
+
+fn karaoke_mode_from_str(s: &str) -> Option<KaraokeMode> {
+    Some(match s {
+        "off" => KaraokeMode::Off,
+        "km" => KaraokeMode::KM,
+        "k1" => KaraokeMode::K1,
+        "k2" => KaraokeMode::K2,
+        "kv" => KaraokeMode::KV,
+        _ => return None,
+    })
+}
+
+/// spec 1.7's A/B memory, shared by the strip and bus parametric EQ.
+fn memory_to_str(memory: Memory) -> &'static str {
+    match memory {
+        Memory::A => "a",
+        Memory::B => "b",
+    }
+}
+
+fn memory_from_str(s: &str) -> Option<Memory> {
+    Some(match s {
+        "a" => Memory::A,
+        "b" => Memory::B,
+        _ => return None,
+    })
+}
+
 #[derive(serde::Serialize)]
 struct StripSnapshotDto {
     mute: bool,
@@ -135,6 +195,26 @@ struct StripSnapshotDto {
     /// `0.0` (center) on a virtual strip, which has no pan pot (spec 1.4
     /// has a 5.1 position pad instead) -- see `StripSnapshot::pan`.
     pan: f32,
+    // M10: every field below mirrors `StripSnapshot`'s own doc comment --
+    // a hardware-only or virtual-only field reads as that control's own
+    // neutral default on the strip kind it doesn't apply to, same
+    // convention as `pan` above.
+    gate_knob: f32,
+    comp_knob: f32,
+    denoiser_knob: f32,
+    limiter_threshold_db: f32,
+    intellipan_mode: &'static str,
+    intellipan_x: f32,
+    intellipan_y: f32,
+    strip_eq_on: bool,
+    strip_eq_memory: &'static str,
+    eq3_bass_db: f32,
+    eq3_mid_db: f32,
+    eq3_treble_db: f32,
+    position_pad_x: f32,
+    position_pad_y: f32,
+    mc: bool,
+    karaoke: &'static str,
 }
 
 impl From<StripSnapshot> for StripSnapshotDto {
@@ -146,6 +226,22 @@ impl From<StripSnapshot> for StripSnapshotDto {
             bus_assign: s.bus_assign,
             gain_layer_db: s.gain_layer_db,
             pan: s.pan,
+            gate_knob: s.gate_knob,
+            comp_knob: s.comp_knob,
+            denoiser_knob: s.denoiser_knob,
+            limiter_threshold_db: s.limiter_threshold_db,
+            intellipan_mode: intellipan_mode_to_str(s.intellipan_mode),
+            intellipan_x: s.intellipan_xy.0,
+            intellipan_y: s.intellipan_xy.1,
+            strip_eq_on: s.strip_eq_on,
+            strip_eq_memory: memory_to_str(s.strip_eq_memory),
+            eq3_bass_db: s.eq3_db.0,
+            eq3_mid_db: s.eq3_db.1,
+            eq3_treble_db: s.eq3_db.2,
+            position_pad_x: s.position_pad.0,
+            position_pad_y: s.position_pad.1,
+            mc: s.mc,
+            karaoke: karaoke_mode_to_str(s.karaoke),
         }
     }
 }
@@ -156,6 +252,8 @@ struct BusSnapshotDto {
     mono: &'static str,
     mode: &'static str,
     gain_db: f32,
+    eq_on: bool,
+    eq_memory: &'static str,
 }
 
 impl From<BusSnapshot> for BusSnapshotDto {
@@ -165,6 +263,8 @@ impl From<BusSnapshot> for BusSnapshotDto {
             mono: bus_mono_to_str(b.mono),
             mode: bus_mode_to_str(b.mode),
             gain_db: b.gain_db,
+            eq_on: b.eq_on,
+            eq_memory: memory_to_str(b.eq_memory),
         }
     }
 }
@@ -180,6 +280,30 @@ impl From<ControlSnapshot> for ControlSnapshotDto {
         Self {
             strips: s.strips.into_iter().map(Into::into).collect(),
             buses: s.buses.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// M10's EQ panel state -- `EqChannelParams`/`EqCellParams` (`loomix-core`)
+/// already derive `Serialize`/`Deserialize` for `loomix-config`'s on-disk
+/// EQ file format, so this DTO reuses them directly rather than inventing
+/// a parallel shape purely for IPC, unlike `BusMode`/`BusMono` above
+/// (`docs/ARCHITECTURE.md`'s M8 entry): those don't derive serde at all,
+/// so wrapping them in a string was the one, explicit translation point
+/// instead of coupling `loomix-core`'s public enums to a wire format they
+/// don't otherwise need -- that reasoning doesn't apply here, since the
+/// coupling already exists for a real, independent reason.
+#[derive(serde::Serialize)]
+struct EqSnapshotDto {
+    strips: Vec<[EqChannelParams; STRIP_EQ_CHANNELS]>,
+    buses: Vec<[EqChannelParams; CHANNELS]>,
+}
+
+impl From<EqSnapshot> for EqSnapshotDto {
+    fn from(s: EqSnapshot) -> Self {
+        Self {
+            strips: s.strips.to_vec(),
+            buses: s.buses.to_vec(),
         }
     }
 }
@@ -276,6 +400,48 @@ fn get_meters(state: State<AppState>) -> MeterSnapshotDto {
     }
 }
 
+/// M10: polled only while the EQ panel is actually open, not at
+/// `get_control_snapshot`'s reconciliation rate -- see the `eq_pub`
+/// publish site's own comment in `connect_audio`.
+#[tauri::command]
+fn get_eq_snapshot(state: State<AppState>) -> EqSnapshotDto {
+    let mut session = state.session.lock().unwrap();
+    match session.as_mut() {
+        Some(s) => s.eq_reader.read().into(),
+        None => EqSnapshot::default().into(),
+    }
+}
+
+/// Hardware strips only (spec 1.2 step 7); a no-op on a virtual strip,
+/// same as `EngineCommand::SetStripEqCell` itself.
+#[tauri::command]
+fn set_strip_eq_cell(
+    state: State<AppState>,
+    strip: usize,
+    channel: usize,
+    cell: usize,
+    params: EqCellParams,
+) {
+    send(
+        &state,
+        EngineCommand::SetStripEqCell(strip, channel, cell, params),
+    );
+}
+
+#[tauri::command]
+fn set_bus_eq_cell(
+    state: State<AppState>,
+    bus: usize,
+    channel: usize,
+    cell: usize,
+    params: EqCellParams,
+) {
+    send(
+        &state,
+        EngineCommand::SetBusEqCell(bus, channel, cell, params),
+    );
+}
+
 /// Enqueues and immediately flushes: a plain button/dropdown/slider
 /// commit is already a discrete, infrequent event, so there's no
 /// coalescing benefit to batching across a timer tick the way a
@@ -343,6 +509,153 @@ fn set_bus_mode(state: State<AppState>, bus: usize, mode: String) -> Result<(), 
 #[tauri::command]
 fn set_bus_gain(state: State<AppState>, bus: usize, db: f32) {
     send(&state, EngineCommand::SetBusGain(bus, db));
+}
+
+// -- M10: the 2026-09-09 coverage audit's state-2 list, one Tauri command
+// per `EngineCommand` variant added for it (`loomix-app::control`) -- the
+// same trivial `send(&state, EngineCommand::X(...))` shape every command
+// above already uses, cross-checked argument-for-argument against
+// `control::tests::CONTROL_CASES`, the table that actually proves each
+// variant's own round trip (`docs/ARCHITECTURE.md`'s M10 entry: this
+// layer's own plumbing isn't separately unit-tested, same as every other
+// trivial one-line command above -- the manual smoke test, spec 4.4,
+// covers this layer once the UI drives it for real).
+
+#[tauri::command]
+fn set_strip_gate_knob(state: State<AppState>, strip: usize, knob: f32) {
+    send(&state, EngineCommand::SetStripGateKnob(strip, knob));
+}
+
+#[tauri::command]
+fn set_strip_comp_knob(state: State<AppState>, strip: usize, knob: f32) {
+    send(&state, EngineCommand::SetStripCompKnob(strip, knob));
+}
+
+#[tauri::command]
+fn set_strip_denoiser_knob(state: State<AppState>, strip: usize, knob: f32) {
+    send(&state, EngineCommand::SetStripDenoiserKnob(strip, knob));
+}
+
+#[tauri::command]
+fn set_strip_limiter_threshold(state: State<AppState>, strip: usize, db: f32) {
+    send(&state, EngineCommand::SetStripLimiterThreshold(strip, db));
+}
+
+#[tauri::command]
+fn set_strip_intellipan_mode(
+    state: State<AppState>,
+    strip: usize,
+    mode: String,
+) -> Result<(), String> {
+    let mode = intellipan_mode_from_str(&mode)
+        .ok_or_else(|| format!("unknown Intellipan mode: {mode}"))?;
+    send(&state, EngineCommand::SetStripIntellipanMode(strip, mode));
+    Ok(())
+}
+
+#[tauri::command]
+fn set_strip_intellipan_xy(state: State<AppState>, strip: usize, x: f32, y: f32) {
+    send(&state, EngineCommand::SetStripIntellipanXY(strip, x, y));
+}
+
+#[tauri::command]
+fn set_strip_eq3(state: State<AppState>, strip: usize, bass_db: f32, mid_db: f32, treble_db: f32) {
+    send(
+        &state,
+        EngineCommand::SetStripEq3(strip, bass_db, mid_db, treble_db),
+    );
+}
+
+#[tauri::command]
+fn set_strip_position_pad(state: State<AppState>, strip: usize, x: f32, y: f32) {
+    send(&state, EngineCommand::SetStripPositionPad(strip, x, y));
+}
+
+#[tauri::command]
+fn set_strip_mc(state: State<AppState>, strip: usize, on: bool) {
+    send(&state, EngineCommand::SetStripMc(strip, on));
+}
+
+#[tauri::command]
+fn set_strip_karaoke(state: State<AppState>, strip: usize, mode: String) -> Result<(), String> {
+    let mode =
+        karaoke_mode_from_str(&mode).ok_or_else(|| format!("unknown Karaoke mode: {mode}"))?;
+    send(&state, EngineCommand::SetStripKaraoke(strip, mode));
+    Ok(())
+}
+
+#[tauri::command]
+fn set_strip_eq_on(state: State<AppState>, strip: usize, on: bool) {
+    send(&state, EngineCommand::SetStripEqOn(strip, on));
+}
+
+#[tauri::command]
+fn set_strip_eq_memory(state: State<AppState>, strip: usize, memory: String) -> Result<(), String> {
+    let memory = memory_from_str(&memory).ok_or_else(|| format!("unknown EQ memory: {memory}"))?;
+    send(&state, EngineCommand::SetStripEqMemory(strip, memory));
+    Ok(())
+}
+
+#[tauri::command]
+fn set_bus_eq_on(state: State<AppState>, bus: usize, on: bool) {
+    send(&state, EngineCommand::SetBusEqOn(bus, on));
+}
+
+#[tauri::command]
+fn set_bus_eq_memory(state: State<AppState>, bus: usize, memory: String) -> Result<(), String> {
+    let memory = memory_from_str(&memory).ok_or_else(|| format!("unknown EQ memory: {memory}"))?;
+    send(&state, EngineCommand::SetBusEqMemory(bus, memory));
+    Ok(())
+}
+
+// -- M10 (continued): spec 1.7's per-channel trim/delay, FLAT and CH
+// COPY -- brought into M10 rather than deferred (see `EngineCommand`'s own
+// doc comment in `control.rs` for why).
+
+#[tauri::command]
+fn set_strip_eq_trim(state: State<AppState>, strip: usize, channel: usize, trim_db: f32) {
+    send(
+        &state,
+        EngineCommand::SetStripEqTrim(strip, channel, trim_db),
+    );
+}
+
+#[tauri::command]
+fn set_strip_eq_delay(state: State<AppState>, strip: usize, channel: usize, delay_ms: f32) {
+    send(
+        &state,
+        EngineCommand::SetStripEqDelay(strip, channel, delay_ms),
+    );
+}
+
+#[tauri::command]
+fn set_bus_eq_trim(state: State<AppState>, bus: usize, channel: usize, trim_db: f32) {
+    send(&state, EngineCommand::SetBusEqTrim(bus, channel, trim_db));
+}
+
+#[tauri::command]
+fn set_bus_eq_delay(state: State<AppState>, bus: usize, channel: usize, delay_ms: f32) {
+    send(&state, EngineCommand::SetBusEqDelay(bus, channel, delay_ms));
+}
+
+#[tauri::command]
+fn reset_strip_eq_channel(state: State<AppState>, strip: usize, channel: usize) {
+    send(&state, EngineCommand::ResetStripEqChannel(strip, channel));
+}
+
+#[tauri::command]
+fn reset_bus_eq_channel(state: State<AppState>, bus: usize, channel: usize) {
+    send(&state, EngineCommand::ResetBusEqChannel(bus, channel));
+}
+
+#[tauri::command]
+fn copy_strip_eq_channel(state: State<AppState>, strip: usize, from: usize, to: usize) {
+    send(&state, EngineCommand::CopyStripEqChannel(strip, from, to));
+}
+
+#[tauri::command]
+fn copy_bus_eq_channel(state: State<AppState>, bus: usize, from: usize, to: usize) {
+    send(&state, EngineCommand::CopyBusEqChannel(bus, from, to));
 }
 
 fn resolve_uid(uid: &str) -> Result<DeviceId, String> {
@@ -421,12 +734,18 @@ fn connect_audio(
     let (mut control_pub, control_reader) = control::snapshot_channel(RECONCILE_QUEUE_CAPACITY);
     let (mut meter_pub, meter_reader) =
         control::latest_value_channel::<MeterSnapshot>(RECONCILE_QUEUE_CAPACITY);
+    // M10: the EQ panel polls this only while actually open, not at the
+    // reconciliation rate the other two get -- still published every
+    // callback like the others (a fixed-size array copy, no allocation,
+    // spec 3.3), just read less often.
+    let (mut eq_pub, eq_reader) = control::eq_snapshot_channel(RECONCILE_QUEUE_CAPACITY);
 
     let callback: MasterTickCallback = Box::new(move |frames, input, output| {
         drain.drain_into(driver.engine_mut(), 64);
         driver.on_master_tick(frames as usize, input, output);
         control_pub.publish(ControlSnapshot::capture(driver.engine_mut()));
         meter_pub.publish(MeterSnapshot::capture(driver.engine_mut()));
+        eq_pub.publish(EqSnapshot::capture(driver.engine_mut()));
     });
     let master = MasterIoProcHandle::start(output_id, callback)
         .map_err(|e| format!("failed to start output on {output_uid}: CoreAudio error {e}"))?;
@@ -435,6 +754,7 @@ fn connect_audio(
         sink,
         control_reader,
         meter_reader,
+        eq_reader,
         capture_underruns,
         _capture: capture_handle,
         _master: master,
@@ -469,6 +789,31 @@ fn main() {
             set_bus_mono,
             set_bus_mode,
             set_bus_gain,
+            set_strip_gate_knob,
+            set_strip_comp_knob,
+            set_strip_denoiser_knob,
+            set_strip_limiter_threshold,
+            set_strip_intellipan_mode,
+            set_strip_intellipan_xy,
+            set_strip_eq3,
+            set_strip_position_pad,
+            set_strip_mc,
+            set_strip_karaoke,
+            set_strip_eq_on,
+            set_strip_eq_memory,
+            set_bus_eq_on,
+            set_bus_eq_memory,
+            get_eq_snapshot,
+            set_strip_eq_cell,
+            set_bus_eq_cell,
+            set_strip_eq_trim,
+            set_strip_eq_delay,
+            set_bus_eq_trim,
+            set_bus_eq_delay,
+            reset_strip_eq_channel,
+            reset_bus_eq_channel,
+            copy_strip_eq_channel,
+            copy_bus_eq_channel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Loomix app");
