@@ -5,6 +5,78 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-09-09 — M8 (continued): the real cause of the alternating-silent-block distortion, found from a WAV recording
+
+The recording deferred in the entry below arrived and settled the question
+that entry left open, decisively and not from either of its two reviewed
+suspects. Analysis of the captured WAV: exactly every other 256-sample
+block entirely zero (520 of 1033 blocks, 98.6% of adjacent pairs
+alternating), and the audio inside the surviving blocks clean (L/R
+correlate at 0.87 at zero lag -- the content itself was never corrupted,
+only half the blocks were missing). A 44.1kHz-vs-48kHz mismatch is an 8%
+effect; this ratio is exactly 2:1, equal to the output device's channel
+count -- pointing at a frames-vs-samples confusion, not drift and not the
+interleaving fix from the entry two below.
+
+**Root cause: `master_ioproc_trampoline` (`loomix-hal::device`) computed
+its `frames` argument from a buffer's raw sample count, not its frame
+count.** For a real stereo output device -- which delivers ONE combined
+interleaved `AudioBuffer`, established repeatedly in this log -- that
+buffer's length is `frames * channel_count`, not `frames`. The trampoline
+used `output_channels[0].len()` directly as `frames`, silently doubling
+it for any stereo device. That inflated value becomes
+`EngineIoDriver::on_master_tick`'s `block_frames`, which does two things
+with it: sizes every scratch buffer, and tells `StripSource::pull_into`
+how many frames to drain from the real capture ring per callback. A real
+capture device only fills that ring at the true frame rate, so draining
+it at 2x produced exactly what the recording showed -- roughly the first
+half of each inflated block genuinely captured, the second half an
+underrun silently filled with zero. The reason the earlier interleaving
+fix's own tests never caught this: `unpack_channels`'s size-based branch
+(`dst[0].len() > frames`) only activates when the reported frame count is
+*smaller* than the buffer -- with `frames` itself inflated to equal the
+buffer's raw length, that condition was never true, so the buggy
+`else` branch ran instead, writing only `frame[0]` (channel 0) across the
+*entire* interleaved buffer -- which also explains the 0.87 L/R
+correlation the recording showed: both "channels" were carrying
+consecutive samples of the same underlying signal, not independent
+stereo.
+
+**Fixed by reading each buffer's own `mNumberChannels`, not inferring
+frame count from its length.** `write_output_channels`/
+`read_input_channels` never exposed this CoreAudio-populated field; a new
+`first_buffer_channel_count` reads it directly and divides the raw
+sample count by it, which recovers the true frame count for both a
+single interleaved multi-channel buffer (division by the real channel
+count) and the existing one-buffer-per-channel case (division by 1, a
+no-op) with the same formula -- no branching on buffer shape needed.
+
+**Proven with two host-side tests, both written and confirmed failing
+against the pre-fix code before the fix was made, per direct
+instruction:** `loomix-hal::device`'s
+`master_trampoline_reports_frame_count_not_raw_interleaved_sample_count`
+drives `master_ioproc_trampoline` itself with a stereo interleaved
+`TestBufferList` and asserts the callback's `frames` argument is the true
+frame count (failed pre-fix: reported 8 instead of 4, exactly `raw_len`
+instead of `raw_len / channel_count`). `loomix-app::engine_io`'s
+`capture_ring_drained_at_master_devices_reported_frame_count_produces_no_silent_blocks`
+reproduces the propagation end to end (it can't call the trampoline
+directly -- different crate, and `loomix-app` forbids unsafe code
+entirely): feeds a real capture ring exactly the frames a correctly
+functioning device would supply per callback, drives `on_master_tick`
+with the same `block_frames` the trampoline computes, and asserts no
+silence reaches the assigned bus. Run against the buggy `block_frames`
+(the old `true_frames_per_callback * channel_count`) it failed with
+exactly the predicted 2560 underruns (`128 frames * 2 channels * 10
+callbacks`); updated to the now-correct value and it passes. Full
+workspace suite (fmt/clippy/`cargo test --workspace --all-features`) green
+after the fix.
+
+**The sample-rate-mismatch gap from the entry below is unaffected by any
+of this and remains real, proven, and unfixed** -- a separate defect in a
+different mechanism (the drift corrector's bounds), not implicated in
+what this recording actually showed.
+
 ## 2026-08-28 — M8 (continued): reviewing the capture/sample-rate path while a real recording is pending
 
 Triggered by the user reporting the live mixer sounds "crackling, robotic,

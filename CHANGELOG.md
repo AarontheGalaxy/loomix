@@ -132,6 +132,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   mirror, for a master device also used as a strip source) got the same
   fix and its own test, though that path is not reachable in the current
   app's wiring yet.
+- The actual cause of the reported real-audio distortion, found by
+  analysing a WAV recording: `master_ioproc_trampoline` reported a real
+  stereo output device's raw interleaved sample count as its frame count
+  instead of dividing by the channel count, doubling `block_frames`
+  throughout the engine. That silently doubled how many frames
+  `StripSource::pull_into` drained from the real capture ring per
+  callback, underrunning every other block into silence -- exactly the
+  alternating-silent-block pattern the recording showed. Fixed by reading
+  each buffer's own `mNumberChannels` (a new `first_buffer_channel_count`)
+  and dividing by it, recovering the true frame count for both the
+  single-interleaved-buffer and one-buffer-per-channel cases with the
+  same formula. Proven with two host-side tests (`loomix-hal::device`,
+  `loomix-app::engine_io`), both written and confirmed failing against
+  the unfixed code first. See `docs/ARCHITECTURE.md`'s 2026-09-09 entry.
 
 ### Known limitations
 

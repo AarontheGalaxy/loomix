@@ -571,4 +571,101 @@ mod tests {
             "right channel should be correctly deinterleaved, got {received_r:?}"
         );
     }
+
+    /// End-to-end regression test for the bug traced back from a real
+    /// recording: every other block of output audio entirely silent, at
+    /// exactly the output device's channel count as its ratio (found by
+    /// counting zero-valued 256-sample blocks in a WAV capture, not from
+    /// reading this code -- `docs/ARCHITECTURE.md`'s next dated entry).
+    ///
+    /// Root cause lived in `loomix-hal::device::master_ioproc_trampoline`
+    /// (fixed there, proven directly by a sibling test): for a real
+    /// stereo output device, which delivers ONE combined interleaved
+    /// buffer, it used to report that buffer's raw sample count
+    /// (`frames * channel_count`) as the frame count instead of the true
+    /// frame count. That value becomes `on_master_tick`'s `block_frames`
+    /// here, which is used both to size the engine's scratch buffers
+    /// and, critically, how many frames [`StripSource::pull_into`]
+    /// drains from the real capture ring per callback -- with the old
+    /// value, doubling the drain rate against a capture ring a real
+    /// device is only filling at the true frame rate.
+    ///
+    /// This test cannot call the trampoline itself (it lives in
+    /// `loomix-hal`, a different crate, and this crate forbids unsafe
+    /// code entirely), so it reproduces the propagation honestly instead:
+    /// a capture ring is fed exactly `true_frames_per_callback` known,
+    /// non-zero frames per simulated callback -- what a correctly
+    /// functioning stereo capture device actually supplies -- while
+    /// `on_master_tick` is driven with `block_frames` set to
+    /// `true_frames_per_callback`, the value the now-fixed trampoline
+    /// actually reports for a stereo master output device (dividing the
+    /// raw interleaved sample count by the buffer's own reported channel
+    /// count). Before the fix this test used `true_frames_per_callback *
+    /// channel_count` here instead and failed with exactly the predicted
+    /// 2560 underruns (`true_frames_per_callback * 2 channels *
+    /// num_callbacks`) -- every sample pushed into the capture ring is
+    /// non-zero by construction, so any zero reaching bus 1 could only be
+    /// `pull_into`'s underrun-silence fill.
+    #[test]
+    fn capture_ring_drained_at_master_devices_reported_frame_count_produces_no_silent_blocks() {
+        let true_frames_per_callback = 128;
+        let num_callbacks = 10;
+        // What the now-fixed `master_ioproc_trampoline` actually reports
+        // for a stereo interleaved output device: the true frame count,
+        // not `true_frames_per_callback * channel_count`.
+        let block_frames = true_frames_per_callback;
+
+        let mut driver = new_driver(None);
+        driver.engine_mut().strips[0].bus_assign = [false; NUM_BUSES];
+        driver.engine_mut().strips[0].bus_assign[1] = true; // bus 1, not MASTER_BUS
+
+        let ring_len = true_frames_per_callback * num_callbacks + block_frames;
+        let (mut cap_l_tx, cap_l_rx) = rtrb::RingBuffer::<f32>::new(ring_len);
+        let (mut cap_r_tx, cap_r_rx) = rtrb::RingBuffer::<f32>::new(ring_len);
+        let source = StripSource::new(vec![cap_l_rx, cap_r_rx]);
+        let underruns = source.underrun_counter();
+        driver.set_strip_source(0, source);
+
+        let (bus_l_tx, mut bus_l_rx) = rtrb::RingBuffer::<f32>::new(ring_len);
+        let (bus_r_tx, mut bus_r_rx) = rtrb::RingBuffer::<f32>::new(ring_len);
+        driver.set_bus_sink(1, BusSink::new(vec![bus_l_tx, bus_r_tx]));
+
+        // Known, non-zero, distinguishable per-channel constants -- a real
+        // capture device correctly supplying `true_frames_per_callback`
+        // frames every callback, exactly matching `block_frames` now that
+        // the trampoline reports the true frame count.
+        for _ in 0..num_callbacks {
+            for _ in 0..true_frames_per_callback {
+                let _ = cap_l_tx.push(0.3);
+                let _ = cap_r_tx.push(0.7);
+            }
+        }
+
+        let mut master_out_buf = vec![0.0_f32; block_frames];
+        for _ in 0..num_callbacks {
+            let mut out_channel = master_out_buf.as_mut_slice();
+            driver.on_master_tick(block_frames, &[], std::slice::from_mut(&mut out_channel));
+        }
+
+        let received_l: Vec<f32> = std::iter::from_fn(|| bus_l_rx.pop().ok()).collect();
+        let received_r: Vec<f32> = std::iter::from_fn(|| bus_r_rx.pop().ok()).collect();
+
+        assert_eq!(
+            underruns.get(),
+            0,
+            "every capture frame delivered was real (0.3/0.7, never 0.0); \
+             any underrun here means the engine drained the ring faster \
+             than a correctly-functioning capture device fills it, got \
+             {} underruns",
+            underruns.get()
+        );
+        assert!(
+            received_l.iter().all(|&s| s == 0.3) && received_r.iter().all(|&s| s == 0.7),
+            "expected every received sample to be the known non-zero \
+             capture value with no silent blocks; got a zero-valued \
+             stretch instead (L sample: {:?}, R sample: {:?})",
+            received_l.iter().find(|&&s| s != 0.3),
+            received_r.iter().find(|&&s| s != 0.7)
+        );
+    }
 }
