@@ -25,14 +25,14 @@ use loomix_core::bus::BusMono;
 use loomix_core::bus_mode::BusMode;
 use loomix_core::parametric_eq::{EqCellParams, NUM_CELLS};
 use loomix_core::strip_dsp::StripChain;
-use loomix_core::{Engine, CHANNELS, NUM_BUSES, NUM_STRIPS};
+use loomix_core::{Engine, Meter, CHANNELS, NUM_BUSES, NUM_STRIPS};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// spec 1.2 step 7: the hardware strip EQ is stereo, unlike the bus EQ's
 /// independent [`CHANNELS`] (8).
 const STRIP_EQ_CHANNELS: usize = 2;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 /// Comfortably exceeds the mixer's total distinct addressable M8-scope
 /// parameters: summing every strip's mute/solo/mono, bus assigns, gain
@@ -54,6 +54,11 @@ pub enum EngineCommand {
     SetStripBusAssign(usize, usize, bool),
     /// (strip, bus, db)
     SetStripGainLayer(usize, usize, f32),
+    /// (strip, pan) -- spec 1.2 step 9's pan pot, hardware strips only
+    /// (spec 1.3); a no-op if `strip` is a virtual strip (spec 1.4 has a
+    /// 5.1 position pad instead, not this control). `-1.0` hard left,
+    /// `0.0` center, `1.0` hard right (`docs/DSP.md`'s balance law).
+    SetStripPan(usize, f32),
     SetBusMute(usize, bool),
     SetBusMono(usize, BusMono),
     SetBusMode(usize, BusMode),
@@ -76,6 +81,7 @@ enum ParamKey {
     StripMono(usize),
     StripBusAssign(usize, usize),
     StripGainLayer(usize, usize),
+    StripPan(usize),
     BusMute(usize),
     BusMono(usize),
     BusMode(usize),
@@ -92,6 +98,7 @@ impl EngineCommand {
             Self::SetStripMono(s, _) => ParamKey::StripMono(s),
             Self::SetStripBusAssign(s, b, _) => ParamKey::StripBusAssign(s, b),
             Self::SetStripGainLayer(s, b, _) => ParamKey::StripGainLayer(s, b),
+            Self::SetStripPan(s, _) => ParamKey::StripPan(s),
             Self::SetBusMute(b, _) => ParamKey::BusMute(b),
             Self::SetBusMono(b, _) => ParamKey::BusMono(b),
             Self::SetBusMode(b, _) => ParamKey::BusMode(b),
@@ -146,6 +153,13 @@ impl EngineCommand {
             Self::SetStripGainLayer(s, b, db) => {
                 if s < NUM_STRIPS && b < NUM_BUSES {
                     engine.strips[s].set_gain_layer_db(b, db);
+                }
+            }
+            Self::SetStripPan(s, pan) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.pan.pan = pan;
+                    }
                 }
             }
             Self::SetBusMute(b, on) => {
@@ -302,6 +316,9 @@ pub struct StripSnapshot {
     pub mono: bool,
     pub bus_assign: [bool; NUM_BUSES],
     pub gain_layer_db: [f32; NUM_BUSES],
+    /// `0.0` (center) on a virtual strip: it has no pan pot (spec 1.4 has
+    /// a 5.1 position pad instead), so there's nothing live to mirror.
+    pub pan: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -328,7 +345,8 @@ pub struct ControlSnapshot {
 impl ControlSnapshot {
     /// Reads the live values straight off `Engine` -- called once per
     /// audio callback, alongside meter observation, to publish into the
-    /// `triple_buffer` the app-side reconciliation task polls.
+    /// channel ([`snapshot_channel`]) the app-side reconciliation task
+    /// polls.
     pub fn capture(engine: &Engine) -> Self {
         Self {
             strips: std::array::from_fn(|s| StripSnapshot {
@@ -337,6 +355,10 @@ impl ControlSnapshot {
                 mono: engine.strips[s].mono,
                 bus_assign: engine.strips[s].bus_assign,
                 gain_layer_db: std::array::from_fn(|b| engine.strips[s].gain_layer_db(b)),
+                pan: match &engine.strips[s].chain {
+                    StripChain::Hardware(chain) => chain.pan.pan,
+                    StripChain::Virtual(_) => 0.0,
+                },
             }),
             buses: std::array::from_fn(|b| BusSnapshot {
                 mute: engine.buses[b].mute,
@@ -354,63 +376,112 @@ impl Default for ControlSnapshot {
     }
 }
 
-/// A small "latest value wins" cross built on the same `rtrb` SPSC ring
-/// [`control_channel`] already uses, rather than a dedicated triple-buffer
-/// crate: the one candidate for that (`triple_buffer`) is MPL-2.0, a
-/// copyleft license outside this project's allow-list (`deny.toml`) for a
-/// product that ships a commercially-distributed installer (spec 4.5) --
-/// not a call to make unilaterally by widening the allow-list for one
-/// dependency's convenience. `rtrb` is already vetted, already a
-/// dependency here, and the same lock-free/no-allocation guarantee spec
-/// 3.3 asks for covers this just as well: the audio thread owns
-/// [`SnapshotPublisher`] and calls [`SnapshotPublisher::publish`] once per
-/// callback; the app-side reconciliation task owns [`SnapshotReader`] and
-/// calls [`SnapshotReader::read`] at a low, UI-appropriate rate, never per
-/// audio block.
-pub fn snapshot_channel(capacity: usize) -> (SnapshotPublisher, SnapshotReader) {
+/// Spec 1.3/1.5's input/output meters: the audio-thread-only side of the
+/// exact crossing `Meter`'s own doc comment named as owed once a UI
+/// thread existed ("no separate UI thread yet to hand it across... spec
+/// 3.3's crossing applies once one exists, from M4 on") -- published
+/// every callback over [`latest_value_channel`], same as
+/// [`ControlSnapshot`], polled at a UI-appropriate rate (this one closer
+/// to per-frame, since meters are meant to move visibly, unlike the
+/// reconciliation snapshot).
+#[derive(Debug, Clone, Copy)]
+pub struct MeterSnapshot {
+    pub strips: [Meter; NUM_STRIPS],
+    pub buses: [Meter; NUM_BUSES],
+}
+
+impl MeterSnapshot {
+    pub fn capture(engine: &Engine) -> Self {
+        Self {
+            strips: std::array::from_fn(|s| *engine.strip_meter(s)),
+            buses: std::array::from_fn(|b| *engine.bus_meter(b)),
+        }
+    }
+}
+
+impl Default for MeterSnapshot {
+    /// `Meter` is no longer `Default` itself (M8: hold/decay ballistics
+    /// are sample-rate dependent, same reasoning as every other
+    /// sample-rate-dependent block in `loomix-core`), so this goes
+    /// through a real `Engine` for its sample rate -- the same pattern
+    /// `ControlSnapshot::default` already uses, not a new one.
+    fn default() -> Self {
+        Self::capture(&Engine::new())
+    }
+}
+
+/// A small, generic "latest value wins" cross built on the same `rtrb`
+/// SPSC ring [`control_channel`] already uses, rather than a dedicated
+/// triple-buffer crate: the one candidate for that (`triple_buffer`) is
+/// MPL-2.0, a copyleft license outside this project's allow-list
+/// (`deny.toml`) for a product that ships a commercially-distributed
+/// installer (spec 4.5) -- not a call to make unilaterally by widening
+/// the allow-list for one dependency's convenience. `rtrb` is already
+/// vetted, already a dependency here, and the same lock-free/
+/// no-allocation guarantee spec 3.3 asks for covers this just as well:
+/// the audio thread owns [`LatestValuePublisher`] and calls
+/// [`LatestValuePublisher::publish`] once per callback; the app-side
+/// reader owns [`LatestValueReader`] and calls [`LatestValueReader::read`]
+/// at whatever rate it needs, never necessarily per audio block. Used for
+/// both [`ControlSnapshot`] (reconciliation, module doc) and
+/// `MeterSnapshot` (`bin/main.rs`, spec 1.3/1.5's meters) -- the same
+/// crossing shape either way, just a different `T`.
+pub fn latest_value_channel<T: Copy + Default>(
+    capacity: usize,
+) -> (LatestValuePublisher<T>, LatestValueReader<T>) {
     let (producer, consumer) = rtrb::RingBuffer::new(capacity);
     (
-        SnapshotPublisher { producer },
-        SnapshotReader {
+        LatestValuePublisher { producer },
+        LatestValueReader {
             consumer,
-            latest: ControlSnapshot::default(),
+            latest: T::default(),
         },
     )
 }
 
-pub struct SnapshotPublisher {
-    producer: rtrb::Producer<ControlSnapshot>,
+/// The M8 plan's reconciliation channel, specialised to [`ControlSnapshot`].
+pub fn snapshot_channel(
+    capacity: usize,
+) -> (
+    LatestValuePublisher<ControlSnapshot>,
+    LatestValueReader<ControlSnapshot>,
+) {
+    latest_value_channel(capacity)
 }
 
-impl SnapshotPublisher {
-    /// Publishes the latest snapshot. Never blocks and never allocates
-    /// (the ring is pre-allocated once, at [`snapshot_channel`]): if the
+pub struct LatestValuePublisher<T: Copy> {
+    producer: rtrb::Producer<T>,
+}
+
+impl<T: Copy> LatestValuePublisher<T> {
+    /// Publishes the latest value. Never blocks and never allocates (the
+    /// ring is pre-allocated once, at [`latest_value_channel`]): if the
     /// reader hasn't polled recently and the small backlog is momentarily
     /// full, this drops the value rather than waiting for room. That's
-    /// harmless here specifically because only the *most recent* snapshot
-    /// ever matters once the reader does poll (see [`SnapshotReader::read`]
-    /// draining the whole backlog and keeping only the last one) -- unlike
-    /// [`CommandSink::flush`], where a dropped value would be a lost user
-    /// action, a dropped intermediate snapshot is just a value nothing
-    /// ever needed to observe.
-    pub fn publish(&mut self, snapshot: ControlSnapshot) {
-        let _ = self.producer.push(snapshot);
+    /// harmless here specifically because only the *most recent* value
+    /// ever matters once the reader does poll (see
+    /// [`LatestValueReader::read`] draining the whole backlog and keeping
+    /// only the last one) -- unlike [`CommandSink::flush`], where a
+    /// dropped value would be a lost user action, a dropped intermediate
+    /// publish here is just a value nothing ever needed to observe.
+    pub fn publish(&mut self, value: T) {
+        let _ = self.producer.push(value);
     }
 }
 
-pub struct SnapshotReader {
-    consumer: rtrb::Consumer<ControlSnapshot>,
-    latest: ControlSnapshot,
+pub struct LatestValueReader<T: Copy> {
+    consumer: rtrb::Consumer<T>,
+    latest: T,
 }
 
-impl SnapshotReader {
-    /// Drains every snapshot published since the last read and returns
-    /// the most recent one, discarding any older backlog -- a "latest
-    /// value" cross, not a lossless history. Returns the previous value
+impl<T: Copy> LatestValueReader<T> {
+    /// Drains every value published since the last read and returns the
+    /// most recent one, discarding any older backlog -- a "latest value"
+    /// cross, not a lossless history. Returns the previous value
     /// unchanged if nothing new has been published.
-    pub fn read(&mut self) -> ControlSnapshot {
-        while let Ok(snapshot) = self.consumer.pop() {
-            self.latest = snapshot;
+    pub fn read(&mut self) -> T {
+        while let Ok(value) = self.consumer.pop() {
+            self.latest = value;
         }
         self.latest
     }
@@ -538,6 +609,7 @@ mod tests {
             EngineCommand::SetStripMono(2, true),
             EngineCommand::SetStripBusAssign(3, 4, true),
             EngineCommand::SetStripGainLayer(4, 5, -12.5),
+            EngineCommand::SetStripPan(0, -0.5),
             EngineCommand::SetBusMute(0, true),
             EngineCommand::SetBusMono(1, BusMono::StereoReverse),
             EngineCommand::SetBusMode(2, BusMode::MixDownA),
@@ -577,6 +649,7 @@ mod tests {
             EngineCommand::SetStripMono(s, on) => snapshot.strips[s].mono = on,
             EngineCommand::SetStripBusAssign(s, b, on) => snapshot.strips[s].bus_assign[b] = on,
             EngineCommand::SetStripGainLayer(s, b, db) => snapshot.strips[s].gain_layer_db[b] = db,
+            EngineCommand::SetStripPan(s, pan) => snapshot.strips[s].pan = pan,
             EngineCommand::SetBusMute(b, on) => snapshot.buses[b].mute = on,
             EngineCommand::SetBusMono(b, mono) => snapshot.buses[b].mono = mono,
             EngineCommand::SetBusMode(b, mode) => snapshot.buses[b].mode = mode,
@@ -610,6 +683,28 @@ mod tests {
         assert_eq!(drain.drain_into(&mut engine, 64), 1);
     }
 
+    /// The pan pot (spec 1.2 step 9) exists only on `StripChain::Hardware`
+    /// -- a virtual strip has a 5.1 position pad instead (spec 1.4), so a
+    /// `SetStripPan` command aimed at one has nothing to apply to, the
+    /// same class of no-op the EQ test above already proves for the
+    /// hardware-only strip EQ.
+    #[test]
+    fn strip_pan_applies_to_a_hardware_strip_and_is_a_no_op_on_a_virtual_strip() {
+        let mut engine = Engine::new();
+        EngineCommand::SetStripPan(0, 0.6).apply(&mut engine); // strip 0: hardware
+        EngineCommand::SetStripPan(5, 0.6).apply(&mut engine); // strip 5: virtual
+
+        match &engine.strips[0].chain {
+            StripChain::Hardware(chain) => assert_eq!(chain.pan.pan, 0.6),
+            StripChain::Virtual(_) => panic!("strip 0 should be hardware (spec 1.1)"),
+        }
+        assert_eq!(
+            ControlSnapshot::capture(&engine).strips[5].pan,
+            0.0,
+            "a virtual strip has no pan pot; the command should be a harmless no-op"
+        );
+    }
+
     /// An `EngineCommand`'s indices come straight from whatever
     /// constructs it, with no `TryFrom`/range type of its own -- once a
     /// Tauri command layer exists, that's a buggy-or-compromised frontend
@@ -637,6 +732,7 @@ mod tests {
             EngineCommand::SetStripBusAssign(NUM_STRIPS, 0, true),
             EngineCommand::SetStripBusAssign(0, NUM_BUSES, true),
             EngineCommand::SetStripGainLayer(usize::MAX, 0, -6.0),
+            EngineCommand::SetStripPan(NUM_STRIPS, 0.5),
             EngineCommand::SetStripEqCell(NUM_STRIPS, 0, 0, eq_params),
             EngineCommand::SetStripEqCell(0, STRIP_EQ_CHANNELS, 0, eq_params),
             EngineCommand::SetStripEqCell(0, 0, NUM_CELLS, eq_params),
@@ -705,6 +801,7 @@ mod tests {
             EngineCommand::SetStripMono(0, true),
             EngineCommand::SetStripBusAssign(0, 1, true),
             EngineCommand::SetStripGainLayer(0, 1, -6.0),
+            EngineCommand::SetStripPan(0, 0.3),
             EngineCommand::SetBusMute(0, true),
             EngineCommand::SetBusMono(0, BusMono::Mono),
             EngineCommand::SetBusMode(0, BusMode::MixDownA),

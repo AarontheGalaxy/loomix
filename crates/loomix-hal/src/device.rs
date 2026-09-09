@@ -162,6 +162,31 @@ pub fn channel_count(id: DeviceId, direction: Direction) -> Result<usize, CoreAu
     Ok(total)
 }
 
+/// The device's current nominal sample rate
+/// (`kAudioDevicePropertyNominalSampleRate`) -- spec 1.11: "the main
+/// output device... defines the engine sample rate," so `loomix-app`
+/// needs the real value to call [`loomix_core::Engine::set_sample_rate`]
+/// correctly once a device is actually selected, not just assume 48kHz
+/// and let the DSP run at the wrong rate silently. Read-only: this
+/// project never sets a device's rate, only reads whatever the hardware
+/// (or the user, via Audio MIDI Setup) already has it configured to.
+pub fn nominal_sample_rate(id: DeviceId) -> Result<f64, CoreAudioError> {
+    let addr = address(kAudioDevicePropertyNominalSampleRate);
+    let mut rate: f64 = 0.0;
+    let mut size = std::mem::size_of::<f64>() as u32;
+    check(unsafe {
+        AudioObjectGetPropertyData(
+            id,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut rate as *mut _ as *mut _,
+        )
+    })?;
+    Ok(rate)
+}
+
 fn cfstring_property(
     object: AudioObjectID,
     selector: AudioObjectPropertySelector,
@@ -443,12 +468,20 @@ unsafe fn read_input_channels_planar(
 /// The simple, non-interleaving-aware reader/writer pair
 /// [`read_input_channels_planar`] replaced for capture/render: still used
 /// by [`master_ioproc_trampoline`], which has no per-device channel count
-/// or deinterleave scratch to work with (it hands raw buffers straight to
-/// a caller-supplied callback). This is therefore a known, documented gap
-/// for a master device that happens to deliver interleaved audio -- see
-/// `read_input_channels_planar`'s doc comment for the failure mode this
-/// would hit, and `docs/ARCHITECTURE.md` for why it's deferred rather than
-/// fixed here.
+/// or deinterleave scratch of its own to adapt the buffer shape here (it
+/// hands raw buffers straight to a caller-supplied callback). That used to
+/// be a real, hit-in-production gap for a master device that delivers
+/// interleaved audio (`docs/ARCHITECTURE.md`'s M8 entry: real stereo
+/// speaker output came out scrambled -- half the buffer never written,
+/// the other half compressed two channels into one). Fixed on the
+/// consumer side instead of here: `loomix-app::engine_io`'s
+/// `pack_channels`/`unpack_channels` already know the exact frame count
+/// they're packing (the caller's own buffer length), so they can detect
+/// and correctly handle a single combined interleaved buffer without
+/// needing a pre-known channel count or any scratch allocation at all --
+/// simpler than this file's capture/render fix, not a re-implementation
+/// of it. This function itself is unchanged and still just hands over
+/// whatever CoreAudio delivered, raw.
 ///
 /// # Safety
 /// Same contract as [`read_input_channels_planar`], without the
@@ -638,6 +671,25 @@ impl MasterIoProcContext {
     }
 }
 
+/// The first buffer's own reported channel count, straight from
+/// CoreAudio's `mNumberChannels` -- unlike the interleaved-flag readback
+/// `read_input_channels_planar`'s doc comment found unreliable, this
+/// field is populated correctly even for a single combined interleaved
+/// buffer, and is exactly what turns that buffer's raw sample count back
+/// into a true frame count (`raw_len / channel_count`). `.max(1)` guards
+/// a genuinely empty list rather than dividing by zero.
+///
+/// # Safety
+/// `list` must be a valid, non-null `AudioBufferList` pointer with at
+/// least one buffer, or null/zero-buffer (handled by returning `1`) --
+/// the same contract [`read_input_channels`]'s callers already rely on.
+unsafe fn first_buffer_channel_count(list: *const AudioBufferList) -> usize {
+    if list.is_null() || unsafe { (*list).mNumberBuffers } == 0 {
+        return 1;
+    }
+    (unsafe { (*list).mBuffers[0].mNumberChannels } as usize).max(1)
+}
+
 pub(crate) unsafe extern "C" fn master_ioproc_trampoline(
     _device: AudioObjectID,
     _now: *const AudioTimeStamp,
@@ -650,11 +702,26 @@ pub(crate) unsafe extern "C" fn master_ioproc_trampoline(
     let ctx = unsafe { &mut *(client_data as *mut MasterIoProcContext) };
     let (input_channels, input_count) = unsafe { read_input_channels(input_data) };
     let (mut output_channels, output_count) = unsafe { write_output_channels(output_data) };
-    let frames = output_channels[..output_count]
-        .first()
-        .map(|c| c.len())
-        .or_else(|| input_channels[..input_count].first().map(|c| c.len()))
-        .unwrap_or(0) as u32;
+    // A real multi-channel device's first buffer may be one combined
+    // interleaved AudioBuffer, whose raw sample count is
+    // `frames * channel_count`, not `frames` -- dividing by that
+    // buffer's own reported channel count recovers the true frame count
+    // in both that case and the plain one-buffer-per-channel case
+    // (channel count 1, division is a no-op). Previously used the raw
+    // buffer length directly, over-reporting the frame count by exactly
+    // the device's channel count for any real multi-channel output --
+    // traced back from a real recording showing every other block of
+    // output entirely silent (`docs/ARCHITECTURE.md`).
+    let frames = if output_count > 0 {
+        let channels = unsafe { first_buffer_channel_count(output_data) };
+        Some(output_channels[0].len() / channels)
+    } else if input_count > 0 {
+        let channels = unsafe { first_buffer_channel_count(input_data) };
+        Some(input_channels[0].len() / channels)
+    } else {
+        None
+    }
+    .unwrap_or(0) as u32;
     (ctx.callback)(
         frames,
         &input_channels[..input_count],
@@ -688,6 +755,16 @@ mod tests {
         let uid = device_uid(id).expect("uid query should succeed");
         assert!(!name.is_empty());
         assert!(!uid.is_empty());
+    }
+
+    #[test]
+    fn default_output_device_has_a_positive_nominal_sample_rate() {
+        let id = default_output_device().expect("a default output device should exist");
+        let rate = nominal_sample_rate(id).expect("sample rate query should succeed");
+        assert!(
+            rate > 0.0,
+            "every real device reports a positive sample rate, got {rate}"
+        );
     }
 
     #[test]
@@ -1122,5 +1199,60 @@ mod tests {
             let buf0 = std::slice::from_raw_parts(list.mBuffers[0].mData as *const f32, 4);
             assert!(buf0.iter().all(|&s| s == 42.0));
         }
+    }
+
+    /// A real stereo output device delivers ONE combined interleaved
+    /// `AudioBuffer` (confirmed repeatedly on this machine, see
+    /// `docs/ARCHITECTURE.md`), so its raw sample count is
+    /// `frames * channel_count`, not `frames`. The test above only
+    /// covers the mono/planar shape (buffer length already equals frame
+    /// count, so the bug this test targets can't show up there), which
+    /// is exactly why it was never caught by that test.
+    ///
+    /// `frames` computed here feeds straight into
+    /// `loomix-app::engine_io::EngineIoDriver::on_master_tick`'s
+    /// `block_frames`, which sizes every scratch buffer and, critically,
+    /// how many frames `StripSource::pull_into` drains from the real
+    /// capture ring per callback -- reporting the raw interleaved
+    /// sample count there over-drains that ring by exactly
+    /// `channel_count`, the root cause traced back from a real
+    /// recording showing every other block of output entirely silent
+    /// (`docs/ARCHITECTURE.md`'s next dated entry).
+    #[test]
+    fn master_trampoline_reports_frame_count_not_raw_interleaved_sample_count() {
+        let true_frames = 4;
+        let channel_count = 2;
+        let input = vec![vec![0.0f32; true_frames]]; // mono capture, not implicated
+        let input_list = TestBufferList::new(input);
+        let interleaved_out = vec![0.0f32; true_frames * channel_count];
+        let mut output_list = TestBufferList::new_interleaved(interleaved_out, channel_count);
+
+        let seen_frames = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen_frames_cb = seen_frames.clone();
+        let callback: MasterTickCallback = Box::new(move |frames, _input, _output| {
+            seen_frames_cb.store(frames, std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut ctx = Box::new(MasterIoProcContext { callback });
+
+        let status = unsafe {
+            master_ioproc_trampoline(
+                0,
+                std::ptr::null(),
+                input_list.as_ptr(),
+                std::ptr::null(),
+                output_list.as_mut_ptr(),
+                std::ptr::null(),
+                ctx.as_mut() as *mut MasterIoProcContext as *mut std::os::raw::c_void,
+            )
+        };
+        assert_eq!(status, 0);
+        assert_eq!(
+            seen_frames.load(std::sync::atomic::Ordering::SeqCst) as usize,
+            true_frames,
+            "a {channel_count}-channel interleaved output buffer of \
+             {true_frames} true frames should report {true_frames} frames, \
+             not its raw sample count ({})",
+            true_frames * channel_count
+        );
     }
 }

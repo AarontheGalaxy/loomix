@@ -36,8 +36,8 @@ impl Default for Engine {
             strips: std::array::from_fn(|i| Strip::for_topology_index(i, DEFAULT_SAMPLE_RATE)),
             buses: std::array::from_fn(|_| Bus::new(DEFAULT_SAMPLE_RATE)),
             patch: Patch::default(),
-            strip_meters: [Meter::default(); NUM_STRIPS],
-            bus_meters: [Meter::default(); NUM_BUSES],
+            strip_meters: std::array::from_fn(|_| Meter::new(DEFAULT_SAMPLE_RATE)),
+            bus_meters: std::array::from_fn(|_| Meter::new(DEFAULT_SAMPLE_RATE)),
             sample_rate: DEFAULT_SAMPLE_RATE,
         }
     }
@@ -60,10 +60,11 @@ impl Engine {
         self.sample_rate
     }
 
-    /// Propagates to every strip's effects chain and every bus's EQ
-    /// (filter/delay-line state is sample-rate dependent) — spec 1.11's
-    /// device-selection-driven rate change, wired through by `loomix-app`
-    /// (M4's clock-master selection).
+    /// Propagates to every strip's effects chain, every bus's EQ
+    /// (filter/delay-line state is sample-rate dependent) and every
+    /// meter (hold time and decay rate are real-time quantities, M8) —
+    /// spec 1.11's device-selection-driven rate change, wired through by
+    /// `loomix-app` (M4's clock-master selection).
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate;
         for strip in &mut self.strips {
@@ -71,6 +72,13 @@ impl Engine {
         }
         for bus in &mut self.buses {
             bus.eq.set_sample_rate(sample_rate);
+        }
+        for meter in self
+            .strip_meters
+            .iter_mut()
+            .chain(self.bus_meters.iter_mut())
+        {
+            meter.set_sample_rate(sample_rate);
         }
     }
 

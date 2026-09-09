@@ -7,6 +7,43 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- App shell and first UI (spec 3.4 M8, in progress): Tauri v2 scaffolding
+  and a React frontend running in-process against the real engine.
+  - `loomix-app::control`: the lock-free UI-to-audio-thread bridge --
+    `EngineCommand`s coalesced per parameter and pushed through an `rtrb`
+    SPSC queue, applied on the audio thread before `process_block`; a
+    `ControlSnapshot`/`MeterSnapshot` published back out over a small
+    "latest value wins" channel for UI reconciliation and live metering.
+    A failed push under load is retried, never dropped; every command's
+    indices are bounds-checked before touching `Engine`, since this runs
+    on the real-time thread.
+  - `loomix-app` gains its `[[bin]]` (`loomix`): Tauri commands for
+    mute/solo/mono, bus assignment, gain layers, bus mute/mono/mode/gain,
+    and both meter/state polling endpoints.
+  - `ui/`: React + Vite, a typed `bridge.ts` command layer, and vertical
+    channel-strip UI -- tall faders beside tall meters, strips filling
+    the window's height, a matching bus row below, plus a device picker
+    in the header.
+  - Meters gained real peak-hold-then-decay ballistics (1.0s hold,
+    20dB/s decay, `docs/DSP.md`) in place of the original plain running
+    max, which read identically whether a channel was loud or had been
+    muted for the whole session.
+  - Real CoreAudio device I/O, replacing the synthetic test tone: a
+    selected output device becomes the clock master (spec 1.19, its bus
+    is always A1) and an optional input device attaches into strip 0,
+    reusing `loomix-app::device_wiring` and `loomix-soak`'s
+    already-proven device-ordering. Verified against real hardware: a
+    real output device connects and stays stable; real microphone
+    capture is wired correctly but currently blocked by a TCC
+    permission gate specific to running an unbundled dev binary (not a
+    bug -- see `docs/ARCHITECTURE.md`), the same finding `loomix-soak`'s
+    own history already recorded for capture devices.
+  - The hardware strip pan pot (spec 1.2 step 9), reachable from the UI
+    for the first time since M5 implemented it: a horizontal slider per
+    hardware strip (0..4), a new `EngineCommand::SetStripPan` following
+    the existing per-strip command pattern, a silent no-op on a virtual
+    strip.
+  - Not yet wired: the EQ graph.
 - Bus modes and patching (spec 3.4 M7): all 12 bus modes (`loomix-core::
   bus_mode`), the composite bus patch, the insert patch, and both pre/post
   switches.
@@ -87,6 +124,34 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     renderer, cross-checked against a fixture generated from the real
     Rust engine rather than trusted independently by either side.
 
+### Fixed
+
+- `master_ioproc_trampoline`'s output buffer was scrambled on real
+  hardware: `EngineIoDriver::unpack_channels` assumed one buffer per
+  channel, but a real output device delivers one combined interleaved
+  buffer, so only the first channel's worth of samples was written and
+  the rest of the buffer kept whatever stale/poisoned data was already
+  there. Found live (reported as "crackling, robotic, distorted" real
+  audio, not from inspection) and proven with a deterministic test before
+  the fix, per `docs/ARCHITECTURE.md`. `pack_channels` (the input-side
+  mirror, for a master device also used as a strip source) got the same
+  fix and its own test, though that path is not reachable in the current
+  app's wiring yet.
+- The actual cause of the reported real-audio distortion, found by
+  analysing a WAV recording: `master_ioproc_trampoline` reported a real
+  stereo output device's raw interleaved sample count as its frame count
+  instead of dividing by the channel count, doubling `block_frames`
+  throughout the engine. That silently doubled how many frames
+  `StripSource::pull_into` drained from the real capture ring per
+  callback, underrunning every other block into silence -- exactly the
+  alternating-silent-block pattern the recording showed. Fixed by reading
+  each buffer's own `mNumberChannels` (a new `first_buffer_channel_count`)
+  and dividing by it, recovering the true frame count for both the
+  single-interleaved-buffer and one-buffer-per-channel cases with the
+  same formula. Proven with two host-side tests (`loomix-hal::device`,
+  `loomix-app::engine_io`), both written and confirmed failing against
+  the unfixed code first. See `docs/ARCHITECTURE.md`'s 2026-09-09 entry.
+
 ### Known limitations
 
 - Intellipan's Color pad tonal-shaping ships without its "small reverb on
@@ -107,6 +172,15 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   click-to-type-a-value and right-click-to-change-the-dB-scale (spec 1.7)
   are real UI work for that milestone; the renderer already takes a dB
   range as a parameter so that control has something to drive.
+- Real device I/O has no correction for a genuine input/output nominal
+  sample-rate mismatch (e.g. a 44.1kHz input device against a 48kHz
+  output), only for small clock drift between devices already at the
+  same rate: `connect_audio` never queries or compares the input
+  device's nominal rate, and the capture resampler's drift corrector is
+  bounded (`max_correction = 0.01`) and reset-on-discontinuity in a way
+  that a real mismatch defeats rather than converges against. Proven by
+  a host-side test (`loomix-hal::ioproc`), not yet fixed — see
+  `docs/ARCHITECTURE.md`'s 2026-08-28 entry.
 
 ## [0.1.0] - 2026-08-23
 

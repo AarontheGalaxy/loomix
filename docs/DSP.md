@@ -390,3 +390,69 @@ tolerance in deep attenuation — fixed with a local `f64`-accumulating
 Goertzel in the fixture generator only, the same class of fix as the M4
 drift-simulation counters (`docs/ARCHITECTURE.md`). The TS side's own
 formulas are otherwise a direct line-for-line port of `biquad.rs`'s.
+
+## Metering (`meter.rs`, M3 originally, ballistics added M8)
+
+Spec 1.3's input meter and spec 1.5's output meter don't get exact
+ballistics from the reference manual (no such table is published there
+either — the same "no external reference exists" position as the
+macro-knob curves and Karaoke's depths above). M3 shipped a plain running
+maximum (`if level > held { held = level }`, never decreasing except on
+an explicit `reset()`), which reads identically whether a channel is
+*currently* loud or was loud once, arbitrarily long ago, and has been
+silent or muted ever since — indistinguishable from a stuck channel.
+Fixed on direct instruction to match typical reference meter ballistics
+instead: hold the peak for a fixed time, then let it fall at a roughly
+constant rate, not a permanent maximum.
+
+| Quantity | Value |
+|---|---|
+| Hold time | 1.0 s |
+| Decay rate | 20 dB/s |
+| Silence floor | -120dB linear (`1e-6`) — below this a decaying peak snaps to exact `0.0` |
+
+`Meter::observe` runs this per sample, not once per block: a sample
+louder than the current held peak immediately replaces it and restarts
+that channel's hold countdown (`hold_samples`, `HOLD_TIME_S * sample_rate`
+rounded to the nearest sample); once the countdown reaches zero, every
+subsequent sample multiplies the held peak by a fixed
+`decay_per_sample` factor instead of comparing it to anything. That
+factor is derived once (in `set_sample_rate`, not per sample) so that its
+value raised to the power of `sample_rate` equals the linear ratio for a
+`DECAY_DB_PER_S` drop over exactly one second:
+`decay_per_sample = 10^(-DECAY_DB_PER_S / (20 * sample_rate))`. Decaying
+multiplicatively never reaches exact `0.0` on its own — `SILENCE_FLOOR`
+(`1e-6`, -120dB) is where a decaying value gets snapped to true digital
+silence instead of lingering in ever-smaller (eventually denormal)
+values forever, the same "flush denormals" concern spec 3.3 already
+raises generally, applied here to a value that would otherwise decay
+towards it indefinitely rather than through it once.
+
+**Sample-rate dependent, so `Meter` lost its `Default` impl** — the
+identical move `Strip`/`Bus`/`ParametricEq` already made for the same
+reason (spec 3.4 M5/M6 logs, `docs/ARCHITECTURE.md`): hold time and decay
+rate are real-time quantities, meaningless without knowing the sample
+rate they're measured against. `Meter::new(sample_rate)` replaces it;
+`Engine::set_sample_rate` now propagates to every meter alongside every
+strip's chain and every bus's EQ.
+
+Tested by driving the ballistics directly with known sample counts, not
+by asserting "the meter changes": a peak held for exactly `hold_samples -
+1` silent samples must read the *original* value bit-exact (proving the
+hold window, not just "decay eventually happens"); a peak held out past
+the hold window and then decayed for exactly one further second of
+silence must land within 1% of the closed-form 20dB-drop answer
+(`decays_at_the_documented_rate_after_the_hold_time_elapses`); a channel
+silenced for 10 seconds (comfortably past both the hold time and the
+~6 seconds a full 120dB range takes to decay through at 20dB/s) must read
+*exact* `0.0`, the specific bug this change exists to fix
+(`a_muted_or_silenced_channel_eventually_reads_exact_silence`); and a
+fresh, higher peak arriving mid-decay must restart the hold window rather
+than inherit whatever was left of the previous one's expired countdown.
+The hold-before-decay ordering is checked the same way every other order
+claim in this codebase is (`docs/ARCHITECTURE.md`): decay was temporarily
+made to run unconditionally, from the first sample regardless of the hold
+window, and confirmed to actually fail
+`decay_never_runs_before_the_hold_window_elapses_provably` (along with
+three of the other tests above) before being reverted — a real proof the
+implementation's order matters to the test, not an assumption that it does.
