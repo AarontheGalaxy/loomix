@@ -54,6 +54,11 @@ pub enum EngineCommand {
     SetStripBusAssign(usize, usize, bool),
     /// (strip, bus, db)
     SetStripGainLayer(usize, usize, f32),
+    /// (strip, pan) -- spec 1.2 step 9's pan pot, hardware strips only
+    /// (spec 1.3); a no-op if `strip` is a virtual strip (spec 1.4 has a
+    /// 5.1 position pad instead, not this control). `-1.0` hard left,
+    /// `0.0` center, `1.0` hard right (`docs/DSP.md`'s balance law).
+    SetStripPan(usize, f32),
     SetBusMute(usize, bool),
     SetBusMono(usize, BusMono),
     SetBusMode(usize, BusMode),
@@ -76,6 +81,7 @@ enum ParamKey {
     StripMono(usize),
     StripBusAssign(usize, usize),
     StripGainLayer(usize, usize),
+    StripPan(usize),
     BusMute(usize),
     BusMono(usize),
     BusMode(usize),
@@ -92,6 +98,7 @@ impl EngineCommand {
             Self::SetStripMono(s, _) => ParamKey::StripMono(s),
             Self::SetStripBusAssign(s, b, _) => ParamKey::StripBusAssign(s, b),
             Self::SetStripGainLayer(s, b, _) => ParamKey::StripGainLayer(s, b),
+            Self::SetStripPan(s, _) => ParamKey::StripPan(s),
             Self::SetBusMute(b, _) => ParamKey::BusMute(b),
             Self::SetBusMono(b, _) => ParamKey::BusMono(b),
             Self::SetBusMode(b, _) => ParamKey::BusMode(b),
@@ -146,6 +153,13 @@ impl EngineCommand {
             Self::SetStripGainLayer(s, b, db) => {
                 if s < NUM_STRIPS && b < NUM_BUSES {
                     engine.strips[s].set_gain_layer_db(b, db);
+                }
+            }
+            Self::SetStripPan(s, pan) => {
+                if s < NUM_STRIPS {
+                    if let StripChain::Hardware(chain) = &mut engine.strips[s].chain {
+                        chain.pan.pan = pan;
+                    }
                 }
             }
             Self::SetBusMute(b, on) => {
@@ -302,6 +316,9 @@ pub struct StripSnapshot {
     pub mono: bool,
     pub bus_assign: [bool; NUM_BUSES],
     pub gain_layer_db: [f32; NUM_BUSES],
+    /// `0.0` (center) on a virtual strip: it has no pan pot (spec 1.4 has
+    /// a 5.1 position pad instead), so there's nothing live to mirror.
+    pub pan: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -338,6 +355,10 @@ impl ControlSnapshot {
                 mono: engine.strips[s].mono,
                 bus_assign: engine.strips[s].bus_assign,
                 gain_layer_db: std::array::from_fn(|b| engine.strips[s].gain_layer_db(b)),
+                pan: match &engine.strips[s].chain {
+                    StripChain::Hardware(chain) => chain.pan.pan,
+                    StripChain::Virtual(_) => 0.0,
+                },
             }),
             buses: std::array::from_fn(|b| BusSnapshot {
                 mute: engine.buses[b].mute,
@@ -588,6 +609,7 @@ mod tests {
             EngineCommand::SetStripMono(2, true),
             EngineCommand::SetStripBusAssign(3, 4, true),
             EngineCommand::SetStripGainLayer(4, 5, -12.5),
+            EngineCommand::SetStripPan(0, -0.5),
             EngineCommand::SetBusMute(0, true),
             EngineCommand::SetBusMono(1, BusMono::StereoReverse),
             EngineCommand::SetBusMode(2, BusMode::MixDownA),
@@ -627,6 +649,7 @@ mod tests {
             EngineCommand::SetStripMono(s, on) => snapshot.strips[s].mono = on,
             EngineCommand::SetStripBusAssign(s, b, on) => snapshot.strips[s].bus_assign[b] = on,
             EngineCommand::SetStripGainLayer(s, b, db) => snapshot.strips[s].gain_layer_db[b] = db,
+            EngineCommand::SetStripPan(s, pan) => snapshot.strips[s].pan = pan,
             EngineCommand::SetBusMute(b, on) => snapshot.buses[b].mute = on,
             EngineCommand::SetBusMono(b, mono) => snapshot.buses[b].mono = mono,
             EngineCommand::SetBusMode(b, mode) => snapshot.buses[b].mode = mode,
@@ -660,6 +683,28 @@ mod tests {
         assert_eq!(drain.drain_into(&mut engine, 64), 1);
     }
 
+    /// The pan pot (spec 1.2 step 9) exists only on `StripChain::Hardware`
+    /// -- a virtual strip has a 5.1 position pad instead (spec 1.4), so a
+    /// `SetStripPan` command aimed at one has nothing to apply to, the
+    /// same class of no-op the EQ test above already proves for the
+    /// hardware-only strip EQ.
+    #[test]
+    fn strip_pan_applies_to_a_hardware_strip_and_is_a_no_op_on_a_virtual_strip() {
+        let mut engine = Engine::new();
+        EngineCommand::SetStripPan(0, 0.6).apply(&mut engine); // strip 0: hardware
+        EngineCommand::SetStripPan(5, 0.6).apply(&mut engine); // strip 5: virtual
+
+        match &engine.strips[0].chain {
+            StripChain::Hardware(chain) => assert_eq!(chain.pan.pan, 0.6),
+            StripChain::Virtual(_) => panic!("strip 0 should be hardware (spec 1.1)"),
+        }
+        assert_eq!(
+            ControlSnapshot::capture(&engine).strips[5].pan,
+            0.0,
+            "a virtual strip has no pan pot; the command should be a harmless no-op"
+        );
+    }
+
     /// An `EngineCommand`'s indices come straight from whatever
     /// constructs it, with no `TryFrom`/range type of its own -- once a
     /// Tauri command layer exists, that's a buggy-or-compromised frontend
@@ -687,6 +732,7 @@ mod tests {
             EngineCommand::SetStripBusAssign(NUM_STRIPS, 0, true),
             EngineCommand::SetStripBusAssign(0, NUM_BUSES, true),
             EngineCommand::SetStripGainLayer(usize::MAX, 0, -6.0),
+            EngineCommand::SetStripPan(NUM_STRIPS, 0.5),
             EngineCommand::SetStripEqCell(NUM_STRIPS, 0, 0, eq_params),
             EngineCommand::SetStripEqCell(0, STRIP_EQ_CHANNELS, 0, eq_params),
             EngineCommand::SetStripEqCell(0, 0, NUM_CELLS, eq_params),
@@ -755,6 +801,7 @@ mod tests {
             EngineCommand::SetStripMono(0, true),
             EngineCommand::SetStripBusAssign(0, 1, true),
             EngineCommand::SetStripGainLayer(0, 1, -6.0),
+            EngineCommand::SetStripPan(0, 0.3),
             EngineCommand::SetBusMute(0, true),
             EngineCommand::SetBusMono(0, BusMono::Mono),
             EngineCommand::SetBusMode(0, BusMode::MixDownA),

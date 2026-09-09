@@ -235,6 +235,31 @@ body {
   padding: 2px;
 }
 
+/* The pan pot (spec 1.2 step 9, hardware strips only): unlike the fader,
+   this is genuinely one-dimensional left-right, so it stays a normal
+   horizontal slider rather than adopting the vertical fader's shape. */
+.pan-row {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pan-slider {
+  flex: 1;
+  min-width: 0;
+  height: 14px;
+  cursor: pointer;
+}
+
+.pan-value {
+  flex: 0 0 auto;
+  width: 22px;
+  text-align: right;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
 /* The vertical fader + vertical meter, side by side, filling whatever
    height the channel strip has left -- this is the actual mixer shape:
    a tall, narrow strip, not a settings-panel row of horizontal sliders. */

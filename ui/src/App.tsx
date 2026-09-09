@@ -18,6 +18,7 @@ import {
   setStripGainLayer,
   setStripMono,
   setStripMute,
+  setStripPan,
   setStripSolo,
   type AudioStatus,
   type ControlSnapshot,
@@ -31,6 +32,7 @@ const BUS_LABELS = ["A1", "A2", "A3", "A4", "A5", "B1", "B2", "B3"];
 
 // spec 1.1: strips 0..4 are hardware, 5..7 are virtual.
 const STRIP_LABELS = ["HW 1", "HW 2", "HW 3", "HW 4", "HW 5", "VI 1", "VI Aux", "VI 3"];
+const NUM_HARDWARE_STRIPS = 5;
 
 // Reconciliation snapshot: low rate, on direct instruction ("not a
 // per-frame round trip") -- the UI already updates optimistically the
@@ -45,6 +47,16 @@ const DEVICE_POLL_MS = 3000;
 
 function peakToUnit(level: number): number {
   return Math.min(1, Math.max(0, level));
+}
+
+// spec 1.2 step 9's balance law (`docs/DSP.md`): -1 hard left, 0 center
+// (the default), 1 hard right -- matches the pan pot's own -1..1 range
+// exactly, so a raw pan value maps straight to a percentage toward the
+// extreme with no rescaling.
+function panLabel(pan: number): string {
+  if (Math.abs(pan) < 0.005) return "C";
+  const pct = Math.round(Math.abs(pan) * 100);
+  return pan < 0 ? `L${pct}` : `R${pct}`;
 }
 
 function Meter({ levels }: { levels: number[] | undefined }) {
@@ -102,6 +114,20 @@ function StripColumn({ index, snapshot, meterLevels, selectedBus, onChange }: St
         />
         {BUS_LABELS[selectedBus]}
       </label>
+      {index < NUM_HARDWARE_STRIPS && (
+        <div className="pan-row">
+          <input
+            className="pan-slider"
+            type="range"
+            min={-1}
+            max={1}
+            step={0.01}
+            value={snapshot.pan}
+            onChange={(e) => void setStripPan(index, Number(e.target.value)).then(onChange)}
+          />
+          <span className="pan-value">{panLabel(snapshot.pan)}</span>
+        </div>
+      )}
       <div className="fader-meter-row">
         <input
           className="fader"

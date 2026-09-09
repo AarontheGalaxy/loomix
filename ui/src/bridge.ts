@@ -51,6 +51,8 @@ export interface StripSnapshot {
   mono: boolean;
   bus_assign: boolean[];
   gain_layer_db: number[];
+  /** `0` (center) on a virtual strip, which has no pan pot. */
+  pan: number;
 }
 
 export interface BusSnapshot {
@@ -126,6 +128,11 @@ export function setStripBusAssign(strip: number, bus: number, on: boolean): Prom
 
 export function setStripGainLayer(strip: number, bus: number, db: number): Promise<void> {
   return invoke("set_strip_gain_layer", { strip, bus, db });
+}
+
+/** `-1` hard left, `0` center, `1` hard right. Hardware strips only. */
+export function setStripPan(strip: number, pan: number): Promise<void> {
+  return invoke("set_strip_pan", { strip, pan });
 }
 
 export function setBusMute(bus: number, on: boolean): Promise<void> {

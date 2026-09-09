@@ -38,6 +38,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     permission gate specific to running an unbundled dev binary (not a
     bug -- see `docs/ARCHITECTURE.md`), the same finding `loomix-soak`'s
     own history already recorded for capture devices.
+  - The hardware strip pan pot (spec 1.2 step 9), reachable from the UI
+    for the first time since M5 implemented it: a horizontal slider per
+    hardware strip (0..4), a new `EngineCommand::SetStripPan` following
+    the existing per-strip command pattern, a silent no-op on a virtual
+    strip.
   - Not yet wired: the EQ graph.
 - Bus modes and patching (spec 3.4 M7): all 12 bus modes (`loomix-core::
   bus_mode`), the composite bus patch, the insert patch, and both pre/post

@@ -132,6 +132,9 @@ struct StripSnapshotDto {
     mono: bool,
     bus_assign: [bool; NUM_BUSES],
     gain_layer_db: [f32; NUM_BUSES],
+    /// `0.0` (center) on a virtual strip, which has no pan pot (spec 1.4
+    /// has a 5.1 position pad instead) -- see `StripSnapshot::pan`.
+    pan: f32,
 }
 
 impl From<StripSnapshot> for StripSnapshotDto {
@@ -142,6 +145,7 @@ impl From<StripSnapshot> for StripSnapshotDto {
             mono: s.mono,
             bus_assign: s.bus_assign,
             gain_layer_db: s.gain_layer_db,
+            pan: s.pan,
         }
     }
 }
@@ -313,6 +317,11 @@ fn set_strip_gain_layer(state: State<AppState>, strip: usize, bus: usize, db: f3
 }
 
 #[tauri::command]
+fn set_strip_pan(state: State<AppState>, strip: usize, pan: f32) {
+    send(&state, EngineCommand::SetStripPan(strip, pan));
+}
+
+#[tauri::command]
 fn set_bus_mute(state: State<AppState>, bus: usize, on: bool) {
     send(&state, EngineCommand::SetBusMute(bus, on));
 }
@@ -455,6 +464,7 @@ fn main() {
             set_strip_mono,
             set_strip_bus_assign,
             set_strip_gain_layer,
+            set_strip_pan,
             set_bus_mute,
             set_bus_mono,
             set_bus_mode,

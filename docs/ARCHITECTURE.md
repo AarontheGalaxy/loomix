@@ -5,6 +5,44 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-09-09 — M8 (continued): the hardware strip pan pot, wired to the UI
+
+Found sitting unused since M5: `loomix-core::strip_dsp::HardwareChain` has
+had a `pan: StereoBalance` field (spec 1.2 step 9, `docs/DSP.md`'s balance
+law) since strip processing landed, but nothing between the engine and the
+UI ever exposed it -- with a mono input and no pan control, there was no
+way to place the signal anywhere but center. The trigger for going looking
+was a direct instruction to close this exact gap, which is also what
+prompted the broader coverage audit logged separately today: if a feature
+this basic could sit implemented-but-unreachable for three milestones
+unnoticed, the same class of gap could exist elsewhere in the surface, and
+now there's a report auditing for it deliberately rather than by accident.
+
+**Follows the bridge's existing pattern exactly, no new plumbing
+invented:** `EngineCommand::SetStripPan(strip, pan)` alongside the other
+per-strip commands (`control.rs`), applied the same way
+`SetStripEqCell` already is -- matched against `StripChain::Hardware`,
+a silent no-op on a virtual strip (spec 1.4's virtual strips have a 5.1
+position pad instead, not this control), proven by a dedicated test the
+same shape as the EQ one. `StripSnapshot` gained a `pan: f32` field
+(`0.0` on a virtual strip, since there's nothing live to mirror) so the
+UI's reconciliation snapshot and every existing burst/round-trip test
+already covering that snapshot picked it up for free once the field
+existed.
+
+**UI: a horizontal slider, deliberately not shaped like the vertical
+fader.** Pan is genuinely one-dimensional left-right, unlike the fader's
+level dimension that benefited from reading as a tall physical strip --
+forcing it into the same vertical idiom would be cargo-culting the
+earlier layout rework's shape rather than applying its actual reasoning
+(control shape should match what the control does). Rendered only for
+strips 0..4 (hardware, spec 1.1's fixed topology) -- a virtual strip's
+column is simply shorter by one row, which reads correctly rather than
+as a layout bug, since virtual strips genuinely have no pan pot to show.
+Scope held deliberately narrow per direct instruction: the pan pot only,
+not the 2D Intellipan pads or pad-mode switching, which stay with a
+later UI pass.
+
 ## 2026-09-09 — M8 (continued): the real cause of the alternating-silent-block distortion, found from a WAV recording
 
 The recording deferred in the entry below arrived and settled the question
