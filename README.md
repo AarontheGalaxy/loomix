@@ -43,9 +43,12 @@ compressor, limiter, denoiser, pan laws (M5); the parametric EQ engine
 (M6); bus modes and patching (M7); the app shell and first UI -- React +
 Tauri, the strip/bus layout, faders, meters, device selection (M8);
 internal FX -- reverb, multitap delay, multiband compressor (M9); the
-recorder (M10); the control surface -- request script, MIDI mapping,
-macro buttons (M11); network audio (M12); and the polish/release
-milestone -- preset scenes, installer, docs site (M13).
+UI completion pass -- effects, Intellipan, virtual strip controls, the
+parametric EQ panel (M10); the recorder (M11); the control surface --
+request script, MIDI mapping, macro buttons (M12); network audio (M13);
+the polish/release milestone -- preset scenes, installer, docs site
+(M14); and the final manual verification release gate against all
+three vendor manuals (M15).
 
 ## Repository layout
 

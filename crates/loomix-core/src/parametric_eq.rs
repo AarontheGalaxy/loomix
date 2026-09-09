@@ -45,7 +45,7 @@ pub struct EqCellParams {
     pub cell_type: EqCellType,
     /// 20Hz..20kHz (spec 1.7). Not clamped here: DSP-layer code trusts its
     /// caller (only validated at a system boundary, which this isn't yet —
-    /// that's the UI layer (M8) or the RPC layer (M11)).
+    /// that's the UI layer (M8/M10) or the RPC layer (M12)).
     pub freq_hz: f32,
     /// -12..+12dB API range, -36..+18dB extended UI scale (spec 1.7).
     /// Ignored by cell types with no gain stage (LowPass/HighPass/

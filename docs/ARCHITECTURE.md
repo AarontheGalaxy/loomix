@@ -5,6 +5,132 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-09-09 — M10 implementation: the command layer, the React UI, and a layout review that caught a real regression before it shipped
+
+**The Rust command layer landed first, tests before implementation per this project's own rule.** All 11 state-2 controls became 14 new `EngineCommand` variants in `loomix-app::control` (`SetStripGateKnob`/`CompKnob`/`DenoiserKnob`, `SetStripLimiterThreshold`, `SetStripIntellipanMode`/`IntellipanXY`, `SetStripEq3`, `SetStripPositionPad`, `SetStripMc`, `SetStripKaraoke`, `SetStripEqOn`/`EqMemory`, `SetBusEqOn`/`EqMemory`), each bounds-checked and RT-safety-proven the same way every existing variant already was. On direct instruction, the bounds and round-trip tests are table-driven (`control::tests::CONTROL_CASES`, an array of `{name, round_trips, noop_variants}`) rather than eleven hand-copied tests, with a completeness assertion (`control_case_table_covers_every_m10_control_exactly_once`) pinning the table's length against a named constant so a missing or duplicated entry fails loudly instead of just never getting written. `StripSnapshot`/`BusSnapshot` grew the matching fields, extending the exact rule their own doc comments already stated ("`EngineCommand`'s own scalar surface"), which incidentally gave the bounds/no-op tests a full-state comparator for free.
+
+**The Intellipan mode switch needed a real architecture fix, not just a new command.** The old `Intellipan` enum reconstructed a fresh boxed pad on every mode switch (`Intellipan::color(sr)` etc.) — fine when switching only happened at strip construction, a spec 3.3 violation once spec 1.18's "right click cycles pad mode" became a live audio-thread command. Replaced with `IntellipanPads`: all three pads allocated once and kept alive permanently, `mode` a plain discriminant, `set_mode` a discriminant write plus an in-place `reset()` (fields zeroed via `.fill()`, no reallocation) on whichever pad becomes newly active — preserving the pre-existing "switching never leaks state" contract without ever allocating on the audio thread. Proven both ways, not just asserted: `switching_mode_and_repositioning_does_not_allocate` passes under `--features rt-assert`, and was confirmed to actually fail against a deliberately reintroduced `Box::new` in `set_mode` before being reverted — the same before/after proof this project's order-tests already use, applied to an allocation claim instead.
+
+**The EQ panel needed a real snapshot channel, not just write commands.** Editing cells you can't see the current value of isn't a working panel — `EqSnapshot` (new, `control.rs`) publishes every strip's and bus's full `EqChannelParams` every audio callback, the same "latest value wins" shape as `ControlSnapshot`/`MeterSnapshot`, polled by `App.tsx` continuously (not just while a panel is open) because the EQ trigger button's glance state needs it live on the main view too.
+
+**Trim, delay, FLAT and CH COPY were brought into M10, not deferred — direct instruction, and the right call on the merits.** All four were already implemented and tested in `loomix-core` (`ParametricEq::set_trim_db`/`set_delay_ms`/`reset_channel`/`copy_channel`) before this milestone; leaving them unwired would have recreated the exact state-2 shape M10 exists to close, which is what the instruction that triggered this said outright. Eight more `EngineCommand` variants, the matching Tauri commands and bridge functions, eight more `CONTROL_CASES` rows (table now 23 long). `COPY ALL`, loading/saving the whole EQ set as a file, and the two right-click gestures (type an exact value, change the graph's dB scale) are the three that stay genuinely deferred — `docs/SPEC.md` 1.7 now names all three explicitly and tags them to **M14**, rather than the panel's own doc comment being the only record of the cut.
+
+**The layout review the user asked for, before committing, caught a real defect a code review wouldn't have.** A first screenshot of the running app (`cargo tauri dev`, captured via `screencapture` + the macOS Accessibility API — the same method earlier M8 log entries already established) showed the Intellipan/5.1 XY pad as a full-width square dwarfing the fader below it; fixed to a 2.2:1 wide rectangle, giving the fader its space back. A second review round found four more real problems, not cosmetic ones:
+
+1. **VI Aux's Karaoke button lived in a row none of its sibling strips had**, shifting its whole stack down and breaking horizontal alignment across the rack. Fixed by folding Karaoke into the strip's existing M/S/Mono/MC button row (present only on the AUX strip, but *inside* an already-shared row, not a new one) rather than reserving a placeholder for it — the better of the two fixes the instruction offered, since it needs no reservation at all. The same review also found hardware and virtual strips were *already* misaligned before this pass, for the same reason (hardware's EQ-button row and pan-row have no virtual-strip equivalent) — fixed by rendering `visibility: hidden` placeholders of identical height on virtual strips, so every column's fader starts at the same row regardless of which controls that strip actually has.
+2. **The macro-knob labels (`DN`/`GT`/`CP`/`BS`/`MD`/`TR`/`LIM`) were invented shorthand, not spec's own terms.** Replaced with `Denoiser`/`Gate`/`Comp`/`Bass`/`Mid`/`Treble`/`Limiter`; `MiniSlider` now takes a `fullName`/`unit`/`neutralHint` and builds the hover tooltip from the live value itself (`${fullName}: ${value}${unit}`), not a static string.
+3. **The XY pad read as inert.** Added a visible handle (a ring, not a bare 8px dot) and faint centre-crosshair axes, pure orientation cues rather than tied to any particular value — the same fix category as adding a cursor affordance, just visual instead of a CSS property.
+4. **The 5.1 pad had no label at all**, unlike Intellipan's mode name. Given a static `"5.1"` label, same component, same `label` prop Intellipan already used for its mode name.
+
+**No mention of Claude, AI, agents or prompts in any of the above** — every commit and comment written the way the rest of this codebase already is.
+
+**Root cause of the coverage audit's 11-item state-2 list (entry below): M5,
+M6 and M7 built the gate, compressor, denoiser, Intellipan, the virtual
+strip's 3-band EQ and 5.1 pad, M.C., Karaoke, and the parametric EQ engine
+before any UI existed at all.** Nothing was skipped at the time — there was
+no UI milestone yet for this work to belong to. M8 then built the first UI
+against a narrower, deliberately-scoped M8 surface (spec 3.4's own M8 text
+excludes exactly these items), so they were never anyone's job to wire up
+afterward either. The pan-pot fix earlier today was one instance of this;
+the audit was run to find the rest before another one surfaced by accident.
+
+**A new milestone, M10 ("UI completion: effects and EQ"), is inserted
+between M9 (Internal FX) and the recorder, on direct instruction, to close
+all 11 state-2 items at once, not a subset — confirmed explicitly rather
+than left to inference, since an earlier draft of this plan under-listed
+two of them (the virtual strip's 5.1 position pad, and the EQ on/off plus
+A/B toggle) by naming examples rather than the complete list.** Old M10
+(Recorder) through M13 (Polish and release) each shift up by one, to
+M11-M14; a new M15 ("Final manual verification") is appended after M14 as
+a release gate — see the separate entry below for that milestone's own
+rationale. Every forward-pointing milestone-number reference across the
+codebase (doc comments in `loomix-rpc`/`loomix-cli`/`loomix-recorder`/
+`loomix-soak`/`loomix-core`/`loomix-app`, `README.md`, `nightly.yml`,
+`docs/COVERAGE-AUDIT-2026-09-09.md`, and this file's own earlier entries)
+was swept to match, the same discipline the M8-insertion entry further
+below already established — except the earlier entry's own literal
+before/after mapping ("Old M8-M12... shift to M9-M13") and its "(after
+M8-M11)" aside, which describe that specific past mechanical action and
+were correct when written; updating them now to reflect today's numbering
+would misstate history, not correct it, so they were deliberately left
+alone. `loomix-soak/Cargo.toml`'s description was also carrying a
+pre-existing error unrelated to this renumbering — it named the recorder
+milestone "M9" when the recorder was actually M10 even before today —
+corrected to M11 while the file was open for the sweep anyway.
+
+**Scope decisions carried into M10's own spec text, not left implicit:**
+macro-knob controls (gate/compressor/denoiser) get only the 0..10 knob, not
+a detail-view panel for the raw sub-parameters — `docs/DSP.md`'s
+macro-knob-curve section already logs the detail-view escape hatch as a
+deliberate Loomix decision not to reproduce, so building UI for it now
+would silently reverse an existing decision rather than execute the
+current one. The Intellipan pad's three modes and the virtual strip's 5.1
+pad reuse one shared XY-pad component rather than two, since both are a
+bounded 2D drag surface differing only in axis ranges and what they
+control downstream.
+
+**Two things flagged during planning, both written into M10's spec text as
+real requirements rather than left for the implementer to notice or miss:**
+the EQ panel is the first UI surface in this app to hide state behind a
+dialog, so every strip's and bus's EQ trigger button must show on/off (and
+a bus's trim/delay) state at a glance, extending spec 1.5's existing
+button-colour convention to strip EQ rather than making a user open eight
+dialogs to find one filtered bus; and the XY pads' pointer-drag updates
+must route through the existing per-parameter coalescing command bridge
+(spec 3.3's `CommandSink`, the same path `SetStripGainLayer` already uses)
+rather than firing one command per pointer move, proven the same way the
+fader's flood test already proves it for that path.
+
+**The rule this is really about, in spec 4.4 now:** a milestone is not done
+until every control it adds is reachable and operable from the running UI,
+not merely proven by an engine or CLI test — and if a milestone's UI is
+large enough to deserve its own pass, that pass gets scheduled as an
+explicit milestone number at the time the gap is identified, not left
+unassigned for the next audit to find by accident. M3 through M7 are
+exempted retroactively (the same reason M10 exists at all: no UI existed
+yet, so there was nothing to hold them to); every milestone from M9 onward
+is held to it. This is process, not just this one gap: the recorder, MIDI
+mapping and network audio (M11, M12, M13) are exactly the milestones named
+as next in line to reopen this gap if the rule weren't in place, and none
+of them exist yet, so no additional milestone split was made for them
+pre-emptively here -- the rule itself is what stops the gap when their
+time comes, not a speculative M11a/M12a inserted today for work that
+doesn't exist yet.
+
+## 2026-09-09 — M15 appended: final manual verification as the release gate
+
+**A new milestone, M15 ("Final manual verification"), appended after M14
+(Polish and release), on direct instruction.** Every milestone up to M14
+proves its own slice against tests, benches, and this project's own
+coverage audits — all of which check the code and the spec against each
+other. Nothing in the pipeline checks the finished product against the
+three vendor manuals directly, end to end, the way the 2026-09-09 coverage
+audit did once, mid-project, to find the state-2 gap in the first place.
+M15 makes that check permanent and mandatory rather than a one-off: the
+same methodology (each manual read in full, non-overlapping, page-cited
+chunks, extraction kept separate from classification) run again at the
+end, against the finished app rather than against `SPEC.md`'s text, with
+"present, reachable, and actually working" as the bar, not "implemented."
+Tagged explicitly as a release gate in `SPEC.md` itself — no `v*` tag, no
+`release.yml` run — until it reports zero open findings, the same way
+M10's own acceptance criterion above ties back to this project's own
+audit methodology rather than a vaguer "looks done."
+
+## 2026-09-09 — correcting an unavailable-skill substitution from the planning turn for M10
+
+**`/mnt/skills/public/frontend-design/SKILL.md`, which the user's own
+environment has, is genuinely absent in this session — not a permissions
+or sandbox artifact being misreported as absence.** Checked directly: `ls
+/mnt` fails with "No such file or directory," and `ls /` on this machine
+shows a plain macOS root (`Applications`, `Library`, `System`, `Users`,
+etc.) with no `/mnt` mount point at all, i.e. this session is running on a
+real local filesystem, not a container image with that skill pack mounted.
+Substituted `ui-ux-pro-max` instead for the M10 layout research (dense
+studio-tool density/palette guidance), per direct instruction to record
+this rather than silently substitute. Recorded here rather than assuming
+away the discrepancy, since a future session on a machine that *does* have
+the path should use the real skill instead of this substitution.
+
 ## 2026-09-09 — PR #22's `lint` and `bench` CI jobs, pre-existing and unrelated to this PR's own changes
 
 Found while getting PR #22 green for merge: `lint` and `bench` were both
@@ -93,7 +219,7 @@ system toggle, the `AutoUpMixMode` auto-detection refinement, DMX-512
 lighting control under macro buttons, and the System Settings dialog's
 own Absolute/Relative slider-linking mode (distinct from Streamer View's
 own, already-documented one) — are added to `SPEC.md` now, each tagged
-to an existing milestone (M7 or M8 or M11) by scope; none needed a new
+to an existing milestone (M7 or M8 or M12) by scope; none needed a new
 milestone number inserted, though the bus output limiter's milestone tag
 (M8) is a judgement call flagged explicitly in the report rather than a
 clean fit, since no milestone's own description names bus-level limiting.
@@ -363,7 +489,7 @@ open bug.** Fixing it needs either a one-time manual grant (Terminal, or
 whatever process TCC ends up attributing this to, added under System
 Settings > Privacy & Security > Microphone) for local development, or --
 the real, durable fix -- a properly signed and bundled `.app` with a
-`NSMicrophoneUsageDescription`, which is M13's packaging milestone, not
+`NSMicrophoneUsageDescription`, which is M14's packaging milestone, not
 something to bolt onto a dev-mode `cargo tauri dev` binary now. Recorded
 here rather than papered over, the same discipline every TCC/permission
 finding in this log already gets.
@@ -555,11 +681,11 @@ not a deserialisation panic.
 **A placeholder icon (`icons/icon.png`, a flat mid-grey square, generated
 programmatically) stands in until real branding exists.** `tauri::
 generate_context!` reads an icon at compile time unconditionally, even
-with `bundle.active: false` (packaging itself is M13's job, spec 3.4) --
+with `bundle.active: false` (packaging itself is M14's job, spec 3.4) --
 without one, the binary doesn't compile at all, dev or not. `bundle.active:
 false` means `cargo tauri build`'s installer/signing path stays inert
 here the same way `release.yml`'s packaging gate already does (M0 log,
-below) until M13 actually needs it.
+below) until M14 actually needs it.
 
 **Diagnosed, not worked around: `npm run lint`/`typecheck` intermittently
 stalled for minutes during this milestone's `npm install`s, traced to real
@@ -1195,17 +1321,17 @@ with a `::notice::` instead of failing when it's absent.** The `v0.1.0`
 tag push actually ran this workflow and it failed, hard, at "Import
 Developer ID signing identity" — the earlier M0 log entry calling this
 job "guarded or documented as inert" was wrong; it was only documented,
-never guarded. A workflow that fails on every tag between now and M13,
+never guarded. A workflow that fails on every tag between now and M14,
 when `packaging/` actually lands (spec 3.4), trains exactly the kind of
 red-means-nothing habit CI exists to prevent. The alternative was
-disabling the workflow outright until M13; rejected because the
+disabling the workflow outright until M14; rejected because the
 `cargo build --release` (both targets) and `xcodebuild -configuration
 Release` steps are real, standing signal independent of packaging — they
 catch a release build that doesn't compile, on every tag, and disabling
 the whole workflow would throw that away for no reason. The gate mirrors
 `nightly.yml`'s existing `fuzz`/`soak` pattern (check whether the thing a
 later milestone adds exists yet; skip with a message if not) rather than
-inventing a new mechanism. No workflow edit needed at M13: the moment
+inventing a new mechanism. No workflow edit needed at M14: the moment
 `packaging/build-pkg.sh` exists, `steps.packaging.outputs.exists` flips to
 `true` and every gated step runs for real.
 
@@ -1321,7 +1447,7 @@ needs drift correction ("outputs A1 through A5 are not sample
 synchronous... when they run on different physical devices") at least as
 well as a capture scenario would. `nightly.yml` already referenced a
 `loomix-soak` package by name and a `--duration 2h` invocation before this
-crate existed; that leg is still M10's (recorder folded in), not this
+crate existed; that leg is still M11's (recorder folded in), not this
 binary's current two-device-only shape, but the name and the
 `--duration` flag already match.
 
@@ -1655,7 +1781,7 @@ is the one every routing-truth-table combination in
 `crates/loomix-core/tests/routing_truth_table.rs` can actually assert
 against; it degrades cleanly to per-bus monitor scoping later; the
 solo-then-monitor-select wiring is deferred to whichever milestone adds
-monitor selection (M11's control surface is the current best guess, spec
+monitor selection (M12's control surface is the current best guess, spec
 1.5/1.10).
 
 **Bus mono (spec 1.5) only ever touches channels 0 and 1.** "First press
@@ -1918,7 +2044,7 @@ under `cfg(test)`. See `crates/loomix-core/src/rt_assert.rs`.
 An M0 `main()` with nothing to do but print a version string can't be
 exercised by `cargo test`, and dragged the workspace under the 80% line
 coverage gate for no real benefit. The executable entry point lands with
-the milestone that gives each crate actual behaviour: M11 for the CLI's
+the milestone that gives each crate actual behaviour: M12 for the CLI's
 subcommands, the first milestone that needs a UI surface for the Tauri
 backend.
 
@@ -1963,7 +2089,7 @@ failures.
 
 **`nightly.yml`'s fuzz, soak and `release.yml`'s packaging jobs are
 guarded or documented as inert until the milestones that create their
-inputs land** (fuzz targets at M11/M12, the soak harness at M4/M10,
+inputs land** (fuzz targets at M12/M13, the soak harness at M4/M11,
 `packaging/build-pkg.sh` and the Developer ID secrets at M4). The
 workflows ship now per the M0 requirement to have all of section 4.3 in
 place from the start; they activate themselves the moment those milestones

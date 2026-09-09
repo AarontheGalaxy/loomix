@@ -202,6 +202,8 @@ One shared implementation serves both the strip EQ and the bus EQ.
 * Right click the graph to change the dB scale of the display.
 * Load and save the whole EQ set as a file, and copy settings between strip EQs and bus EQs since the parameter model is shared.
 
+**UI status (M10):** on/off, A/B, the six cells, per-channel `Trim`, per-channel `Delay`, `FLAT` and `CH COPY` are all reachable from the panel as of M10 — all seven were already implemented and tested in the engine before M10, so leaving any of them unwired would have reopened the exact state-2 gap M10 exists to close (`docs/COVERAGE-AUDIT-2026-09-09.md`). Three items from this list remain genuinely unreachable and are deliberately deferred, each to a real milestone rather than silently dropped: `COPY ALL` (a different command shape from `CH COPY` — it copies between two separate `ParametricEq` instances, strip-to-bus or bus-to-bus, not one channel to another inside the same instance), loading and saving the whole EQ set as a file (real file I/O and a save/open dialog, not just wiring an existing pure function), and the two right-click gestures (typing an exact value, changing the graph's dB scale — spec 1.18 interaction conventions that cut across many controls, not specific to this panel). **Milestone: M14**, the same one that already owns the rest of spec 1.18's interaction polish and (for the file case) sits closest to preset/file work.
+
 ## 1.8 Internal FX
 
 ### Reverb (send / return)
@@ -310,7 +312,7 @@ The protocol is public and free to implement, and interoperating with it is the 
 * Audio level trigger: choose an input strip, set an IN threshold that presses the button when the level rises above it, an OUT threshold that releases it when the level falls below it, and a HOLD time that keeps it engaged for a minimum period. This is how auto ducking and push to talk are built.
 * React to mixer events, in particular the recorder transport events.
 * System actions: execute a program with a command line, send keyboard events to the OS, send MIDI messages to up to 2 devices, send network text or MIDI requests to remote instances.
-* **DMX-512 lighting control**: set a value on a given DMX address/channel (optionally several channels at once) and commit the frame to a DMX serial interface. Found missing from this document by the 2026-09-09 coverage audit, confirmed identically in all three vendor manuals (`docs/COVERAGE-AUDIT-2026-09-09.md`); niche and hardware-dependent (needs a USB DMX interface), but a genuine reference-product capability, not one of this document's deliberate exclusions. Milestone: M11.
+* **DMX-512 lighting control**: set a value on a given DMX address/channel (optionally several channels at once) and commit the frame to a DMX serial interface. Found missing from this document by the 2026-09-09 coverage audit, confirmed identically in all three vendor manuals (`docs/COVERAGE-AUDIT-2026-09-09.md`); niche and hardware-dependent (needs a USB DMX interface), but a genuine reference-product capability, not one of this document's deliberate exclusions. Milestone: M12.
 
 ## 1.15 Remote control API and request script
 
@@ -538,13 +540,17 @@ Work strictly in order. Each milestone ends with a green CI run, a tagged commit
 
 **M9 — Internal FX.** Reverb, multitap delay with tempo, multiband compressor, sends and returns with pre and post buttons.
 
-**M10 — Recorder.** Playback and recording, all source modes, formats, multitrack, pre-record buffer, timer.
+**M10 — UI completion: effects and EQ.** Wire every state-2 control identified by the 2026-09-09 coverage audit (`docs/COVERAGE-AUDIT-2026-09-09.md`) to the running UI, all 11 items, not a subset: hardware strip gate, compressor, denoiser and limiter macro knobs (0..10, no detail-view escape hatch — already a deliberate Loomix decision not to reproduce, `docs/DSP.md`'s macro-knob section), the three Intellipan pad modes, the virtual strip 3-band EQ, the virtual strip 5.1 position pad, M.C., Karaoke, the virtual strip limiter, bus and strip EQ on/off plus A/B memory, and the shared parametric EQ panel (strip and bus, spec 1.7) built on `ui/src/eqGraph.ts`'s existing renderer — on/off, A/B, the six cells, per-channel trim and delay, FLAT and CH COPY, all of it already engine-complete before this milestone; spec 1.7's own text records exactly which three items stay deferred past M10, and to which milestone. This is the first UI surface to hide state behind a dialog (the EQ panel); every strip's and bus's EQ trigger button must therefore show its on/off state (and, for buses, trim/delay state) at a glance without opening it, extending spec 1.5's button-colour convention to strip EQ rather than requiring a user to open eight dialogs to find one filtered bus. The Intellipan and 5.1 pads generate a pointer-drag event per frame; their commands must route through the existing per-parameter, last-value-wins coalescing bridge (spec 3.3, `CommandSink`) exactly like the fader, never one queued command per pointer move. **Acceptance:** re-running the coverage audit's methodology finds zero state-2 items remaining; a flood test on the pad's coordinate updates (same shape as `a_flood_past_capacity_still_converges_to_the_last_value_sent`) shows no per-move queue growth and convergence to the last position sent.
 
-**M11 — Control surface.** Request script parser, unix socket, C ABI, CLI, MIDI mapping with learn and feedback, macro buttons with all trigger types including the audio level trigger.
+**M11 — Recorder.** Playback and recording, all source modes, formats, multitrack, pre-record buffer, timer.
 
-**M12 — Network audio.** Incoming and outgoing streams, discovery, jitter buffer, error indicators, text and MIDI sub protocols. Fuzz the parser before merging.
+**M12 — Control surface.** Request script parser, unix socket, C ABI, CLI, MIDI mapping with learn and feedback, macro buttons with all trigger types including the audio level trigger.
 
-**M13 — Polish and release.** Preset scenes, simplified remote view, menu bar mode, login item, first run wizard, signed and notarised installer, uninstaller, documentation site.
+**M13 — Network audio.** Incoming and outgoing streams, discovery, jitter buffer, error indicators, text and MIDI sub protocols. Fuzz the parser before merging.
+
+**M14 — Polish and release.** Preset scenes, simplified remote view, menu bar mode, login item, first run wizard, signed and notarised installer, uninstaller, documentation site.
+
+**M15 — Final manual verification (release gate).** A full manual re-audit against all three vendor manuals in `~/Documents/loomix-refs/`, repeating the 2026-09-09 audit's methodology exactly: each manual read in full, in non-overlapping, page-cited chunks, extraction kept as a separate pass from classification, checked against `docs/SPEC.md` and the running app itself rather than the code in isolation. Every feature in Part 1 must be confirmed present, reachable from the UI, and actually working end to end — not merely implemented. **This is the release gate: no `v*` tag and no `release.yml` run until this milestone's audit reports zero open findings.**
 
 ---
 
@@ -681,11 +687,12 @@ Also add: Dependabot for cargo, npm and actions; a CODEOWNERS file; a pull reque
 
 1. Code merged to `main` through a pull request, never pushed directly.
 2. Every CI job green.
-3. New behaviour covered by tests at the appropriate layer, and the coverage gate still passes.
-4. `docs/` updated, including `DSP.md` if a filter changed.
-5. CHANGELOG entry under Keep a Changelog format.
-6. Manual smoke test recorded in the pull request: which macOS version, which audio interface, what was verified.
-7. No new `clippy` allow attributes without a comment explaining why.
+3. Every control the milestone adds is reachable and operable from the running UI, not just proven by an engine or CLI test — a fader, toggle, pad or panel a real user can use. If a milestone's own UI surface is large enough to deserve a dedicated pass, that pass is scheduled as its own explicit milestone number at the time the gap is identified, never left unassigned for a later audit to find. (M3 through M7 predated any UI existing at all and are exempt retroactively; every milestone from M9 onward is held to this.)
+4. New behaviour covered by tests at the appropriate layer, and the coverage gate still passes.
+5. `docs/` updated, including `DSP.md` if a filter changed.
+6. CHANGELOG entry under Keep a Changelog format.
+7. Manual smoke test recorded in the pull request: which macOS version, which audio interface, what was verified.
+8. No new `clippy` allow attributes without a comment explaining why.
 
 ## 4.5 Non goals, write these into the README
 
