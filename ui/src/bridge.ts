@@ -149,12 +149,16 @@ export interface DeviceInfo {
   name: string;
   input_channels: number;
   output_channels: number;
+  /** M11: degraded-device warnings (reduced Bluetooth profile, mono-only output), if any. */
+  warnings: string[];
 }
 
 export interface AudioStatus {
   connected: boolean;
   /** `null` when connected with no input device attached, not just "0 so far". */
   capture_underruns: number | null;
+  /** M11: degraded-device warnings for whichever devices are actually connected. */
+  device_warnings: string[];
 }
 
 export function listAudioDevices(): Promise<DeviceInfo[]> {

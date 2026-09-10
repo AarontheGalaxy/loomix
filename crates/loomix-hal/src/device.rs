@@ -187,6 +187,37 @@ pub fn nominal_sample_rate(id: DeviceId) -> Result<f64, CoreAudioError> {
     Ok(rate)
 }
 
+/// The device's connection transport (`kAudioDevicePropertyTransportType`),
+/// as CoreAudio's own FourCC code -- spec has no equivalent concept
+/// (Windows exposes a Bluetooth headset's HFP/A2DP modes as separate,
+/// explicitly-chosen endpoints, not a live property of one device), so
+/// this exists only to power `loomix-app`'s own reduced-Bluetooth-profile
+/// detection (`docs/ARCHITECTURE.md`'s 2026-09-10 entry), not a spec-named
+/// value. [`TRANSPORT_BLUETOOTH`]/[`TRANSPORT_BLUETOOTH_LE`] are the two
+/// values worth comparing against; every other transport (built-in, USB,
+/// virtual, aggregate...) is irrelevant to that specific check.
+pub fn transport_type(id: DeviceId) -> Result<u32, CoreAudioError> {
+    let addr = address(kAudioDevicePropertyTransportType);
+    let mut transport: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    check(unsafe {
+        AudioObjectGetPropertyData(
+            id,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut transport as *mut _ as *mut _,
+        )
+    })?;
+    Ok(transport)
+}
+
+/// `kAudioDeviceTransportTypeBluetooth` -- classic Bluetooth (A2DP/HFP).
+pub const TRANSPORT_BLUETOOTH: u32 = kAudioDeviceTransportTypeBluetooth;
+/// `kAudioDeviceTransportTypeBluetoothLE` -- Bluetooth Low Energy.
+pub const TRANSPORT_BLUETOOTH_LE: u32 = kAudioDeviceTransportTypeBluetoothLE;
+
 fn cfstring_property(
     object: AudioObjectID,
     selector: AudioObjectPropertySelector,
@@ -768,6 +799,21 @@ mod tests {
     }
 
     #[test]
+    fn default_output_device_reports_some_transport_type() {
+        // Not asserting *which* transport -- this machine's default
+        // output could genuinely be anything -- only that the query
+        // itself succeeds and returns CoreAudio's real answer, not the
+        // zeroed buffer this function would silently return on a
+        // property-size mismatch bug.
+        let id = default_output_device().expect("a default output device should exist");
+        let transport = transport_type(id).expect("transport type query should succeed");
+        assert_ne!(
+            transport, 0,
+            "every real device reports a nonzero transport type"
+        );
+    }
+
+    #[test]
     fn default_output_device_has_at_least_one_output_channel() {
         let id = default_output_device().expect("a default output device should exist");
         let count =
@@ -940,7 +986,7 @@ mod tests {
         let input_list = TestBufferList::new(vec![ch0, ch1]);
 
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
-        let stage = DriftCorrectedIoStage::new(2, corrector);
+        let stage = DriftCorrectedIoStage::new(2, corrector, 1.0);
         let master = Arc::new(MasterClock::default());
         let (tx0, mut rx0) = rtrb::RingBuffer::<f32>::new(256);
         let (tx1, mut rx1) = rtrb::RingBuffer::<f32>::new(256);
@@ -983,7 +1029,7 @@ mod tests {
     #[test]
     fn render_trampoline_fills_every_channel_and_pads_underrun_with_silence() {
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
-        let stage = DriftCorrectedIoStage::new(2, corrector);
+        let stage = DriftCorrectedIoStage::new(2, corrector, 1.0);
         let master = Arc::new(MasterClock::default());
         let (mut tx0, rx0) = rtrb::RingBuffer::<f32>::new(64);
         // Channel 0 has data queued; channel 1 has none, so it must
@@ -1041,7 +1087,7 @@ mod tests {
         let input_list = TestBufferList::new_interleaved(interleaved, 2);
 
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
-        let stage = DriftCorrectedIoStage::new(2, corrector);
+        let stage = DriftCorrectedIoStage::new(2, corrector, 1.0);
         let master = Arc::new(MasterClock::default());
         let (tx0, mut rx0) = rtrb::RingBuffer::<f32>::new(256);
         let (tx1, mut rx1) = rtrb::RingBuffer::<f32>::new(256);
@@ -1089,7 +1135,7 @@ mod tests {
         // with real (correct) silence, not a bug in the interleaving.
         let frames = 64;
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
-        let stage = DriftCorrectedIoStage::new(2, corrector);
+        let stage = DriftCorrectedIoStage::new(2, corrector, 1.0);
         let master = Arc::new(MasterClock::default());
         // More than `frames` samples queued, generously: TAPS (32) of
         // them are consumed priming the resampler before it emits

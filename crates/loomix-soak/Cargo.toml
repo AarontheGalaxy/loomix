@@ -1,6 +1,6 @@
 [package]
 name = "loomix-soak"
-description = "Manual soak harness: two real devices, one clock master, for as long as --duration says. Spec 3.4 M4's 30-minute two-device acceptance test; nightly.yml's --duration 2h leg lands with M11's recorder."
+description = "Manual soak harness: two real devices, one clock master, for as long as --duration says. Spec 3.4 M4's 30-minute two-device acceptance test; nightly.yml's --duration 2h leg lands with M12's recorder."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

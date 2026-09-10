@@ -5,6 +5,48 @@ engineering judgement, dated, so the reasoning survives past the PR that
 made them. `SPEC.md` remains the source of truth for anything it does
 specify; this file never contradicts it.
 
+## 2026-09-10 — M11 implementation: `base_ratio` proven against the real AirPods numbers, and the degraded-device warning, closing the milestone
+
+Both halves of M11's design decision (previous entries) are now implemented and verified, in that order, per direct instruction to fix the bigger one first.
+
+**The resample fix, proven with a real reproduction before the fix, not just "improved."** `ioproc.rs` gained `airpods_class_mismatch_settles_to_a_bounded_underrun_count_once_base_ratio_seeds_it`: a 24000Hz capture device against a 44100Hz master, run long enough for the pre-fix discontinuity guard to trip repeatedly, asserting the underrun count. Run against today's code before the fix, it failed with 201,010 underruns — close to the 2026-09-10 investigation's own real-hardware measurement (~20,083/sec steady, extrapolated to the test's run length), so the synthetic harness reproduces the actual defect's magnitude, not just its direction. `DriftCorrectedIoStage::ratio_for_next_callback` now computes `self.base_ratio * correction` instead of `correction` alone; the pre-existing `a_genuine_nominal_rate_mismatch_is_not_corrected_within_production_bounds` test is kept, pinned to `base_ratio = 1.0` explicitly, as the permanent regression test for "forgot to seed `base_ratio` at a call site" — every other test in `drift.rs` passed unmodified, confirming the PI/discontinuity logic itself was never touched. `MIN_BASE_RATIO`/`MAX_BASE_RATIO` (`main.rs`) are named constants at `[1/32, 32]`, doc-commented as Loomix's own sanity margin rather than a vendor-sourced figure, the same way `docs/DSP.md` already marks the macro-knob curves and Karaoke depths that have no published reference either. `attach_capture_device`/`attach_render_device` (`device_wiring.rs`) each took `base_ratio` as an eighth parameter rather than a bundling struct — eight independently-meaningful facts about how to wire up one device, not a group that would make a config type anything but indirection, so `#[allow(clippy::too_many_arguments)]` is applied with that reasoning written down rather than restructured away. `loomix-soak`'s own render call site passes an explicit `1.0`, documented as deliberate: that harness measures clock drift between devices already at the same nominal rate, not a genuine mismatch, so seeding anything else would misrepresent what it's testing.
+
+**The degraded-device warning, covering both cases named in the milestone.** Two independent, pure functions in `main.rs`: `mono_output_warning` fires only at exactly `channels == 1` — not "fewer than the bus," which was the first thing tried and immediately caught by its own test (`output_device_warnings_is_empty_for_a_healthy_device`, a 2-channel MacBook speaker) failing, since spec 1.6's bus-mode family (Mix Down A/B, Stereo Repeat, the Up Mix modes) makes anything from 1 to 8 channels a normal, chosen output width — only true mono has no stereo field to lose, matching the user's own framing exactly. `bluetooth_reduced_profile_warning` fires when a device's transport is Bluetooth or Bluetooth LE (`loomix_hal::device::transport_type`, a new thin CoreAudio read following `nominal_sample_rate`'s own pattern exactly) and its nominal rate is under 32kHz — telephony-grade HFP territory, distinct from A2DP's normal 44.1/48kHz — checked first and preferred over the generic mono message when both would fire, since "your Bluetooth mic is in use, stop using it" is the actionable, specific explanation the generic "no stereo field" message can't give. Both messages state what's degraded and what fixes it, not just that something is unusual, per direct instruction. Wired into `DeviceInfoDto.warnings` (computed per-device in `list_audio_devices`, so a degraded device is flagged in the picker before connecting) and `AudioStatusDto.device_warnings` (computed once in `connect_audio` from the actually-connected devices' real properties, carried on `AudioSession`, read back by `get_audio_status`) — the two surfaces spec 1.7's M11 text names explicitly. 17 new tests in `main.rs`'s own `tests` module cover both functions' firing conditions, precedence, and the false-positive case that was caught.
+
+**Verified against this machine's own currently-connected AirPods, live, not just simulated.** With Bluetooth AirPods connected and in HFP mode (`system_profiler SPAudioDataType` independently confirms `Output Channels: 1`, `Current SampleRate: 24000`, `Transport: Bluetooth` at the time of this check), the running app's own output picker lists `Eren (AirPods) (1ch out) -- degraded`, and a Microsoft Teams virtual mono device is flagged the same way, while every genuinely stereo device (BlackHole, Background Music, the Loomix routing channels) lists clean — confirming the mono-only threshold doesn't false-positive on the wide range of virtual/routing devices this machine actually has installed. `ui/src/bridge.ts`'s `DeviceInfo`/`AudioStatus` interfaces gained the matching `warnings`/`device_warnings` fields; `App.tsx`'s `DevicePicker` renders a device's warning as a `-- degraded` suffix (full text in the option's own tooltip) in each dropdown, and the connected session's own warnings as full-sentence lines under the status line, styled with the existing amber `--solo` token rather than the red `--mute` used for connection errors, since a degraded-but-working connection isn't a failure the same way a rejected connection is.
+
+This closes M11: both the resample fix and the degraded-device warning named in `docs/SPEC.md`'s M11 entry are implemented, tested (including the real-number reproduction and, for the warning, a live verification against this machine's own currently-connected hardware), and merged behind the definition-of-done in spec 4.4.
+
+## 2026-09-10 — M11 inserted: both AirPods findings become real work items, with a design decision made before any code
+
+The prior entry's two findings (AirPods' genuine 1ch/24kHz Bluetooth profile, and the confirmed-unbounded underrun climb) stop being log-only on direct instruction: "a user reaching for AirPods on day one hits both at once." Both need fixing, not just recording -- but the rate-mismatch half is a real DSP/clocking design decision, so it's made explicit here, in `docs/SPEC.md`, before a line of it is implemented, the same discipline this project already applies to every other non-trivial call.
+
+**Inserted as M11 ("Device robustness"), between the merged M10 and the not-yet-started M12 (Recorder)** -- M9 (Internal FX) keeps its own number and position; nothing about this milestone depends on or relates to reverb/delay/multiband compression, and M9 hasn't started, so there's no reason to renumber it or reorder around it. Old M11 (Recorder) through M15 (Final manual verification) each shift up by one, to M12-M16. The same sweep discipline as M10's own insertion applies here, with the same one exception carried forward: that earlier entry's own literal before/after mapping ("Old M10... shift up... to M11-M14; M15 appended") describes *that* specific mechanical action and stays as written, for the identical reason the M8-insertion entry's own mapping already does.
+
+**The design decision, made before implementation, per direct instruction:**
+
+Loomix resamples properly across a genuine nominal-rate mismatch between a non-master device and the master's own rate; it does not refuse the pairing outright. Two things made this the right call rather than the cautious one:
+
+1. **The resampler itself needs no change.** `resample.rs`'s `Resampler::process(ratio, ...)` already takes an arbitrary ratio per call -- nothing in its windowed-sinc kernel assumes `ratio` stays near 1.0. The direction this specific bug needs (a low-rate capture device upsampled to a higher-rate master) is the safe direction for an interpolation-only kernel: the source is already band-limited below its own Nyquist by construction, so there's no aliasing to guard against the way there would be for a large-ratio *downsample*. Verified by reasoning through the kernel's own construction, not assumed — the only case that would need a different filter design (a matched anti-alias lowpass) is downsampling a non-master *render* device by a large ratio, which nothing in this codebase does yet (the master always drives the engine's own rate directly, no resampling on that path at all).
+
+2. **The bug was never in the resampler or even really in the drift corrector's math -- it's in what gets fed into it.** Read `drift.rs` and `ioproc.rs::ratio_for_next_callback` directly rather than assumed: `PiController::update` always returns `1.0 - correction` with `correction` clamped to `±max_correction`, and `DriftCorrector::update` resets straight to literal `1.0` on any discontinuity -- both are structurally incapable of representing anything but "close to 1.0," by design, because that's exactly and only what spec 2.3 asked this loop to track (small clock drift between two devices already at the same nominal rate). Fed a genuine ~84% mismatch, the error signal (`progress_frames` vs `master.frames()`) blows past the 500-sample discontinuity threshold within a handful of blocks and *stays* there, so the corrector spends the entire session treating normal operation as a one-off glitch and resetting to 1.0 over and over -- which is exactly the empirically observed ~20,000/second climb, not a mystery once traced this far.
+
+**The fix: `DriftCorrectedIoStage` gains a `base_ratio` field, computed once at connect time as a plain division (`master_sample_rate / device_nominal_sample_rate`), multiplying the PI controller's output instead of being replaced by it.** `connect_audio` has to query the *input* device's own nominal rate to compute this -- today it only ever reads the output device's, the other half of the 2026-08-28 log's own finding. `drift.rs` itself needs zero changes: its output is still `1.0 ± max_correction`, still means exactly what it always meant, just now interpreted as a small correction *around* the true baseline instead of *being* the ratio outright, so the existing, already-proven small-drift and discontinuity-rejection tests keep passing completely unmodified -- the fix is a multiplication at the one call site that turns the PI output into a final ratio (`ioproc.rs`), not a redesign of the control loop that took real effort to get right the first time. This is the literal answer to the question this milestone was opened to settle: the fixed ratio lives *outside* the drift loop, computed once, not fought for inside it.
+
+Because `DriftCorrectedIoStage` already serves `on_render` as well as `on_capture` (spec 2.3's own framing was always "every other device," not "every capture device"), this same `base_ratio` mechanism covers a future non-master *render* device's own rate mismatch automatically, whenever that capability gets wired -- worth naming now so nobody re-discovers the same design question later for the render side.
+
+**The refuse threshold is a genuine Loomix-original number, not a vendor one.** `docs/audit/` was checked for how the reference product handles an output device offering fewer channels than the bus, or a live rate change -- no coverage found in any of the three manuals, plausibly because Windows exposes a Bluetooth headset's HFP/A2DP modes as separate, explicitly-chosen endpoints rather than one endpoint whose effective rate changes live underneath an already-selected device the way CoreAudio's does. `[1/32, 32]` was picked generously (8kHz telephony-grade hardware against a 192kHz interface is a 24x span, comfortably inside it) specifically so a real, if unusual, device pairing is never refused for being merely uncommon -- only a non-finite, zero, or genuinely nonsensical rate report trips it.
+
+## 2026-09-10 — AirPods reported as 1-channel output, and 500+ capture underruns: both real, both explained, neither a new bug
+
+Reported live against this machine's own hardware after M10's UI review: connecting AirPods showed the output device as 1ch in the picker, and the header's underrun counter climbed past 500. Two separate questions, two separate real answers, checked against live CoreAudio state directly rather than assumed.
+
+**The 1ch output is genuine, not a misread.** A direct `kAudioDevicePropertyStreamConfiguration` query (the same one `loomix_hal::device::channel_count` already makes, same code path the device picker and `connect_audio` both use) shows macOS enumerating these AirPods as *two separate device objects* — `...:input` (in_ch=1, out_ch=0) and `...:output` (out_ch=1, in_ch=0) — both `transport=blue`, both `nominal_sample_rate=24000`. The built-in speaker, queried the same way for comparison, reports `out_ch=2`, `transport=bltn`, `rate=44100` — a real 2-channel device, confirming `channel_count` reports exactly what the hardware/OS gives it either way. 24kHz mono on both AirPods objects is the textbook signature of Bluetooth's HFP/mSBC voice profile, not A2DP's full-quality stereo — macOS renegotiates the *entire* connection to this lower-bandwidth bidirectional profile whenever something requests microphone input from a Bluetooth headset that also does output, for as long as that capture stream is open, and downgrades the output side along with it. This is an OS/hardware constraint outside this codebase's control, not a bug in how the channel count is read.
+
+**Not fixed here: `connect_audio` accepts any `output_channels > 0` silently, with no distinction between "this device is genuinely mono" and "everything else."** The user-facing gap named directly: a mixer bus's stereo (or wider) field cannot exist over a 1-channel physical path regardless of source content, and presenting that as a normal connection rather than a flagged one is misleading. Left open, tagged for a follow-up UI pass rather than fixed in this session — needs a real design decision (warn at device-selection time before connecting, or on the connected-status line, and what exactly to say about *why* — "Bluetooth microphone in use" is the likely real cause but isn't something this codebase can query and confirm directly from CoreAudio's device-side properties alone) rather than a rushed one. The three vendor manuals were checked (`docs/audit/`) for how the reference product handles an output device offering fewer channels than the bus: no coverage found — plausibly because Windows exposes a Bluetooth headset's HFP/A2DP modes as distinct, explicitly-named endpoints a user picks between, rather than one endpoint whose channel count changes live underneath an already-selected device the way CoreAudio's does here.
+
+**The underrun count is not a one-off — confirmed by direct reproduction, and it is severe.** A temporary diagnostic (reproducing `connect_audio`'s own device-attachment call sequence directly against real hardware — AirPods capture into strip 0, the built-in speaker as master/output, bypassing the Tauri command layer entirely so no UI interaction was needed — deleted after this investigation, not shipped) sampled the real `DropoutCounter` twice, five and fifteen seconds after connecting: 95,912 at 5s, 296,744 at 15s — climbing at roughly 20,000/second in steady state, not settling. This is not a new defect: it's the exact gap the 2026-08-28 log entry above already found and left unfixed — `connect_audio` reads `nominal_sample_rate` for the *output* device only and never compares it against the input device's own rate, so `DriftCorrectedIoStage`'s correction (tuned for small same-rate clock drift, `max_correction = 0.01`) never engages for a genuine nominal-rate mismatch. That entry's own worked example used a 44.1kHz/48kHz pairing (~8% apart, already ~92x past the corrector's reach); AirPods' capture-side 24kHz against this machine's 44.1kHz output is a ~84% mismatch, further still past it, which is consistent with why the real number climbs as fast as it does. Not fixed here either — a real fix needs either a second, wider-range resampling stage for genuine nominal-rate mismatches distinct from the drift corrector's small-drift-only design, or refusing/warning on a connection whose two nominal rates disagree by more than the corrector can actually reach, and deciding which of those is the right behavior is exactly the kind of judgement call this file exists to record once it's made, not to rush at the end of a long session.
+
 ## 2026-09-09 — M10 implementation: the command layer, the React UI, and a layout review that caught a real regression before it shipped
 
 **The Rust command layer landed first, tests before implementation per this project's own rule.** All 11 state-2 controls became 14 new `EngineCommand` variants in `loomix-app::control` (`SetStripGateKnob`/`CompKnob`/`DenoiserKnob`, `SetStripLimiterThreshold`, `SetStripIntellipanMode`/`IntellipanXY`, `SetStripEq3`, `SetStripPositionPad`, `SetStripMc`, `SetStripKaraoke`, `SetStripEqOn`/`EqMemory`, `SetBusEqOn`/`EqMemory`), each bounds-checked and RT-safety-proven the same way every existing variant already was. On direct instruction, the bounds and round-trip tests are table-driven (`control::tests::CONTROL_CASES`, an array of `{name, round_trips, noop_variants}`) rather than eleven hand-copied tests, with a completeness assertion (`control_case_table_covers_every_m10_control_exactly_once`) pinning the table's length against a named constant so a missing or duplicated entry fails loudly instead of just never getting written. `StripSnapshot`/`BusSnapshot` grew the matching fields, extending the exact rule their own doc comments already stated ("`EngineCommand`'s own scalar surface"), which incidentally gave the bounds/no-op tests a full-state comparator for free.
@@ -13,7 +55,7 @@ specify; this file never contradicts it.
 
 **The EQ panel needed a real snapshot channel, not just write commands.** Editing cells you can't see the current value of isn't a working panel — `EqSnapshot` (new, `control.rs`) publishes every strip's and bus's full `EqChannelParams` every audio callback, the same "latest value wins" shape as `ControlSnapshot`/`MeterSnapshot`, polled by `App.tsx` continuously (not just while a panel is open) because the EQ trigger button's glance state needs it live on the main view too.
 
-**Trim, delay, FLAT and CH COPY were brought into M10, not deferred — direct instruction, and the right call on the merits.** All four were already implemented and tested in `loomix-core` (`ParametricEq::set_trim_db`/`set_delay_ms`/`reset_channel`/`copy_channel`) before this milestone; leaving them unwired would have recreated the exact state-2 shape M10 exists to close, which is what the instruction that triggered this said outright. Eight more `EngineCommand` variants, the matching Tauri commands and bridge functions, eight more `CONTROL_CASES` rows (table now 23 long). `COPY ALL`, loading/saving the whole EQ set as a file, and the two right-click gestures (type an exact value, change the graph's dB scale) are the three that stay genuinely deferred — `docs/SPEC.md` 1.7 now names all three explicitly and tags them to **M14**, rather than the panel's own doc comment being the only record of the cut.
+**Trim, delay, FLAT and CH COPY were brought into M10, not deferred — direct instruction, and the right call on the merits.** All four were already implemented and tested in `loomix-core` (`ParametricEq::set_trim_db`/`set_delay_ms`/`reset_channel`/`copy_channel`) before this milestone; leaving them unwired would have recreated the exact state-2 shape M10 exists to close, which is what the instruction that triggered this said outright. Eight more `EngineCommand` variants, the matching Tauri commands and bridge functions, eight more `CONTROL_CASES` rows (table now 23 long). `COPY ALL`, loading/saving the whole EQ set as a file, and the two right-click gestures (type an exact value, change the graph's dB scale) are the three that stay genuinely deferred — `docs/SPEC.md` 1.7 now names all three explicitly and tags them to **M15**, rather than the panel's own doc comment being the only record of the cut.
 
 **The layout review the user asked for, before committing, caught a real defect a code review wouldn't have.** A first screenshot of the running app (`cargo tauri dev`, captured via `screencapture` + the macOS Accessibility API — the same method earlier M8 log entries already established) showed the Intellipan/5.1 XY pad as a full-width square dwarfing the fader below it; fixed to a 2.2:1 wide rectangle, giving the fader its space back. A second review round found four more real problems, not cosmetic ones:
 
@@ -56,7 +98,7 @@ would misstate history, not correct it, so they were deliberately left
 alone. `loomix-soak/Cargo.toml`'s description was also carrying a
 pre-existing error unrelated to this renumbering — it named the recorder
 milestone "M9" when the recorder was actually M10 even before today —
-corrected to M11 while the file was open for the sweep anyway.
+corrected to M12 while the file was open for the sweep anyway.
 
 **Scope decisions carried into M10's own spec text, not left implicit:**
 macro-knob controls (gate/compressor/denoiser) get only the 0..10 knob, not
@@ -90,23 +132,23 @@ unassigned for the next audit to find by accident. M3 through M7 are
 exempted retroactively (the same reason M10 exists at all: no UI existed
 yet, so there was nothing to hold them to); every milestone from M9 onward
 is held to it. This is process, not just this one gap: the recorder, MIDI
-mapping and network audio (M11, M12, M13) are exactly the milestones named
+mapping and network audio (M12, M13, M14) are exactly the milestones named
 as next in line to reopen this gap if the rule weren't in place, and none
 of them exist yet, so no additional milestone split was made for them
 pre-emptively here -- the rule itself is what stops the gap when their
 time comes, not a speculative M11a/M12a inserted today for work that
 doesn't exist yet.
 
-## 2026-09-09 — M15 appended: final manual verification as the release gate
+## 2026-09-09 — M16 appended: final manual verification as the release gate
 
-**A new milestone, M15 ("Final manual verification"), appended after M14
-(Polish and release), on direct instruction.** Every milestone up to M14
+**A new milestone, M16 ("Final manual verification"), appended after M15
+(Polish and release), on direct instruction.** Every milestone up to M15
 proves its own slice against tests, benches, and this project's own
 coverage audits — all of which check the code and the spec against each
 other. Nothing in the pipeline checks the finished product against the
 three vendor manuals directly, end to end, the way the 2026-09-09 coverage
 audit did once, mid-project, to find the state-2 gap in the first place.
-M15 makes that check permanent and mandatory rather than a one-off: the
+M16 makes that check permanent and mandatory rather than a one-off: the
 same methodology (each manual read in full, non-overlapping, page-cited
 chunks, extraction kept separate from classification) run again at the
 end, against the finished app rather than against `SPEC.md`'s text, with
@@ -219,7 +261,7 @@ system toggle, the `AutoUpMixMode` auto-detection refinement, DMX-512
 lighting control under macro buttons, and the System Settings dialog's
 own Absolute/Relative slider-linking mode (distinct from Streamer View's
 own, already-documented one) — are added to `SPEC.md` now, each tagged
-to an existing milestone (M7 or M8 or M12) by scope; none needed a new
+to an existing milestone (M7 or M8 or M13) by scope; none needed a new
 milestone number inserted, though the bus output limiter's milestone tag
 (M8) is a judgement call flagged explicitly in the report rather than a
 clean fit, since no milestone's own description names bus-level limiting.
@@ -489,7 +531,7 @@ open bug.** Fixing it needs either a one-time manual grant (Terminal, or
 whatever process TCC ends up attributing this to, added under System
 Settings > Privacy & Security > Microphone) for local development, or --
 the real, durable fix -- a properly signed and bundled `.app` with a
-`NSMicrophoneUsageDescription`, which is M14's packaging milestone, not
+`NSMicrophoneUsageDescription`, which is M15's packaging milestone, not
 something to bolt onto a dev-mode `cargo tauri dev` binary now. Recorded
 here rather than papered over, the same discipline every TCC/permission
 finding in this log already gets.
@@ -681,11 +723,11 @@ not a deserialisation panic.
 **A placeholder icon (`icons/icon.png`, a flat mid-grey square, generated
 programmatically) stands in until real branding exists.** `tauri::
 generate_context!` reads an icon at compile time unconditionally, even
-with `bundle.active: false` (packaging itself is M14's job, spec 3.4) --
+with `bundle.active: false` (packaging itself is M15's job, spec 3.4) --
 without one, the binary doesn't compile at all, dev or not. `bundle.active:
 false` means `cargo tauri build`'s installer/signing path stays inert
 here the same way `release.yml`'s packaging gate already does (M0 log,
-below) until M14 actually needs it.
+below) until M15 actually needs it.
 
 **Diagnosed, not worked around: `npm run lint`/`typecheck` intermittently
 stalled for minutes during this milestone's `npm install`s, traced to real
@@ -1321,17 +1363,17 @@ with a `::notice::` instead of failing when it's absent.** The `v0.1.0`
 tag push actually ran this workflow and it failed, hard, at "Import
 Developer ID signing identity" — the earlier M0 log entry calling this
 job "guarded or documented as inert" was wrong; it was only documented,
-never guarded. A workflow that fails on every tag between now and M14,
+never guarded. A workflow that fails on every tag between now and M15,
 when `packaging/` actually lands (spec 3.4), trains exactly the kind of
 red-means-nothing habit CI exists to prevent. The alternative was
-disabling the workflow outright until M14; rejected because the
+disabling the workflow outright until M15; rejected because the
 `cargo build --release` (both targets) and `xcodebuild -configuration
 Release` steps are real, standing signal independent of packaging — they
 catch a release build that doesn't compile, on every tag, and disabling
 the whole workflow would throw that away for no reason. The gate mirrors
 `nightly.yml`'s existing `fuzz`/`soak` pattern (check whether the thing a
 later milestone adds exists yet; skip with a message if not) rather than
-inventing a new mechanism. No workflow edit needed at M14: the moment
+inventing a new mechanism. No workflow edit needed at M15: the moment
 `packaging/build-pkg.sh` exists, `steps.packaging.outputs.exists` flips to
 `true` and every gated step runs for real.
 
@@ -1447,7 +1489,7 @@ needs drift correction ("outputs A1 through A5 are not sample
 synchronous... when they run on different physical devices") at least as
 well as a capture scenario would. `nightly.yml` already referenced a
 `loomix-soak` package by name and a `--duration 2h` invocation before this
-crate existed; that leg is still M11's (recorder folded in), not this
+crate existed; that leg is still M12's (recorder folded in), not this
 binary's current two-device-only shape, but the name and the
 `--duration` flag already match.
 
@@ -1781,7 +1823,7 @@ is the one every routing-truth-table combination in
 `crates/loomix-core/tests/routing_truth_table.rs` can actually assert
 against; it degrades cleanly to per-bus monitor scoping later; the
 solo-then-monitor-select wiring is deferred to whichever milestone adds
-monitor selection (M12's control surface is the current best guess, spec
+monitor selection (M13's control surface is the current best guess, spec
 1.5/1.10).
 
 **Bus mono (spec 1.5) only ever touches channels 0 and 1.** "First press
@@ -2044,7 +2086,7 @@ under `cfg(test)`. See `crates/loomix-core/src/rt_assert.rs`.
 An M0 `main()` with nothing to do but print a version string can't be
 exercised by `cargo test`, and dragged the workspace under the 80% line
 coverage gate for no real benefit. The executable entry point lands with
-the milestone that gives each crate actual behaviour: M12 for the CLI's
+the milestone that gives each crate actual behaviour: M13 for the CLI's
 subcommands, the first milestone that needs a UI surface for the Tauri
 backend.
 
@@ -2089,7 +2131,7 @@ failures.
 
 **`nightly.yml`'s fuzz, soak and `release.yml`'s packaging jobs are
 guarded or documented as inert until the milestones that create their
-inputs land** (fuzz targets at M12/M13, the soak harness at M4/M11,
+inputs land** (fuzz targets at M13/M14, the soak harness at M4/M12,
 `packaging/build-pkg.sh` and the Developer ID secrets at M4). The
 workflows ship now per the M0 requirement to have all of section 4.3 in
 place from the start; they activate themselves the moment those milestones

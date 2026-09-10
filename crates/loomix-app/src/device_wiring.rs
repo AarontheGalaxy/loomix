@@ -35,6 +35,13 @@ pub struct AttachedDevice<H> {
 /// `DriftCorrectedIoStage`), and points `driver`'s `strip` at the
 /// consumer side. Returns the handle keeping the registration alive --
 /// dropping it stops and unregisters the device.
+// `base_ratio` (M11) is the eighth argument, over clippy's default
+// threshold -- each one is a distinct, independently-meaningful part of
+// "how to wire this device up" (not a group of related fields that would
+// make a bundling struct anything but indirection for its own sake), so
+// this stays a plain parameter list rather than growing a
+// single-purpose config type nothing else would ever construct.
+#[allow(clippy::too_many_arguments)]
 pub fn attach_capture_device(
     driver: &mut EngineIoDriver,
     strip: usize,
@@ -43,6 +50,7 @@ pub fn attach_capture_device(
     master_clock: Arc<MasterClock>,
     corrector: loomix_hal::drift::DriftCorrector,
     ring_capacity: usize,
+    base_ratio: f32,
 ) -> Result<AttachedDevice<loomix_hal::device_lifecycle::CaptureIoProcHandle>, CoreAudioError> {
     let mut producers = Vec::with_capacity(channel_count);
     let mut consumers = Vec::with_capacity(channel_count);
@@ -51,7 +59,8 @@ pub fn attach_capture_device(
         producers.push(producer);
         consumers.push(consumer);
     }
-    let stage = loomix_hal::ioproc::DriftCorrectedIoStage::new(channel_count, corrector);
+    let stage =
+        loomix_hal::ioproc::DriftCorrectedIoStage::new(channel_count, corrector, base_ratio);
     let ratio = stage.ratio_handle();
     let ctx = loomix_hal::device::CaptureIoProcContext::new(
         stage,
@@ -72,7 +81,14 @@ pub fn attach_capture_device(
 
 /// The render-side mirror of [`attach_capture_device`]: registers `device`
 /// as a drift-corrected render IOProc and points `driver`'s `bus` at the
-/// producer side.
+/// producer side. `base_ratio` is inverted from the capture case --
+/// `device_rate / master_rate`, since this direction resamples the bus's
+/// master-rate audio down (or up) to whatever rate `device` itself runs
+/// at -- not wired to a real call site yet (spec 3.4's multi-device
+/// output topology isn't connected beyond the master), but the same
+/// `DriftCorrectedIoStage` fix (M11, `docs/ARCHITECTURE.md`) already
+/// covers it once it is.
+#[allow(clippy::too_many_arguments)] // see attach_capture_device's own comment
 pub fn attach_render_device(
     driver: &mut EngineIoDriver,
     bus: usize,
@@ -81,6 +97,7 @@ pub fn attach_render_device(
     master_clock: Arc<MasterClock>,
     corrector: loomix_hal::drift::DriftCorrector,
     ring_capacity: usize,
+    base_ratio: f32,
 ) -> Result<AttachedDevice<loomix_hal::device_lifecycle::RenderIoProcHandle>, CoreAudioError> {
     let mut producers = Vec::with_capacity(channel_count);
     let mut consumers = Vec::with_capacity(channel_count);
@@ -89,7 +106,8 @@ pub fn attach_render_device(
         producers.push(producer);
         consumers.push(consumer);
     }
-    let stage = loomix_hal::ioproc::DriftCorrectedIoStage::new(channel_count, corrector);
+    let stage =
+        loomix_hal::ioproc::DriftCorrectedIoStage::new(channel_count, corrector, base_ratio);
     let ratio = stage.ratio_handle();
     let ctx =
         loomix_hal::device::RenderIoProcContext::new(stage, master_clock, consumers, ring_capacity);

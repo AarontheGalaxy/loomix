@@ -20,7 +20,7 @@
 //! on this specific machine and process, not a bug in the wiring.
 //!
 //! `nightly.yml`'s `soak` job already looks for this package by name and
-//! runs it with `--duration 2h`; that leg is M11's (with the recorder
+//! runs it with `--duration 2h`; that leg is M12's (with the recorder
 //! folded in), not exercised by this binary's current two-device-only
 //! shape.
 //!
@@ -237,6 +237,11 @@ fn run(
         master_clock.clone(),
         corrector,
         RING_CAPACITY,
+        // This harness measures clock *drift* between two devices already
+        // assumed to share a nominal rate (spec 3.4 M4's own acceptance
+        // test), not a genuine nominal-rate mismatch (M11) -- 1.0 keeps
+        // that exact, already-proven scenario unchanged.
+        1.0,
     )?;
 
     // attach_master_device takes `driver` by value and starts it running

@@ -41,7 +41,7 @@ milestone).
 |---|---|---|
 | 1 — in spec, implemented, UI-reachable | ~14 control groups | faders, mute/solo/mono, bus assign, pan pot, bus mode, bus mute/gain, device select |
 | 2 — in spec, implemented in the engine, **not** UI-reachable | 14 control groups | see highlighted list below |
-| 3 — in spec, not implemented, milestone already assigned | ~30 control groups | M6/M7/M9/M11/M12/M13/M14 work not yet started or UI-only |
+| 3 — in spec, not implemented, milestone already assigned | ~30 control groups | M6/M7/M9/M12/M13/M14/M15 work not yet started or UI-only |
 | 4 — not in `SPEC.md` at all | 4 items, added below | Out Limiter, AutoUpMixMode, DMX-512, System Settings Slider Mode |
 
 `SPEC.md` turned out to already be unusually thorough — it was written
@@ -122,13 +122,13 @@ State 1. Implemented (`loomix-core::{NUM_STRIPS, NUM_BUSES}` = 8/8, spec
 `topology_is_aux`) and reachable (the UI renders all 8 strips and 8
 buses). `--layout compact|mid|full` (Standard/Banana presets) is not
 implemented — state 3, no milestone currently owns a "layout preset"
-concept explicitly; folding it into M14 (polish) is the natural home, not
+concept explicitly; folding it into M15 (polish) is the natural home, not
 a fresh milestone.
 
 ## 1.2 Exact signal flow
 
 Mixed states, item by item (hardware strip order): source (state 1) →
-pre-fader tap (state 3, M11/M7) → insert point (state 3, M9/2.3's AUv3
+pre-fader tap (state 3, M12/M7) → insert point (state 3, M9/2.3's AUv3
 upgrade) → denoiser/Voice Modeler (state 2) → gate (state 2) → compressor
 (state 2) → strip EQ (state 2) → Intellipan (state 2) → **pan pot (state
 1, fixed today)** → limiter (state 2, engine runs it, threshold not
@@ -138,8 +138,8 @@ mute/solo (state 1) → bus assignment (state 1).
 Bus chain: sum (state 1) → FX returns (state 3, M9) → bus mode (state 1)
 → bus EQ (state 2) → mono (state 1) → mute (state 1) → gain (state 1) →
 **bus output limiter/peak-remover (state 4 — see below)** → per-bus
-output delay (state 3, M12/M4-adjacent, no dedicated owner yet, folding
-into M4's clocking work or M14 is reasonable) → device output (state 1).
+output delay (state 3, M13/M4-adjacent, no dedicated owner yet, folding
+into M4's clocking work or M15 is reasonable) → device output (state 1).
 
 ## 1.3 Hardware input strip: every control
 
@@ -159,7 +159,7 @@ state 1. Reverb/Delay/Fx1/Fx2 sends and their post buttons: state 3 (M9).
 Bus assign: state 1. Input meter: state 1 (meters render for strips
 today). Standard-edition `Audibility` knob: state 3, correctly scoped —
 `SPEC.md` itself says "implement it" but no milestone has yet; natural
-home is M5 (already merged) retroactively, or M14 as a small addendum —
+home is M5 (already merged) retroactively, or M15 as a small addendum —
 flagged, not resolved, per the "doesn't fit an existing milestone
 cleanly" instruction.
 
@@ -170,7 +170,7 @@ Limiter: state 2. Mono/Solo/Mute/fader/bus-assign: state 1 (shared code
 path with hardware strips). Connected application list: state 3 — spec
 2.2/2.3 already correctly scope this behind macOS 14.4's process-tap API
 with an explicit availability gate; not implemented yet, no explicit
-milestone owner (M14 polish is the natural home given its
+milestone owner (M15 polish is the natural home given its
 platform-conditional nature, or a small M8-follow-up — flagged, not
 resolved).
 
@@ -179,7 +179,7 @@ resolved).
 Device selector, SEL (already captures Ctrl+Click multi-select in spec
 text), bus mode, mono, mute, gain fader: all state 1 or already
 correctly captured. EQ toggle: state 2. Reverb/Delay/Fx1/Fx2 return
-knobs: state 3 (M9). Monitor select: state 3 (M8/M14-adjacent UI work, no
+knobs: state 3 (M9). Monitor select: state 3 (M8/M15-adjacent UI work, no
 engine concept of a monitoring bus yet). Output meter: state 1.
 
 ## 1.6 The 12 bus modes
@@ -209,7 +209,7 @@ here, M9's future implementer already has everything the manuals specify.
 
 ## 1.9 Recorder / tape deck
 
-State 3, M11, not started. `SPEC.md`'s "one or all inputs" phrasing
+State 3, M12, not started. `SPEC.md`'s "one or all inputs" phrasing
 already implies the per-source arming this audit found in the Remote
 API's `Recorder.ArmStrip(i)`/`ArmBus(i)` (confirmed present in all three
 manuals, most explicitly in Banana p.59 and Potato p.71) — not a gap
@@ -217,12 +217,12 @@ requiring a wording change, just confirmed accurate.
 
 ## 1.10 Main menu, every item
 
-State 3, spread across several milestones (M12 for MIDI/network dialogs,
-M14 for the rest) — not implemented, correctly scoped, no changes needed.
+State 3, spread across several milestones (M13 for MIDI/network dialogs,
+M15 for the rest) — not implemented, correctly scoped, no changes needed.
 
 ## 1.11 System settings dialog, every field
 
-Mostly state 3 (M4/M12/M14, not yet built as a dialog). Two additions
+Mostly state 3 (M4/M13/M15, not yet built as a dialog). Two additions
 needed:
 
 - **Out Limiter toggle is missing entirely — state 4.** See below.
@@ -233,38 +233,38 @@ needed:
 
 ## 1.12 MIDI mapping
 
-State 3, M12, not started. Fully matches this audit's extraction
+State 3, M13, not started. Fully matches this audit's extraction
 (Learn/F/FF/Advanced Feedback/MIDI Forward all already named in
 `SPEC.md`'s text) — no additions needed.
 
 ## 1.13 Network audio
 
-State 3, M13, not started. Matches extraction exactly, including the
+State 3, M14, not started. Matches extraction exactly, including the
 explicit, correct exclusion of VBAN-Frame screen sharing.
 
 ## 1.14 Macro buttons application
 
-State 3, M12, not started, with one addition:
+State 3, M13, not started, with one addition:
 
 - **DMX-512 lighting control is missing entirely — state 4.** See below.
 
 ## 1.15 Remote control API and request script
 
-State 3, M12, not started. This section's own parameter namespace list is
+State 3, M13, not started. This section's own parameter namespace list is
 the most thoroughly cross-checked part of this audit (every table in all
 three manuals was read against it) and is already accurate and complete
 — no additions found.
 
 ## 1.16 Preset scenes
 
-State 3, M14, not started. Matches extraction exactly (64 slots, F1-F24,
+State 3, M15, not started. Matches extraction exactly (64 slots, F1-F24,
 the explicit "not device selection/system settings/MIDI/VBAN" scope
 boundary appears identically worded in all three manuals and in
 `SPEC.md`).
 
 ## 1.17 Bundled companion tools
 
-State 3 across the board (M14 for most, M4's own virtual driver control
+State 3 across the board (M15 for most, M4's own virtual driver control
 panel equivalent for the last item). Matches extraction; Streamer View's
 own separate slider-link mode is already correctly captured here,
 distinct from the System Settings-level one flagged as state 4 above.
@@ -330,7 +330,7 @@ in that menu's exact item list in all three manuals). Niche and
 hardware-dependent (needs a USB DMX interface, e.g. the vendor's tested
 "Enttec Open DMX USB") but a genuine reference-product capability, not
 one of `SPEC.md`'s deliberate exclusions. Added to section 1.14 tagged
-**M12** (the milestone that already owns macro buttons' system actions).
+**M13** (the milestone that already owns macro buttons' system actions).
 
 ### 4. System Settings' own Slider Mode (Absolute/Relative fader linking)
 
@@ -371,7 +371,7 @@ rather than sampling:
   names `"vban1"`/`"vban2"` for two different purposes (Potato pp.83-85)
   — disambiguated only by which script function targets them
   (`SendMidi` vs `SendText`/`BEGIN_SECTION`), not by the string itself.
-  Noted for anyone implementing M12/M13 against these names later, not a
+  Noted for anyone implementing M13/M14 against these names later, not a
   `SPEC.md` change.
 - **One elaboration, not a conflict**: Standard's manual gives a
   concrete, worked Composite-mode channel layout for its own 3-strip

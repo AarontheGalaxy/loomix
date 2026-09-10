@@ -12,7 +12,7 @@
 // and tested in `loomix-core` before M10, so leaving any of them unwired
 // would recreate the exact state-2 gap this milestone exists to close.
 // Still deferred, each to a real milestone rather than silently dropped
-// (`docs/ARCHITECTURE.md`'s M10 entry, `docs/SPEC.md` 1.7 -- M14 owns all
+// (`docs/ARCHITECTURE.md`'s M10 entry, `docs/SPEC.md` 1.7 -- M15 owns all
 // three): COPY ALL (a genuinely different command shape -- it copies
 // between two separate EQ instances, strip-to-bus or bus-to-bus, not one
 // channel to another inside the same instance), loading/saving the whole

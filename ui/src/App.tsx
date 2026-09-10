@@ -548,8 +548,9 @@ function DevicePicker({ devices, status, onConnectionChange }: DevicePickerProps
       >
         <option value="">No input</option>
         {inputs.map((d) => (
-          <option key={d.uid} value={d.uid}>
+          <option key={d.uid} value={d.uid} title={d.warnings.join(" ")}>
             {d.name} ({d.input_channels}ch in)
+            {d.warnings.length > 0 ? " -- degraded" : ""}
           </option>
         ))}
       </select>
@@ -561,8 +562,9 @@ function DevicePicker({ devices, status, onConnectionChange }: DevicePickerProps
       >
         <option value="">Choose output...</option>
         {outputs.map((d) => (
-          <option key={d.uid} value={d.uid}>
+          <option key={d.uid} value={d.uid} title={d.warnings.join(" ")}>
             {d.name} ({d.output_channels}ch out)
+            {d.warnings.length > 0 ? " -- degraded" : ""}
           </option>
         ))}
       </select>
@@ -585,6 +587,12 @@ function DevicePicker({ devices, status, onConnectionChange }: DevicePickerProps
           : "Not connected"}
       </span>
       {error && <span className="device-error">{error}</span>}
+      {connected &&
+        status?.device_warnings.map((w) => (
+          <span key={w} className="device-warning">
+            {w}
+          </span>
+        ))}
     </div>
   );
 }
