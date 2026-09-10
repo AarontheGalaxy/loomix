@@ -44,11 +44,11 @@ compressor, limiter, denoiser, pan laws (M5); the parametric EQ engine
 Tauri, the strip/bus layout, faders, meters, device selection (M8);
 internal FX -- reverb, multitap delay, multiband compressor (M9); the
 UI completion pass -- effects, Intellipan, virtual strip controls, the
-parametric EQ panel (M10); the recorder (M11); the control surface --
-request script, MIDI mapping, macro buttons (M12); network audio (M13);
+parametric EQ panel (M10); the recorder (M12); the control surface --
+request script, MIDI mapping, macro buttons (M13); network audio (M14);
 the polish/release milestone -- preset scenes, installer, docs site
-(M14); and the final manual verification release gate against all
-three vendor manuals (M15).
+(M15); and the final manual verification release gate against all
+three vendor manuals (M16).
 
 ## Repository layout
 

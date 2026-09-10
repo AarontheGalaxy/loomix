@@ -129,7 +129,7 @@ pub enum EngineCommand {
     // different command shape -- two EQ instances, not one) and the file
     // load/save plus right-click-precision-edit/scale gestures are the
     // ones actually deferred; see `docs/ARCHITECTURE.md`'s M10 entry for
-    // why those specifically, with M14 named as the milestone that owns
+    // why those specifically, with M15 named as the milestone that owns
     // them, not left unassigned.
     /// (strip, channel, trim_db) -- hardware strips only.
     SetStripEqTrim(usize, usize, f32),
@@ -777,7 +777,7 @@ impl Default for MeterSnapshot {
 /// M10's parametric EQ panel needs to *display* a strip's or bus's actual
 /// 6-cell state, not just fire-and-forget edits into it -- opening the
 /// panel on a strip someone already configured (from an earlier session,
-/// or from a preset once M13 exists) has to show what's really there.
+/// or from a preset once M14 exists) has to show what's really there.
 /// `ControlSnapshot`'s own doc comment predicted exactly this ("EQ cells
 /// get their own, larger snapshot later if drift there is ever found to
 /// matter in practice") -- this is that snapshot, kept separate from
