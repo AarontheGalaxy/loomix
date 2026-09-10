@@ -57,6 +57,21 @@ const MAX_BLOCK_FRAMES: usize = 2048;
 /// convention from the synthetic-tone version this replaces.
 const INPUT_STRIP: usize = 0;
 
+/// M11's resample-ratio sanity bound (`docs/SPEC.md`): a computed
+/// `base_ratio` outside this range is refused rather than resampled.
+/// This is Loomix's own choice, not a vendor-documented limit -- the
+/// same "no published reference exists" category `docs/DSP.md` already
+/// marks the macro-knob curves and Karaoke's mix depths with, checked the
+/// same way (`docs/audit/`, no coverage found for this scenario in any
+/// of the three vendor manuals, `docs/ARCHITECTURE.md`'s 2026-09-10
+/// entry). Picked generously: 8kHz telephony-grade hardware against a
+/// 192kHz interface is a 24x span, comfortably inside `[1/32, 32]`, so a
+/// real, if unusual, device pairing is never refused just for being
+/// uncommon -- only a non-finite, zero, or genuinely nonsensical rate
+/// report trips it.
+const MIN_BASE_RATIO: f32 = 1.0 / 32.0;
+const MAX_BASE_RATIO: f32 = 32.0;
+
 /// Everything a live audio connection owns: the two bridge halves the
 /// Tauri commands below talk to, and the device handles that keep the
 /// real I/O running -- dropping either handle stops and unregisters that
@@ -658,6 +673,31 @@ fn copy_bus_eq_channel(state: State<AppState>, bus: usize, from: usize, to: usiz
     send(&state, EngineCommand::CopyBusEqChannel(bus, from, to));
 }
 
+/// The fixed ratio a capture device's real nominal rate needs against the
+/// master's (spec 2.3's "feed the ratio into a polyphase resampler," now
+/// computed directly instead of left for the drift corrector to
+/// discover -- `docs/ARCHITECTURE.md`'s 2026-09-10 entry). A plain
+/// division of two already-queried rates, refused rather than resampled
+/// if it's not finite, not positive, or outside `[MIN_BASE_RATIO,
+/// MAX_BASE_RATIO]`.
+fn base_ratio_for(master_rate: f64, device_rate: f64) -> Result<f32, String> {
+    let ratio = (master_rate / device_rate) as f32;
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return Err(format!(
+            "reported a nominal rate of {device_rate} Hz against a {master_rate} Hz master, \
+             which CoreAudio can't give a usable resample ratio for"
+        ));
+    }
+    if !(MIN_BASE_RATIO..=MAX_BASE_RATIO).contains(&ratio) {
+        return Err(format!(
+            "its {device_rate} Hz nominal rate against a {master_rate} Hz master needs a \
+             {ratio:.3}x resample ratio, outside the {MIN_BASE_RATIO:.4}x..{MAX_BASE_RATIO}x \
+             range Loomix will attempt"
+        ));
+    }
+    Ok(ratio)
+}
+
 fn resolve_uid(uid: &str) -> Result<DeviceId, String> {
     let ids = list_device_ids().map_err(|e| format!("CoreAudio error {e}"))?;
     for id in ids {
@@ -712,6 +752,16 @@ fn connect_audio(
             if input_channels == 0 {
                 return Err(format!("{input_uid} has no input channels"));
             }
+            // M11: the other half of the 2026-08-28 gap -- only the
+            // output device's nominal rate was ever read before this.
+            // `base_ratio` is the fixed, known quantity a genuine
+            // mismatch needs, computed once here rather than left for
+            // the drift corrector to discover (it can't -- see
+            // `docs/ARCHITECTURE.md`'s 2026-09-10 entry).
+            let input_rate =
+                nominal_sample_rate(input_id).map_err(|e| format!("CoreAudio error {e}"))?;
+            let base_ratio =
+                base_ratio_for(sample_rate, input_rate).map_err(|e| format!("{input_uid}: {e}"))?;
             // Same PI gains and discontinuity threshold as loomix-soak's
             // proven values -- not retuned here.
             let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
@@ -723,6 +773,7 @@ fn connect_audio(
                 master_clock.clone(),
                 corrector,
                 RING_CAPACITY,
+                base_ratio,
             )
             .map_err(|e| format!("failed to start capture on {input_uid}: CoreAudio error {e}"))?;
             (Some(attached.io), Some(attached.dropouts))
@@ -817,4 +868,62 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Loomix app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_ratio_for_a_real_airpods_pairing_matches_the_hand_derived_value() {
+        // 44100 Hz master, 24000 Hz AirPods HFP capture (confirmed live
+        // against real hardware, `docs/ARCHITECTURE.md`'s 2026-09-10
+        // entry) -- well inside the accepted range.
+        let ratio = base_ratio_for(44_100.0, 24_000.0).expect("a real pairing should be accepted");
+        assert!((ratio - 44_100.0 / 24_000.0).abs() < 1e-6, "got {ratio}");
+    }
+
+    #[test]
+    fn base_ratio_for_the_same_nominal_rate_is_exactly_one() {
+        let ratio =
+            base_ratio_for(48_000.0, 48_000.0).expect("same-rate pairing should be accepted");
+        assert_eq!(
+            ratio, 1.0,
+            "no genuine mismatch should give a ratio of exactly 1.0"
+        );
+    }
+
+    #[test]
+    fn base_ratio_for_a_zero_device_rate_is_refused() {
+        assert!(
+            base_ratio_for(48_000.0, 0.0).is_err(),
+            "a zero nominal rate can't give a usable ratio"
+        );
+    }
+
+    #[test]
+    fn base_ratio_for_an_extreme_mismatch_is_refused() {
+        // 192kHz master against an 8kHz device is a real, if extreme,
+        // pairing -- 24x, inside the bound -- but past MAX_BASE_RATIO
+        // (32x) something has gone wrong with the reported rates, not a
+        // real device this codebase should attempt to resample across.
+        assert!(
+            base_ratio_for(192_000.0, 1_000.0).is_err(),
+            "a 192x mismatch should be refused, not resampled"
+        );
+        assert!(
+            base_ratio_for(1_000.0, 192_000.0).is_err(),
+            "the same extreme mismatch in the other direction should also be refused"
+        );
+    }
+
+    #[test]
+    fn base_ratio_for_stays_within_bounds_at_the_edges_of_a_realistic_range() {
+        // 8kHz telephony-grade hardware against a 192kHz interface (a
+        // 24x span, `docs/SPEC.md`'s own worked example for why the
+        // bound is generous) should still be accepted in both
+        // directions.
+        assert!(base_ratio_for(192_000.0, 8_000.0).is_ok());
+        assert!(base_ratio_for(8_000.0, 192_000.0).is_ok());
+    }
 }
