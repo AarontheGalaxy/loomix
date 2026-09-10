@@ -43,6 +43,18 @@ impl RatioHandle {
 pub struct DriftCorrectedIoStage {
     resamplers: Vec<Resampler>,
     corrector: DriftCorrector,
+    /// The known, fixed ratio a genuine nominal-rate difference between
+    /// this device and the master needs -- `master_rate / device_rate`
+    /// for a capture stage, computed once at connect time from each
+    /// device's own reported nominal rate, never adjusted by the control
+    /// loop itself (`docs/ARCHITECTURE.md`'s 2026-09-10 entry). `1.0` for
+    /// the ordinary same-nominal-rate case, which is the only case this
+    /// field used to implicitly assume. `corrector`'s own output --
+    /// always `1.0 ± max_correction` -- multiplies this rather than
+    /// replacing it, so the PI loop keeps doing exactly the small-
+    /// residual-drift job spec 2.3 built it for, now measured against the
+    /// true baseline instead of an assumed one.
+    base_ratio: f32,
     ratio_bits: Arc<AtomicU32>,
     /// Cumulative *master-equivalent* progress made so far -- for capture,
     /// frames written to the ring (what the resampler actually produced);
@@ -67,29 +79,45 @@ pub struct DriftCorrectedIoStage {
 }
 
 impl DriftCorrectedIoStage {
-    pub fn new(channel_count: usize, corrector: DriftCorrector) -> Self {
+    /// `base_ratio` must already be sane (finite, positive, within
+    /// whatever bound the caller enforces) -- this constructor trusts it,
+    /// the same "validate at the boundary" convention every other
+    /// caller-supplied value in this codebase follows; `main.rs::
+    /// connect_audio` is that boundary for a real device pairing.
+    pub fn new(channel_count: usize, corrector: DriftCorrector, base_ratio: f32) -> Self {
         Self {
             resamplers: (0..channel_count).map(|_| Resampler::new()).collect(),
             corrector,
-            ratio_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            base_ratio,
+            ratio_bits: Arc::new(AtomicU32::new(base_ratio.to_bits())),
             progress_frames: 0,
         }
     }
 
     /// A cloneable, thread-safe handle to this stage's current resample
-    /// ratio. Not real-time code itself -- the handle is meant to be
-    /// cloned once, up front, and polled from a monitoring thread, not
-    /// from inside another IOProc callback.
+    /// ratio -- the *effective* ratio (`base_ratio` times the corrector's
+    /// own small correction), the number the resampler is actually being
+    /// driven at, not just the residual correction on its own. Not
+    /// real-time code itself -- the handle is meant to be cloned once, up
+    /// front, and polled from a monitoring thread, not from inside
+    /// another IOProc callback.
     pub fn ratio_handle(&self) -> RatioHandle {
         RatioHandle(self.ratio_bits.clone())
     }
 
     /// The ratio to use for the callback about to run, from progress
     /// measured as of the *previous* callback (this callback's own
-    /// contribution isn't known until after it resamples).
+    /// contribution isn't known until after it resamples). `corrector`
+    /// still only ever returns `1.0 ± max_correction` -- exactly what it
+    /// always returned, tracking only the small residual drift spec 2.3
+    /// built it for -- multiplied by `base_ratio` here rather than used
+    /// directly, so a genuine nominal-rate difference is already
+    /// accounted for before the PI loop ever sees an error signal
+    /// (`docs/ARCHITECTURE.md`'s 2026-09-10 entry).
     fn ratio_for_next_callback(&mut self, master: &MasterClock) -> f32 {
         let error = self.progress_frames as f64 - master.frames() as f64;
-        let ratio = self.corrector.update(error as f32);
+        let correction = self.corrector.update(error as f32);
+        let ratio = self.base_ratio * correction;
         self.ratio_bits.store(ratio.to_bits(), Ordering::Relaxed);
         ratio
     }
@@ -253,7 +281,7 @@ mod tests {
         let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(input.len());
         let master = MasterClock::default();
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
-        let mut stage = DriftCorrectedIoStage::new(1, corrector);
+        let mut stage = DriftCorrectedIoStage::new(1, corrector, 1.0);
 
         // A device running 500 ppm fast -- a real, if generous, clock
         // error (spec 2.3's whole reason to exist).
@@ -384,6 +412,13 @@ mod tests {
     /// here, not assumed, by running the exact same harness and
     /// production constants as the passing 500 ppm test above and
     /// showing the frame-drift bound that test relies on does not hold.
+    ///
+    /// Kept exactly as originally written, `base_ratio` pinned to `1.0`
+    /// rather than deleted, once `base_ratio` existed (M11): this is now
+    /// the permanent regression test for *not* seeding it -- proof that
+    /// leaving it at the old implicit default reproduces the exact bug
+    /// `base_ratio` exists to fix, not just a claim about code that no
+    /// longer exists.
     #[test]
     fn a_genuine_nominal_rate_mismatch_is_not_corrected_within_production_bounds() {
         let sample_rate = 48_000.0;
@@ -397,7 +432,7 @@ mod tests {
         // Same constants `main.rs::connect_audio` actually configures,
         // not a hypothetical worst case.
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
-        let mut stage = DriftCorrectedIoStage::new(1, corrector);
+        let mut stage = DriftCorrectedIoStage::new(1, corrector, 1.0);
         let ratio_handle = stage.ratio_handle();
 
         // 44100 Hz capture against a 48000 Hz master: (44100 / 48000 - 1)
@@ -439,10 +474,107 @@ mod tests {
         );
     }
 
+    /// The exact real-hardware scenario from `docs/ARCHITECTURE.md`'s
+    /// 2026-09-10 entry, not a hypothetical: a Bluetooth headset's HFP
+    /// capture profile (24000 Hz nominal, confirmed by direct CoreAudio
+    /// query against real AirPods) against a real master output (44100
+    /// Hz) -- an 84% mismatch, worse than the 44.1/48kHz test above, and
+    /// exactly the shape `base_ratio` (M11) exists to fix. Live hardware
+    /// measured this producing underruns at roughly 20,000/second once
+    /// the discontinuity guard settles into permanently resetting; this
+    /// test reproduces the identical shortfall mechanism
+    /// `StripSource::pull_into` (`loomix-app::engine_io`) uses in
+    /// production -- draining at the master's own rate and counting every
+    /// sample the capture side hadn't produced yet -- entirely within
+    /// this crate, so it needs no cross-crate access to prove the fix.
+    #[test]
+    fn airpods_class_mismatch_settles_to_a_bounded_underrun_count_once_base_ratio_seeds_it() {
+        let master_sample_rate = 44_100.0_f32;
+        let device_sample_rate = 24_000.0_f32;
+        let block_frames = 128;
+        // ~10 seconds of master time at 44100Hz/128-frame blocks -- long
+        // enough that the discontinuity guard trips almost immediately at
+        // this mismatch (the 44.1/48kHz test above already shows that
+        // happening within ~45 blocks for a much smaller 8% mismatch) and
+        // stays tripped for the whole run, the same as it did against
+        // real hardware.
+        let num_callbacks = 3445;
+        let input_frames = sine_tone(
+            block_frames * num_callbacks * 2,
+            device_sample_rate,
+            1_000.0,
+            0,
+        );
+        let input: Vec<f32> = input_frames.iter().map(|f| f[0]).collect();
+
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(input.len());
+        let master = MasterClock::default();
+        let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
+        // The fix under test: `main.rs::connect_audio`'s own formula,
+        // `master_rate / device_rate`, computed once from each device's
+        // real nominal rate the same way it would be for a genuine
+        // AirPods connection.
+        let base_ratio = master_sample_rate / device_sample_rate;
+        let mut stage = DriftCorrectedIoStage::new(1, corrector, base_ratio);
+
+        let device = FakeDevice {
+            block_frames,
+            ppm_offset: (device_sample_rate / master_sample_rate - 1.0) as f64 * 1e6,
+        };
+        device.run_capture(
+            &mut stage,
+            &master,
+            &input,
+            std::slice::from_mut(&mut producer),
+            num_callbacks,
+        );
+
+        // Drain at the master's own rate and count every sample not yet
+        // available -- exactly `StripSource::pull_into`'s own logic
+        // (`loomix-app::engine_io`), reproduced here rather than imported
+        // across the crate boundary, so this is a real underrun count
+        // from a real drain, not a subtraction.
+        let master_frames = master.frames() as usize;
+        let mut underruns = 0u64;
+        for _ in 0..master_frames {
+            if consumer.pop().is_err() {
+                underruns += 1;
+            }
+        }
+
+        // Sanity check on the scenario itself, independent of whether the
+        // fix works: with `base_ratio` inert (today's bug), the capture
+        // ring only ever fills at the device's own raw rate while this
+        // loop drains at the master's, so the shortfall should come out
+        // within a few percent of `master_frames * (1 - device_rate /
+        // master_rate)` -- for this run, ~200,987 frames, matching real
+        // hardware's measured ~20,000/second over the ~10 seconds this
+        // run simulates (`docs/ARCHITECTURE.md`) to within a few percent.
+        // Recorded so the bound below reads as a real, derived quantity,
+        // not an arbitrary threshold picked to make the test pass.
+        let naive_shortfall_if_unfixed =
+            master_frames as f32 * (1.0 - device_sample_rate / master_sample_rate);
+        assert!(
+            naive_shortfall_if_unfixed > 150_000.0,
+            "sanity check on the scenario itself: an 84% mismatch over \
+             ~10 simulated seconds should imply well over 150,000 frames \
+             of shortfall if uncorrected, got {naive_shortfall_if_unfixed}"
+        );
+
+        assert!(
+            underruns < 300,
+            "a genuine AirPods-class rate mismatch (24000 Hz capture \
+             against a 44100 Hz master) should settle to a small, bounded \
+             underrun count once base_ratio seeds the resampler correctly \
+             -- got {underruns} underruns over {master_frames} master \
+             frames (naive unfixed shortfall would have been ~{naive_shortfall_if_unfixed})"
+        );
+    }
+
     #[test]
     fn render_underrun_fills_silence_instead_of_blocking_or_stale_data() {
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
-        let mut stage = DriftCorrectedIoStage::new(1, corrector);
+        let mut stage = DriftCorrectedIoStage::new(1, corrector, 1.0);
         let master = MasterClock::default();
         let (_producer, consumer) = rtrb::RingBuffer::<f32>::new(16);
         // Nothing was ever pushed -- every callback underruns.
@@ -465,7 +597,7 @@ mod tests {
     #[test]
     fn ratio_handle_reflects_the_stage_that_produced_it() {
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
-        let mut stage = DriftCorrectedIoStage::new(1, corrector);
+        let mut stage = DriftCorrectedIoStage::new(1, corrector, 1.0);
         let handle = stage.ratio_handle();
         assert_eq!(handle.get(), 1.0, "no callback has run yet");
 

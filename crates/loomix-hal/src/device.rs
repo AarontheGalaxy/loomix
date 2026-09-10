@@ -940,7 +940,7 @@ mod tests {
         let input_list = TestBufferList::new(vec![ch0, ch1]);
 
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
-        let stage = DriftCorrectedIoStage::new(2, corrector);
+        let stage = DriftCorrectedIoStage::new(2, corrector, 1.0);
         let master = Arc::new(MasterClock::default());
         let (tx0, mut rx0) = rtrb::RingBuffer::<f32>::new(256);
         let (tx1, mut rx1) = rtrb::RingBuffer::<f32>::new(256);
@@ -983,7 +983,7 @@ mod tests {
     #[test]
     fn render_trampoline_fills_every_channel_and_pads_underrun_with_silence() {
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
-        let stage = DriftCorrectedIoStage::new(2, corrector);
+        let stage = DriftCorrectedIoStage::new(2, corrector, 1.0);
         let master = Arc::new(MasterClock::default());
         let (mut tx0, rx0) = rtrb::RingBuffer::<f32>::new(64);
         // Channel 0 has data queued; channel 1 has none, so it must
@@ -1041,7 +1041,7 @@ mod tests {
         let input_list = TestBufferList::new_interleaved(interleaved, 2);
 
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
-        let stage = DriftCorrectedIoStage::new(2, corrector);
+        let stage = DriftCorrectedIoStage::new(2, corrector, 1.0);
         let master = Arc::new(MasterClock::default());
         let (tx0, mut rx0) = rtrb::RingBuffer::<f32>::new(256);
         let (tx1, mut rx1) = rtrb::RingBuffer::<f32>::new(256);
@@ -1089,7 +1089,7 @@ mod tests {
         // with real (correct) silence, not a bug in the interleaving.
         let frames = 64;
         let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
-        let stage = DriftCorrectedIoStage::new(2, corrector);
+        let stage = DriftCorrectedIoStage::new(2, corrector, 1.0);
         let master = Arc::new(MasterClock::default());
         // More than `frames` samples queued, generously: TAPS (32) of
         // them are consumed priming the resampler before it emits
