@@ -187,6 +187,37 @@ pub fn nominal_sample_rate(id: DeviceId) -> Result<f64, CoreAudioError> {
     Ok(rate)
 }
 
+/// The device's connection transport (`kAudioDevicePropertyTransportType`),
+/// as CoreAudio's own FourCC code -- spec has no equivalent concept
+/// (Windows exposes a Bluetooth headset's HFP/A2DP modes as separate,
+/// explicitly-chosen endpoints, not a live property of one device), so
+/// this exists only to power `loomix-app`'s own reduced-Bluetooth-profile
+/// detection (`docs/ARCHITECTURE.md`'s 2026-09-10 entry), not a spec-named
+/// value. [`TRANSPORT_BLUETOOTH`]/[`TRANSPORT_BLUETOOTH_LE`] are the two
+/// values worth comparing against; every other transport (built-in, USB,
+/// virtual, aggregate...) is irrelevant to that specific check.
+pub fn transport_type(id: DeviceId) -> Result<u32, CoreAudioError> {
+    let addr = address(kAudioDevicePropertyTransportType);
+    let mut transport: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    check(unsafe {
+        AudioObjectGetPropertyData(
+            id,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut transport as *mut _ as *mut _,
+        )
+    })?;
+    Ok(transport)
+}
+
+/// `kAudioDeviceTransportTypeBluetooth` -- classic Bluetooth (A2DP/HFP).
+pub const TRANSPORT_BLUETOOTH: u32 = kAudioDeviceTransportTypeBluetooth;
+/// `kAudioDeviceTransportTypeBluetoothLE` -- Bluetooth Low Energy.
+pub const TRANSPORT_BLUETOOTH_LE: u32 = kAudioDeviceTransportTypeBluetoothLE;
+
 fn cfstring_property(
     object: AudioObjectID,
     selector: AudioObjectPropertySelector,
@@ -764,6 +795,21 @@ mod tests {
         assert!(
             rate > 0.0,
             "every real device reports a positive sample rate, got {rate}"
+        );
+    }
+
+    #[test]
+    fn default_output_device_reports_some_transport_type() {
+        // Not asserting *which* transport -- this machine's default
+        // output could genuinely be anything -- only that the query
+        // itself succeeds and returns CoreAudio's real answer, not the
+        // zeroed buffer this function would silently return on a
+        // property-size mismatch bug.
+        let id = default_output_device().expect("a default output device should exist");
+        let transport = transport_type(id).expect("transport type query should succeed");
+        assert_ne!(
+            transport, 0,
+            "every real device reports a nonzero transport type"
         );
     }
 

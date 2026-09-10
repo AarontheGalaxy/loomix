@@ -111,6 +111,12 @@ body {
   color: var(--mute);
 }
 
+.device-warning {
+  font-size: 11px;
+  color: var(--solo);
+  flex-basis: 100%;
+}
+
 .app-footer {
   flex: 0 0 auto;
 }

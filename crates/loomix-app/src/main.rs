@@ -35,8 +35,8 @@ use loomix_core::parametric_eq::{EqCellParams, EqChannelParams, Memory};
 use loomix_core::{Engine, CHANNELS, NUM_BUSES};
 use loomix_hal::clock::{ClockSource, DeviceId};
 use loomix_hal::device::{
-    channel_count, device_name, device_uid, list_device_ids, nominal_sample_rate, Direction,
-    MasterTickCallback,
+    channel_count, device_name, device_uid, list_device_ids, nominal_sample_rate, transport_type,
+    Direction, MasterTickCallback,
 };
 use loomix_hal::device_lifecycle::{CaptureIoProcHandle, MasterIoProcHandle};
 use loomix_hal::drift::{DriftCorrector, PiController};
@@ -83,6 +83,10 @@ struct AudioSession {
     meter_reader: LatestValueReader<MeterSnapshot>,
     eq_reader: LatestValueReader<EqSnapshot>,
     capture_underruns: Option<DropoutCounter>,
+    /// M11: computed once at connect time from the actual connected
+    /// devices' real channel counts/transport/rate -- see
+    /// `output_device_warnings`/`input_device_warnings`.
+    device_warnings: Vec<String>,
     _capture: Option<CaptureIoProcHandle>,
     _master: MasterIoProcHandle,
 }
@@ -347,6 +351,12 @@ struct DeviceInfoDto {
     name: String,
     input_channels: usize,
     output_channels: usize,
+    /// M11: degraded-device warnings for this device, computed at
+    /// picker-list time (`output_device_warnings`/`input_device_warnings`)
+    /// so a degraded device can be spotted before connecting, not only
+    /// after (`docs/SPEC.md`'s M11 entry -- "at device-selection time and
+    /// on the connected-status line").
+    warnings: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -356,6 +366,12 @@ struct AudioStatusDto {
     /// "zero so far" -- the UI needs to tell "no input selected" apart
     /// from "input selected, draining cleanly".
     capture_underruns: Option<u64>,
+    /// M11: the same degraded-device warnings `list_audio_devices`
+    /// already computes for the picker, recorded once at connect time for
+    /// whichever devices actually got connected (`AudioSession::
+    /// device_warnings`) -- the connected-status line's own copy, not a
+    /// live re-query every poll.
+    device_warnings: Vec<String>,
 }
 
 #[tauri::command]
@@ -372,11 +388,22 @@ fn list_audio_devices() -> Result<Vec<DeviceInfoDto>, String> {
         if input_channels == 0 && output_channels == 0 {
             continue;
         }
+        let name = device_name(id).unwrap_or_default();
+        let transport = transport_type(id).unwrap_or(0);
+        let rate = nominal_sample_rate(id).unwrap_or(0.0);
+        let mut warnings = output_device_warnings(&name, transport, rate, output_channels);
+        warnings.extend(input_device_warnings(
+            &name,
+            transport,
+            rate,
+            input_channels,
+        ));
         out.push(DeviceInfoDto {
             uid,
-            name: device_name(id).unwrap_or_default(),
+            name,
             input_channels,
             output_channels,
+            warnings,
         });
     }
     Ok(out)
@@ -389,10 +416,12 @@ fn get_audio_status(state: State<AppState>) -> AudioStatusDto {
         Some(s) => AudioStatusDto {
             connected: true,
             capture_underruns: s.capture_underruns.as_ref().map(DropoutCounter::get),
+            device_warnings: s.device_warnings.clone(),
         },
         None => AudioStatusDto {
             connected: false,
             capture_underruns: None,
+            device_warnings: Vec::new(),
         },
     }
 }
@@ -673,6 +702,104 @@ fn copy_bus_eq_channel(state: State<AppState>, bus: usize, from: usize, to: usiz
     send(&state, EngineCommand::CopyBusEqChannel(bus, from, to));
 }
 
+/// Bluetooth's Hands-Free Profile (mono, telephony-grade codecs at
+/// 8/16/24kHz) is CoreAudio's own well-known signature for "this
+/// Bluetooth device's microphone is in use somewhere, which drops call
+/// quality on *both* directions of the connection" -- confirmed against
+/// real AirPods hardware (`transport` reads Bluetooth, `rate` reads
+/// 24000 against A2DP's normal 44.1/48kHz, `docs/ARCHITECTURE.md`'s
+/// 2026-09-10 entry). Loomix's own heuristic, not something CoreAudio
+/// states directly or the vendor manuals cover at all (`docs/SPEC.md`'s
+/// M11 entry, `docs/audit/`) -- generous enough to catch HFP's whole
+/// documented rate range without ever flagging a genuine low-rate
+/// non-Bluetooth device, since the transport check runs first and short-
+/// circuits everything else.
+const BLUETOOTH_REDUCED_PROFILE_RATE_CEILING: f64 = 32_000.0;
+
+fn is_bluetooth_transport(transport: u32) -> bool {
+    transport == loomix_hal::device::TRANSPORT_BLUETOOTH
+        || transport == loomix_hal::device::TRANSPORT_BLUETOOTH_LE
+}
+
+/// Actionable, not diagnostic, per direct instruction: names what's
+/// degraded (the real rate, in Bluetooth's reduced profile, not just "an
+/// unusual number") and what would fix it (stop using the mic
+/// elsewhere, reconnect) rather than only observing that something looks
+/// off.
+fn bluetooth_reduced_profile_warning(
+    name: &str,
+    transport: u32,
+    rate: f64,
+    channels: usize,
+) -> Option<String> {
+    if is_bluetooth_transport(transport)
+        && rate > 0.0
+        && rate < BLUETOOTH_REDUCED_PROFILE_RATE_CEILING
+    {
+        Some(format!(
+            "{name} is running at {rate:.0} Hz, {channels}ch -- Bluetooth's reduced call-quality \
+             profile, not its normal stereo quality. This usually means {name}'s microphone is in \
+             use by this or another app; stop using it and reconnect {name} to restore full quality."
+        ))
+    } else {
+        None
+    }
+}
+
+/// Actionable, not diagnostic: names what's missing (no stereo field can
+/// exist, not just "channel count looks low") and the fix (pick a
+/// different device). Deliberately *not* a comparison against the bus's
+/// own 8 channels (spec 1.1): the overwhelming majority of real output
+/// devices are 2-channel, and the bus mode system (spec 1.6's Mix Down
+/// A/B, Stereo Repeat, the Up Mix family) exists specifically to make
+/// that the normal, unremarkable case -- warning on every ordinary
+/// stereo speaker connection would be noise, not signal, and nothing a
+/// user could act on (there's no "8-channel speaker" to go buy). A
+/// single-channel output is the genuinely unusual case actually worth
+/// naming: literally no stereo field can exist over it, regardless of
+/// what the bus carries or how its mode is set -- exactly the AirPods
+/// symptom this milestone started from ("a mono output path means the
+/// stereo field cannot exist at all regardless of what the source is,"
+/// per the session that found it). Output-only: a mono *input* device is
+/// completely ordinary (most real microphones are mono), so this has no
+/// input-side equivalent.
+fn mono_output_warning(name: &str, channels: usize) -> Option<String> {
+    if channels == 1 {
+        Some(format!(
+            "{name} only provides 1 output channel, so no stereo field can exist over it \
+             regardless of the mix -- choose a different device for stereo output."
+        ))
+    } else {
+        None
+    }
+}
+
+/// Every warning that applies to `name` as an *output* device, in
+/// priority order and deduplicated: when the Bluetooth-reduced-profile
+/// explanation applies, it already accounts for the mono output too (its
+/// own message names the channel count), so the more generic mono
+/// warning is skipped rather than shown alongside it -- one clear cause,
+/// not two messages describing the same symptom from different angles.
+fn output_device_warnings(name: &str, transport: u32, rate: f64, channels: usize) -> Vec<String> {
+    if let Some(w) = bluetooth_reduced_profile_warning(name, transport, rate, channels) {
+        vec![w]
+    } else if let Some(w) = mono_output_warning(name, channels) {
+        vec![w]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The input-side mirror of [`output_device_warnings`]: only the
+/// Bluetooth-reduced-profile check applies (see [`mono_output_warning`]'s
+/// own doc comment for why a low channel count isn't a warning on this
+/// side).
+fn input_device_warnings(name: &str, transport: u32, rate: f64, channels: usize) -> Vec<String> {
+    bluetooth_reduced_profile_warning(name, transport, rate, channels)
+        .into_iter()
+        .collect()
+}
+
 /// The fixed ratio a capture device's real nominal rate needs against the
 /// master's (spec 2.3's "feed the ratio into a polyphase resampler," now
 /// computed directly instead of left for the drift corrector to
@@ -737,6 +864,16 @@ fn connect_audio(
         _ => return Err(format!("{output_uid} is not currently connected")),
     }
     let sample_rate = nominal_sample_rate(output_id).map_err(|e| format!("CoreAudio error {e}"))?;
+    let output_name = device_name(output_id).unwrap_or_default();
+    // M11: computed once here, from the device actually being connected --
+    // see `output_device_warnings`'s own doc comment for what's checked
+    // and why a plain "fewer than 8 channels" isn't one of them.
+    let mut device_warnings = output_device_warnings(
+        &output_name,
+        transport_type(output_id).unwrap_or(0),
+        sample_rate,
+        output_channels,
+    );
 
     let mut engine = Engine::new();
     engine.set_sample_rate(sample_rate as f32);
@@ -762,6 +899,13 @@ fn connect_audio(
                 nominal_sample_rate(input_id).map_err(|e| format!("CoreAudio error {e}"))?;
             let base_ratio =
                 base_ratio_for(sample_rate, input_rate).map_err(|e| format!("{input_uid}: {e}"))?;
+            let input_name = device_name(input_id).unwrap_or_default();
+            device_warnings.extend(input_device_warnings(
+                &input_name,
+                transport_type(input_id).unwrap_or(0),
+                input_rate,
+                input_channels,
+            ));
             // Same PI gains and discontinuity threshold as loomix-soak's
             // proven values -- not retuned here.
             let corrector = DriftCorrector::new(PiController::new(2e-5, 5e-7, 0.01), 500.0);
@@ -807,6 +951,7 @@ fn connect_audio(
         meter_reader,
         eq_reader,
         capture_underruns,
+        device_warnings,
         _capture: capture_handle,
         _master: master,
     });
@@ -873,6 +1018,142 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loomix_hal::device::{TRANSPORT_BLUETOOTH, TRANSPORT_BLUETOOTH_LE};
+
+    const BUILTIN_TRANSPORT: u32 = 0x626c_746e; // 'bltn', an arbitrary non-Bluetooth transport for these tests
+
+    #[test]
+    fn bluetooth_reduced_profile_warning_fires_for_the_real_airpods_signature() {
+        // transport=blue, rate=24000, 1ch -- exactly what real AirPods
+        // reported (`docs/ARCHITECTURE.md`'s 2026-09-10 entry).
+        let warning =
+            bluetooth_reduced_profile_warning("Eren (AirPods)", TRANSPORT_BLUETOOTH, 24_000.0, 1);
+        let warning = warning.expect("the real AirPods signature should produce a warning");
+        assert!(
+            warning.contains("24000") && warning.contains("Eren (AirPods)"),
+            "should name the device and the actual degraded rate, not just say something's wrong: {warning}"
+        );
+        assert!(
+            warning.to_lowercase().contains("microphone")
+                || warning.to_lowercase().contains("reconnect"),
+            "should say what would fix it, not just diagnose it (direct instruction): {warning}"
+        );
+    }
+
+    #[test]
+    fn bluetooth_reduced_profile_warning_also_fires_for_bluetooth_le() {
+        assert!(bluetooth_reduced_profile_warning(
+            "Some LE headset",
+            TRANSPORT_BLUETOOTH_LE,
+            16_000.0,
+            1
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn bluetooth_reduced_profile_warning_does_not_fire_for_a_normal_bluetooth_rate() {
+        // The same transport, but a real A2DP stereo connection (44.1kHz) --
+        // must not be flagged just for being Bluetooth.
+        assert!(
+            bluetooth_reduced_profile_warning("Eren (AirPods)", TRANSPORT_BLUETOOTH, 44_100.0, 2)
+                .is_none(),
+            "a normal A2DP-quality Bluetooth connection should never be flagged"
+        );
+    }
+
+    #[test]
+    fn bluetooth_reduced_profile_warning_does_not_fire_for_a_non_bluetooth_low_rate_device() {
+        // A genuinely low-rate wired/built-in device (old telephony
+        // hardware, a cheap USB mic) is not "reduced" -- it's just what
+        // it is. The transport check must gate this, not the rate alone.
+        assert!(
+            bluetooth_reduced_profile_warning("Old USB Headset", BUILTIN_TRANSPORT, 8_000.0, 1)
+                .is_none(),
+            "a low rate on a non-Bluetooth device should never be flagged as a reduced profile"
+        );
+    }
+
+    #[test]
+    fn mono_output_warning_fires_and_is_actionable() {
+        let warning = mono_output_warning("Eren (AirPods)", 1);
+        let warning = warning.expect("a mono output should warn");
+        assert!(
+            warning.to_lowercase().contains("stereo"),
+            "should name what's actually missing (a stereo field), not just an unusual number: {warning}"
+        );
+        assert!(
+            warning.to_lowercase().contains("choose")
+                || warning.to_lowercase().contains("different"),
+            "should say what would fix it, not just that it's mono: {warning}"
+        );
+    }
+
+    #[test]
+    fn mono_output_warning_does_not_fire_for_an_ordinary_stereo_device() {
+        // The case this test exists to pin down: a ubiquitous, completely
+        // healthy 2-channel output (built-in speakers, headphones) must
+        // never be flagged just for being short of the bus's own 8
+        // channels -- that's what bus modes (spec 1.6) are for.
+        assert!(mono_output_warning("MacBook Pro Hoparlörü", 2).is_none());
+    }
+
+    #[test]
+    fn mono_output_warning_does_not_fire_at_the_bus_s_own_full_channel_count() {
+        assert!(mono_output_warning("Full Interface", CHANNELS).is_none());
+    }
+
+    #[test]
+    fn mono_output_warning_does_not_fire_at_zero_channels() {
+        // A device offering zero output channels is rejected earlier in
+        // `connect_audio` with its own distinct error -- not this warning's job.
+        assert!(mono_output_warning("No Output", 0).is_none());
+    }
+
+    #[test]
+    fn output_device_warnings_prefers_the_bluetooth_explanation_over_the_generic_one() {
+        // The exact real AirPods case: both conditions are technically
+        // true (1ch, and it's a reduced Bluetooth profile), but only the
+        // more specific, causal explanation should surface -- not both,
+        // which would read as two different problems instead of one.
+        let warnings = output_device_warnings("Eren (AirPods)", TRANSPORT_BLUETOOTH, 24_000.0, 1);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one warning, not both: {warnings:?}"
+        );
+        assert!(
+            warnings[0].to_lowercase().contains("bluetooth"),
+            "the Bluetooth explanation should win, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn output_device_warnings_falls_back_to_the_generic_one_for_a_non_bluetooth_shortfall() {
+        let warnings =
+            output_device_warnings("Cheap USB Interface", BUILTIN_TRANSPORT, 44_100.0, 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("output channel"));
+    }
+
+    #[test]
+    fn output_device_warnings_is_empty_for_a_healthy_device() {
+        assert!(
+            output_device_warnings("MacBook Pro Hoparlörü", BUILTIN_TRANSPORT, 44_100.0, 2)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn input_device_warnings_only_ever_checks_the_bluetooth_case() {
+        // A mono microphone is completely normal on the input side --
+        // must never be flagged, unlike the output-side channel check.
+        assert!(input_device_warnings("Normal Mic", BUILTIN_TRANSPORT, 44_100.0, 1).is_empty());
+        assert_eq!(
+            input_device_warnings("Eren (AirPods)", TRANSPORT_BLUETOOTH, 24_000.0, 1).len(),
+            1
+        );
+    }
 
     #[test]
     fn base_ratio_for_a_real_airpods_pairing_matches_the_hand_derived_value() {
